@@ -1,0 +1,263 @@
+[
+  {
+    "name": "Spencer Strider",
+    "position": "P",
+    "team": "ATL",
+    "opponent": "MIA",
+    "salary": 10800,
+    "projection": 25.4,
+    "ownership": 31.0
+  },
+  {
+    "name": "Zack Wheeler",
+    "position": "P",
+    "team": "PHI",
+    "opponent": "NYM",
+    "salary": 10300,
+    "projection": 23.7,
+    "ownership": 24.0
+  },
+  {
+    "name": "Logan Gilbert",
+    "position": "P",
+    "team": "SEA",
+    "opponent": "OAK",
+    "salary": 9100,
+    "projection": 20.5,
+    "ownership": 18.0
+  },
+  {
+    "name": "Joe Ryan",
+    "position": "P",
+    "team": "MIN",
+    "opponent": "KC",
+    "salary": 8600,
+    "projection": 18.9,
+    "ownership": 13.0
+  },
+  {
+    "name": "Value Arm",
+    "position": "P",
+    "team": "TB",
+    "opponent": "BAL",
+    "salary": 6900,
+    "projection": 14.8,
+    "ownership": 8.0
+  },
+  {
+    "name": "Cheap SP2",
+    "position": "P",
+    "team": "SF",
+    "opponent": "COL",
+    "salary": 6100,
+    "projection": 12.6,
+    "ownership": 5.0
+  },
+  {
+    "name": "Will Smith",
+    "position": "C",
+    "team": "LAD",
+    "opponent": "COL",
+    "salary": 4600,
+    "projection": 9.8,
+    "ownership": 12.0
+  },
+  {
+    "name": "Sean Murphy",
+    "position": "C",
+    "team": "ATL",
+    "opponent": "MIA",
+    "salary": 4100,
+    "projection": 8.7,
+    "ownership": 9.0
+  },
+  {
+    "name": "Value Catcher",
+    "position": "C",
+    "team": "SEA",
+    "opponent": "OAK",
+    "salary": 2900,
+    "projection": 6.5,
+    "ownership": 5.0
+  },
+  {
+    "name": "Freddie Freeman",
+    "position": "1B",
+    "team": "LAD",
+    "opponent": "COL",
+    "salary": 6100,
+    "projection": 12.4,
+    "ownership": 21.0
+  },
+  {
+    "name": "Matt Olson",
+    "position": "1B",
+    "team": "ATL",
+    "opponent": "MIA",
+    "salary": 5900,
+    "projection": 11.9,
+    "ownership": 19.0
+  },
+  {
+    "name": "Value First Base",
+    "position": "1B",
+    "team": "SEA",
+    "opponent": "OAK",
+    "salary": 3500,
+    "projection": 7.7,
+    "ownership": 6.0
+  },
+  {
+    "name": "Mookie Betts",
+    "position": "2B",
+    "team": "LAD",
+    "opponent": "COL",
+    "salary": 6500,
+    "projection": 13.5,
+    "ownership": 25.0
+  },
+  {
+    "name": "Ozzie Albies",
+    "position": "2B",
+    "team": "ATL",
+    "opponent": "MIA",
+    "salary": 5400,
+    "projection": 10.9,
+    "ownership": 15.0
+  },
+  {
+    "name": "Value Second Base",
+    "position": "2B",
+    "team": "TB",
+    "opponent": "BAL",
+    "salary": 3200,
+    "projection": 7.1,
+    "ownership": 5.0
+  },
+  {
+    "name": "Austin Riley",
+    "position": "3B",
+    "team": "ATL",
+    "opponent": "MIA",
+    "salary": 5700,
+    "projection": 11.5,
+    "ownership": 17.0
+  },
+  {
+    "name": "Max Muncy",
+    "position": "3B",
+    "team": "LAD",
+    "opponent": "COL",
+    "salary": 5100,
+    "projection": 10.4,
+    "ownership": 13.0
+  },
+  {
+    "name": "Value Third Base",
+    "position": "3B",
+    "team": "SEA",
+    "opponent": "OAK",
+    "salary": 3300,
+    "projection": 7.4,
+    "ownership": 6.0
+  },
+  {
+    "name": "Corey Seager",
+    "position": "SS",
+    "team": "TEX",
+    "opponent": "LAA",
+    "salary": 6000,
+    "projection": 11.8,
+    "ownership": 18.0
+  },
+  {
+    "name": "Trea Turner",
+    "position": "SS",
+    "team": "PHI",
+    "opponent": "NYM",
+    "salary": 5800,
+    "projection": 11.4,
+    "ownership": 16.0
+  },
+  {
+    "name": "Value Shortstop",
+    "position": "SS",
+    "team": "ATL",
+    "opponent": "MIA",
+    "salary": 3400,
+    "projection": 7.6,
+    "ownership": 7.0
+  },
+  {
+    "name": "Ronald Acuna Jr.",
+    "position": "OF",
+    "team": "ATL",
+    "opponent": "MIA",
+    "salary": 6600,
+    "projection": 13.7,
+    "ownership": 27.0
+  },
+  {
+    "name": "Julio Rodriguez",
+    "position": "OF",
+    "team": "SEA",
+    "opponent": "OAK",
+    "salary": 5900,
+    "projection": 11.7,
+    "ownership": 16.0
+  },
+  {
+    "name": "Yordan Alvarez",
+    "position": "OF",
+    "team": "HOU",
+    "opponent": "TEX",
+    "salary": 5800,
+    "projection": 11.6,
+    "ownership": 15.0
+  },
+  {
+    "name": "Teoscar Hernandez",
+    "position": "OF",
+    "team": "LAD",
+    "opponent": "COL",
+    "salary": 4800,
+    "projection": 9.8,
+    "ownership": 12.0
+  },
+  {
+    "name": "Michael Harris II",
+    "position": "OF",
+    "team": "ATL",
+    "opponent": "MIA",
+    "salary": 4500,
+    "projection": 9.2,
+    "ownership": 10.0
+  },
+  {
+    "name": "Value Outfielder One",
+    "position": "OF",
+    "team": "LAD",
+    "opponent": "COL",
+    "salary": 3600,
+    "projection": 7.9,
+    "ownership": 7.0
+  },
+  {
+    "name": "Value Outfielder Two",
+    "position": "OF",
+    "team": "TB",
+    "opponent": "BAL",
+    "salary": 3300,
+    "projection": 7.3,
+    "ownership": 5.0
+  },
+  {
+    "name": "Cheap Outfielder",
+    "position": "OF",
+    "team": "SEA",
+    "opponent": "OAK",
+    "salary": 2800,
+    "projection": 6.4,
+    "ownership": 3.0
+  }
+]
