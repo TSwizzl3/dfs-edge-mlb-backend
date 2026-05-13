@@ -27,10 +27,15 @@ SALARY_CAP = 50000
 ADMIN_PASSWORD = "dfsedge_admin_2026"
 
 BASE_DIR = Path(__file__).parent
-SAMPLE_PLAYERS_PATH = BASE_DIR / "sample_players.json"
-ACTIVE_SLATE_PATH = BASE_DIR / "active_slate.json"
-MARKET_STATE_PATH = BASE_DIR / "market_state.json"
-USERS_PATH = BASE_DIR / "users.json"
+# IMPORTANT FOR LIVE DIGITALOCEAN DEPLOYMENT:
+# Store uploaded slates/users in a persistent data directory, not just the app code folder.
+# Set DFS_EDGE_DATA_DIR=/var/lib/dfs_edge_mlb on the Droplet service for true daily-slate persistence.
+DATA_DIR = Path(os.getenv("DFS_EDGE_DATA_DIR", str(BASE_DIR))).expanduser()
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+SAMPLE_PLAYERS_PATH = DATA_DIR / "sample_players.json"
+ACTIVE_SLATE_PATH = DATA_DIR / "active_slate.json"
+MARKET_STATE_PATH = DATA_DIR / "market_state.json"
+USERS_PATH = DATA_DIR / "users.json"
 ADMIN_EMAIL = "zero2sixtygraphics@gmail.com"
 DEFAULT_ADMIN_PASSWORD = "Zero2SixtyAdmin2026!"
 
@@ -828,6 +833,16 @@ def current_slate_source():
 
 @app.on_event("startup")
 def startup_setup():
+    # One-time migration: if the old code-folder JSON files exist, copy them into
+    # the persistent DATA_DIR so today's admin CSV stays live for every user.
+    for filename in ["active_slate.json", "users.json", "market_state.json", "sample_players.json"]:
+        old_path = BASE_DIR / filename
+        new_path = DATA_DIR / filename
+        try:
+            if old_path.exists() and not new_path.exists():
+                new_path.write_text(old_path.read_text(encoding="utf-8"), encoding="utf-8")
+        except Exception:
+            pass
     ensure_sample_players_file()
     ensure_admin_user()
 
@@ -3254,15 +3269,18 @@ def simulator_focus_label(focus: str):
 
 def payout_for_rank(rank, contest):
     """
-    Approximate a realistic DFS payout curve when the user enters only contest
-    size, paid spots, prize pool, and buy-in. This is not a sportsbook/provider
-    payout table, but it behaves like common DFS tournaments:
-    - Cash/H2H: flatter min-cash style payout.
-    - Single-entry GPP: moderately top-heavy.
-    - Massive-field GPP: very top-heavy.
+    Conservative DFS payout lookup when the exact DraftKings payout table is not supplied.
+
+    The old model overpaid mid-pack ranks. This model is intentionally top-heavy:
+    - outside paid spots = $0
+    - last paid spots = realistic min-cash
+    - middle paid spots = still small payouts
+    - only very high finishes receive large payouts
+
+    This is still an estimate. Exact payouts require importing the contest payout table.
     """
     contest_size = max(1, safe_int(contest.get("contest_size", 1), 1))
-    paid_spots = max(1, safe_int(contest.get("estimated_paid_spots", 1), 1))
+    paid_spots = max(1, min(contest_size, safe_int(contest.get("estimated_paid_spots", contest.get("paid_positions", 1)), 1)))
     entry_fee = max(0.01, safe_float(contest.get("entry_fee", 1.0), 1.0))
     prize_pool = max(1.0, safe_float(contest.get("prize_pool", 1.0), 1.0))
     max_entries = max(1, safe_int(contest.get("max_entries", 1), 1))
@@ -3274,79 +3292,110 @@ def payout_for_rank(rank, contest):
 
     payout_rate = paid_spots / contest_size
 
-    # Cash/H2H/double-up style contests should not use top-heavy GPP payouts.
-    if payout_rate >= 0.45 and max_entries == 1:
+    # Cash/double-up style payout: flatter, but never invent huge ROI.
+    if payout_rate >= 0.42 and max_entries <= 1:
         return round(max(entry_fee * 1.75, prize_pool / max(paid_spots, 1)), 2)
 
-    min_cash = max(entry_fee * 1.5, prize_pool * 0.00035)
+    # Real DK GPP min-cash is commonly around 1.5x-2.5x buy-in, not hundreds.
+    min_cash = max(entry_fee * 1.5, min(entry_fee * 2.5, prize_pool / max(paid_spots, 1) * 0.55))
 
-    if contest_size >= 100000:
-        top_pct = 0.22
-        curve_alpha = 4.2
-    elif contest_size >= 25000 or max_entries >= 50:
-        top_pct = 0.18
-        curve_alpha = 3.65
+    # Estimate first place. Do NOT let first place consume an unrealistic share for smaller pools.
+    if contest_size >= 100000 or max_entries >= 100:
+        first_pct = 0.12
+        alpha = 6.8
+    elif contest_size >= 20000 or max_entries >= 50:
+        first_pct = 0.11
+        alpha = 6.2
     elif single_entry:
-        top_pct = 0.10
-        curve_alpha = 2.65
+        first_pct = 0.075
+        alpha = 5.2
     else:
-        top_pct = 0.14
-        curve_alpha = 3.05
+        first_pct = 0.09
+        alpha = 5.7
 
-    top_prize = max(entry_fee * 25, prize_pool * top_pct)
+    first_prize = max(entry_fee * 20, prize_pool * first_pct)
+    first_prize = min(first_prize, prize_pool * 0.18)
+
+    if rank == 1:
+        return round(first_prize, 2)
+
     if paid_spots <= 1:
-        return round(min(top_prize, prize_pool), 2)
+        return round(min(first_prize, prize_pool), 2)
 
-    # rank_position = 1.0 for 1st, 0.0 for last paid.
+    # rank_position: 1 near first, 0 near min-cash. High alpha keeps mid-paid ranks realistic.
     rank_position = (paid_spots - rank) / max(paid_spots - 1, 1)
-    payout = min_cash + (top_prize - min_cash) * (rank_position ** curve_alpha)
+    payout = min_cash + (first_prize - min_cash) * (rank_position ** alpha)
 
-    # Keep individual payout within the actual prize pool.
+    # Add small tier bumps for truly high finishes only.
+    top_01_cut = max(1, round(contest_size * 0.001))
+    top_1_cut = max(1, round(contest_size * 0.01))
+    top_5_cut = max(1, round(contest_size * 0.05))
+    if rank <= top_01_cut:
+        payout = max(payout, first_prize * 0.22)
+    elif rank <= top_1_cut:
+        payout = max(payout, first_prize * 0.055)
+    elif rank <= top_5_cut:
+        payout = max(payout, min_cash * 2.2)
+
     return round(max(0.0, min(payout, prize_pool)), 2)
 
 
 def estimate_expected_payout_from_probabilities(contest, projected_rank, ceiling_rank, cash_probability, top_10_probability, top_1_probability, top_0_1_probability):
+    """
+    Conservative EV model.
+
+    Important: the app's Top 10/1/0.1 numbers are lineup-strength indicators, not true
+    Monte Carlo probabilities from a full field simulation. Treating them as literal odds
+    created fake $6k EV entries. This blends rank-based payout first and only adds a small
+    upside component.
+    """
     contest_size = max(1, safe_int(contest.get("contest_size", 1), 1))
-    paid_spots = max(1, safe_int(contest.get("estimated_paid_spots", 1), 1))
+    paid_spots = max(1, min(contest_size, safe_int(contest.get("estimated_paid_spots", contest.get("paid_positions", 1)), 1)))
+    entry_fee = max(0.01, safe_float(contest.get("entry_fee", 1.0), 1.0))
 
-    p_cash = max(0.0, min(1.0, safe_float(cash_probability, 0) / 100.0))
-    p_top10 = max(0.0, min(p_cash, safe_float(top_10_probability, 0) / 100.0))
-    p_top1 = max(0.0, min(p_top10, safe_float(top_1_probability, 0) / 100.0))
-    p_top01 = max(0.0, min(p_top1, safe_float(top_0_1_probability, 0) / 100.0))
-
-    # Convert cumulative probabilities into non-overlapping buckets.
-    bucket_top01 = p_top01
-    bucket_top1 = max(0.0, p_top1 - p_top01)
-    bucket_top10 = max(0.0, p_top10 - p_top1)
-    bucket_cash = max(0.0, p_cash - p_top10)
-
-    rank_top01 = max(1, round(contest_size * 0.0005))
-    rank_top1 = max(1, round(contest_size * 0.005))
-    rank_top10 = max(1, round(contest_size * 0.05))
-    rank_cash = max(1, round((paid_spots + max(rank_top10, 1)) / 2))
-
-    expected = (
-        bucket_top01 * payout_for_rank(rank_top01, contest)
-        + bucket_top1 * payout_for_rank(rank_top1, contest)
-        + bucket_top10 * payout_for_rank(rank_top10, contest)
-        + bucket_cash * payout_for_rank(rank_cash, contest)
-    )
+    projected_rank = max(1, min(safe_int(projected_rank, contest_size), contest_size))
+    ceiling_rank = max(1, min(safe_int(ceiling_rank, contest_size), contest_size))
 
     projected_payout = payout_for_rank(projected_rank, contest)
     ceiling_payout = payout_for_rank(ceiling_rank, contest)
+    min_cash_payout = payout_for_rank(paid_spots, contest)
 
-    # Blend model EV with rank-based payout so the shown projected rank and payout
-    # agree with each other. The probabilities still drive upside EV.
-    expected = expected * 0.72 + projected_payout * 0.18 + ceiling_payout * 0.10
+    # Convert displayed strength indicators into tiny EV weights, not literal probabilities.
+    p_cash = max(0.0, min(1.0, safe_float(cash_probability, 0) / 100.0))
+    p_top10 = max(0.0, min(1.0, safe_float(top_10_probability, 0) / 100.0))
+    p_top1 = max(0.0, min(1.0, safe_float(top_1_probability, 0) / 100.0))
+    p_top01 = max(0.0, min(1.0, safe_float(top_0_1_probability, 0) / 100.0))
+
+    rank_top01 = max(1, round(contest_size * 0.001))
+    rank_top1 = max(1, round(contest_size * 0.01))
+    rank_top10 = max(1, round(contest_size * 0.10))
+
+    upside_component = (
+        p_top01 * payout_for_rank(rank_top01, contest) * 0.08
+        + p_top1 * payout_for_rank(rank_top1, contest) * 0.06
+        + p_top10 * payout_for_rank(rank_top10, contest) * 0.035
+        + p_cash * min_cash_payout * 0.18
+    )
+
+    # Rank-based payout is king. Median outside the money should usually be negative EV.
+    expected = projected_payout * 0.72 + ceiling_payout * 0.18 + upside_component
+
+    # Safety cap: unless ceiling is truly elite, EV cannot explode from probability labels.
+    realistic_cap = max(
+        entry_fee * 0.25,
+        projected_payout * 1.15 + ceiling_payout * 0.35 + min_cash_payout * 0.35,
+    )
+    if ceiling_rank > max(1, round(contest_size * 0.01)):
+        expected = min(expected, realistic_cap)
 
     return {
-        "expected_payout": round(expected, 2),
+        "expected_payout": round(max(0.0, expected), 2),
         "projected_payout": round(projected_payout, 2),
         "ceiling_payout": round(ceiling_payout, 2),
-        "min_cash_payout": payout_for_rank(paid_spots, contest),
-        "top_10_rank_payout": payout_for_rank(max(1, round(contest_size * 0.10)), contest),
-        "top_1_rank_payout": payout_for_rank(max(1, round(contest_size * 0.01)), contest),
-        "top_0_1_rank_payout": payout_for_rank(max(1, round(contest_size * 0.001)), contest),
+        "min_cash_payout": round(min_cash_payout, 2),
+        "top_10_rank_payout": payout_for_rank(rank_top10, contest),
+        "top_1_rank_payout": payout_for_rank(rank_top1, contest),
+        "top_0_1_rank_payout": payout_for_rank(rank_top01, contest),
     }
 
 def simulate_single_lineup(lineup_data, request: ContestSimulationRequest, lineup_number=1):
@@ -3511,12 +3560,29 @@ def simulate_single_lineup(lineup_data, request: ContestSimulationRequest, lineu
 
     # Make probabilities contest-aware.
     # More paid spots helps min-cash probability. Multi-entry fields make top-end outcomes harder.
-    payout_adjustment = max(0.55, min(1.55, payout_rate / 0.20))
-    entry_adjustment = 1.0 + (0.08 if single_entry else 0.0) - min(0.30, math.log10(max(max_entries, 1)) * 0.055)
-    cash_probability = max(0.5, min(99.0, cash_probability * payout_adjustment))
-    top_10_probability = max(0.1, min(85.0, top_10_probability * entry_adjustment))
-    top_1_probability = max(0.01, min(50.0, top_1_probability * entry_adjustment))
-    top_0_1_probability = max(0.001, min(15.0, top_0_1_probability * entry_adjustment))
+    payout_adjustment = max(0.55, min(1.35, payout_rate / 0.20))
+    entry_adjustment = 1.0 + (0.06 if single_entry else 0.0) - min(0.42, math.log10(max(max_entries, 1)) * 0.075)
+
+    # Keep display probabilities realistic. They are strength estimates, not guaranteed odds.
+    if projected_rank <= paid_spots:
+        rank_cash_base = 48.0 + (1.0 - projected_rank / max(paid_spots, 1)) * 34.0
+    else:
+        distance_out = (projected_rank - paid_spots) / max(contest_size - paid_spots, 1)
+        rank_cash_base = max(3.0, 28.0 * (1.0 - distance_out))
+
+    cash_probability = max(1.0, min(88.0, (cash_probability * 0.35 + rank_cash_base * 0.65) * payout_adjustment))
+
+    top_10_cut = max(1, round(contest_size * 0.10))
+    top_1_cut = max(1, round(contest_size * 0.01))
+    top_01_cut = max(1, round(contest_size * 0.001))
+
+    rank_top10_base = 42.0 if ceiling_rank <= top_10_cut else max(1.0, 26.0 * (top_10_cut / max(ceiling_rank, 1)))
+    rank_top1_base = 14.0 if ceiling_rank <= top_1_cut else max(0.1, 8.0 * (top_1_cut / max(ceiling_rank, 1)))
+    rank_top01_base = 3.5 if ceiling_rank <= top_01_cut else max(0.01, 1.4 * (top_01_cut / max(ceiling_rank, 1)))
+
+    top_10_probability = max(0.1, min(65.0, (top_10_probability * 0.30 + rank_top10_base * 0.70) * entry_adjustment))
+    top_1_probability = max(0.01, min(22.0, (top_1_probability * 0.25 + rank_top1_base * 0.75) * entry_adjustment))
+    top_0_1_probability = max(0.001, min(5.0, (top_0_1_probability * 0.20 + rank_top01_base * 0.80) * entry_adjustment))
 
     payout_model = estimate_expected_payout_from_probabilities(
         contest=contest,
