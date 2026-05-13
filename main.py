@@ -13,6 +13,11 @@ import math
 import os
 from datetime import datetime
 
+try:
+    import psycopg
+except Exception:
+    psycopg = None
+
 app = FastAPI(title="DFS Edge MLB API")
 
 app.add_middleware(
@@ -27,15 +32,16 @@ SALARY_CAP = 50000
 ADMIN_PASSWORD = "dfsedge_admin_2026"
 
 BASE_DIR = Path(__file__).parent
-# IMPORTANT FOR LIVE DIGITALOCEAN DEPLOYMENT:
-# Store uploaded slates/users in a persistent data directory, not just the app code folder.
-# Set DFS_EDGE_DATA_DIR=/var/lib/dfs_edge_mlb on the Droplet service for true daily-slate persistence.
-DATA_DIR = Path(os.getenv("DFS_EDGE_DATA_DIR", str(BASE_DIR))).expanduser()
+# DigitalOcean App Platform does not give you SSH/server folders like a Droplet.
+# For live persistence, set DATABASE_URL to a DigitalOcean Managed PostgreSQL connection string.
+# File fallback is kept for local testing only.
+DATA_DIR = Path(os.getenv("DFS_EDGE_DATA_DIR", str(BASE_DIR / "data")))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-SAMPLE_PLAYERS_PATH = DATA_DIR / "sample_players.json"
+SAMPLE_PLAYERS_PATH = BASE_DIR / "sample_players.json"
 ACTIVE_SLATE_PATH = DATA_DIR / "active_slate.json"
 MARKET_STATE_PATH = DATA_DIR / "market_state.json"
 USERS_PATH = DATA_DIR / "users.json"
+DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("DFS_EDGE_DATABASE_URL")
 ADMIN_EMAIL = "zero2sixtygraphics@gmail.com"
 DEFAULT_ADMIN_PASSWORD = "Zero2SixtyAdmin2026!"
 
@@ -779,6 +785,92 @@ def convert_dk_csv_to_players(csv_text):
     return players
 
 
+
+def database_available():
+    return bool(DATABASE_URL and psycopg is not None)
+
+
+def get_db_connection():
+    if not database_available():
+        return None
+    return psycopg.connect(DATABASE_URL)
+
+
+def init_persistent_store():
+    """Create the small state table used for the live daily slate on App Platform."""
+    if not database_available():
+        return False
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS dfs_edge_app_state (
+                        state_key TEXT PRIMARY KEY,
+                        state_value JSONB NOT NULL,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+            conn.commit()
+        return True
+    except Exception:
+        return False
+
+
+def db_get_json(key):
+    if not database_available():
+        return None
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT state_value FROM dfs_edge_app_state WHERE state_key = %s", (key,))
+                row = cur.fetchone()
+                return row[0] if row else None
+    except Exception:
+        return None
+
+
+def db_set_json(key, value):
+    if not database_available():
+        return False
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO dfs_edge_app_state (state_key, state_value, updated_at)
+                    VALUES (%s, %s::jsonb, NOW())
+                    ON CONFLICT (state_key)
+                    DO UPDATE SET state_value = EXCLUDED.state_value, updated_at = NOW()
+                    """,
+                    (key, json.dumps(value)),
+                )
+            conn.commit()
+        return True
+    except Exception:
+        return False
+
+
+def db_delete_json(key):
+    if not database_available():
+        return False
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM dfs_edge_app_state WHERE state_key = %s", (key,))
+            conn.commit()
+        return True
+    except Exception:
+        return False
+
+
+def has_persistent_active_slate():
+    db_value = db_get_json("active_slate")
+    if isinstance(db_value, list) and len(db_value) >= 10:
+        return True
+    return ACTIVE_SLATE_PATH.exists()
+
 def ensure_sample_players_file():
     if not SAMPLE_PLAYERS_PATH.exists():
         with open(SAMPLE_PLAYERS_PATH, "w", encoding="utf-8") as f:
@@ -798,6 +890,12 @@ def ensure_sample_players_file():
 
 
 def load_players():
+    # 1) Production source: DigitalOcean Managed PostgreSQL / DATABASE_URL.
+    db_players = db_get_json("active_slate")
+    if isinstance(db_players, list) and len(db_players) >= 10:
+        return db_players
+
+    # 2) Local/dev fallback file. App Platform file storage is not guaranteed across redeploys.
     if ACTIVE_SLATE_PATH.exists():
         try:
             with open(ACTIVE_SLATE_PATH, "r", encoding="utf-8") as f:
@@ -821,28 +919,30 @@ def load_players():
 
 
 def save_active_slate(players):
+    # Save to DB first so today's admin slate is shared by every user.
+    db_set_json("active_slate", players)
+
+    # Keep file fallback for local dev and emergency recovery.
+    ACTIVE_SLATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(ACTIVE_SLATE_PATH, "w", encoding="utf-8") as f:
         json.dump(players, f, indent=2)
 
 
-def current_slate_source():
+def clear_active_slate():
+    db_delete_json("active_slate")
     if ACTIVE_SLATE_PATH.exists():
+        ACTIVE_SLATE_PATH.unlink()
+
+
+def current_slate_source():
+    if has_persistent_active_slate():
         return "imported_or_edited_slate"
     return "sample_players"
 
 
 @app.on_event("startup")
 def startup_setup():
-    # One-time migration: if the old code-folder JSON files exist, copy them into
-    # the persistent DATA_DIR so today's admin CSV stays live for every user.
-    for filename in ["active_slate.json", "users.json", "market_state.json", "sample_players.json"]:
-        old_path = BASE_DIR / filename
-        new_path = DATA_DIR / filename
-        try:
-            if old_path.exists() and not new_path.exists():
-                new_path.write_text(old_path.read_text(encoding="utf-8"), encoding="utf-8")
-        except Exception:
-            pass
+    init_persistent_store()
     ensure_sample_players_file()
     ensure_admin_user()
 
@@ -3057,6 +3157,7 @@ def normalize_contest_request(request: ContestSimulationRequest):
         "paid_positions": paid_positions,
         "entry_fee": entry_fee,
         "prize_pool": prize_pool,
+        "top_prize": safe_float(getattr(request, "top_prize", 0), 0),
         "max_entries": max_entries,
         "single_entry": single_entry,
         "total_entry_cost": round(entry_fee * max_entries, 2),
@@ -3269,15 +3370,15 @@ def simulator_focus_label(focus: str):
 
 def payout_for_rank(rank, contest):
     """
-    Conservative DFS payout lookup when the exact DraftKings payout table is not supplied.
+    Conservative DFS payout curve when the exact DK payout table is not entered.
 
-    The old model overpaid mid-pack ranks. This model is intentionally top-heavy:
-    - outside paid spots = $0
-    - last paid spots = realistic min-cash
-    - middle paid spots = still small payouts
-    - only very high finishes receive large payouts
+    Key behavior:
+    - Outside paid spots always pays $0.
+    - Bottom paid spots are true min-cash, not huge fake prizes.
+    - Mid-paid ranks stay modest.
+    - Only very high finishes receive large payouts.
 
-    This is still an estimate. Exact payouts require importing the contest payout table.
+    This is still an estimate. Exact results require importing the actual DK payout table.
     """
     contest_size = max(1, safe_int(contest.get("contest_size", 1), 1))
     paid_spots = max(1, min(contest_size, safe_int(contest.get("estimated_paid_spots", contest.get("paid_positions", 1)), 1)))
@@ -3291,111 +3392,99 @@ def payout_for_rank(rank, contest):
         return 0.0
 
     payout_rate = paid_spots / contest_size
+    average_paid_payout = prize_pool / paid_spots
 
-    # Cash/double-up style payout: flatter, but never invent huge ROI.
-    if payout_rate >= 0.42 and max_entries <= 1:
-        return round(max(entry_fee * 1.75, prize_pool / max(paid_spots, 1)), 2)
+    # Cash/double-up contests are flat. If about half the field is paid, avoid GPP curve.
+    if payout_rate >= 0.42 and max_entries == 1:
+        return round(max(entry_fee * 1.75, min(average_paid_payout, entry_fee * 2.2)), 2)
 
-    # Real DK GPP min-cash is commonly around 1.5x-2.5x buy-in, not hundreds.
-    min_cash = max(entry_fee * 1.5, min(entry_fee * 2.5, prize_pool / max(paid_spots, 1) * 0.55))
+    # Real DK min-cash is usually around 1.25x-2.5x buy-in, rarely huge.
+    min_cash = max(entry_fee * 1.25, min(average_paid_payout * 0.72, entry_fee * 2.5))
 
-    # Estimate first place. Do NOT let first place consume an unrealistic share for smaller pools.
-    if contest_size >= 100000 or max_entries >= 100:
-        first_pct = 0.12
-        alpha = 6.8
-    elif contest_size >= 20000 or max_entries >= 50:
-        first_pct = 0.11
-        alpha = 6.2
-    elif single_entry:
-        first_pct = 0.075
-        alpha = 5.2
+    # If the app ever receives a real top_prize, use it; otherwise estimate conservatively.
+    supplied_top_prize = safe_float(contest.get("top_prize", 0), 0)
+    if supplied_top_prize > 0 and supplied_top_prize < prize_pool:
+        top_prize = supplied_top_prize
     else:
-        first_pct = 0.09
-        alpha = 5.7
-
-    first_prize = max(entry_fee * 20, prize_pool * first_pct)
-    first_prize = min(first_prize, prize_pool * 0.18)
-
-    if rank == 1:
-        return round(first_prize, 2)
+        if contest_size >= 100000:
+            top_pct = 0.18
+        elif contest_size >= 25000 or max_entries >= 50:
+            top_pct = 0.14
+        elif single_entry:
+            top_pct = 0.085
+        else:
+            top_pct = 0.11
+        top_prize = max(entry_fee * 20, prize_pool * top_pct)
+    top_prize = min(top_prize, prize_pool * 0.22)
 
     if paid_spots <= 1:
-        return round(min(first_prize, prize_pool), 2)
+        return round(top_prize, 2)
 
-    # rank_position: 1 near first, 0 near min-cash. High alpha keeps mid-paid ranks realistic.
-    rank_position = (paid_spots - rank) / max(paid_spots - 1, 1)
-    payout = min_cash + (first_prize - min_cash) * (rank_position ** alpha)
+    paid_depth = rank / paid_spots  # 0.0-ish = top, 1.0 = last paid
 
-    # Add small tier bumps for truly high finishes only.
-    top_01_cut = max(1, round(contest_size * 0.001))
-    top_1_cut = max(1, round(contest_size * 0.01))
-    top_5_cut = max(1, round(contest_size * 0.05))
-    if rank <= top_01_cut:
-        payout = max(payout, first_prize * 0.22)
-    elif rank <= top_1_cut:
-        payout = max(payout, first_prize * 0.055)
-    elif rank <= top_5_cut:
-        payout = max(payout, min_cash * 2.2)
+    # Bottom half of paid positions: min-cash to about 2x min-cash.
+    if paid_depth >= 0.50:
+        multiplier = 1.0 + (1.0 - paid_depth) * 2.0
+        return round(min(min_cash * multiplier, average_paid_payout * 1.35), 2)
 
+    # 10% to 50% paid: modest mid-tier payout.
+    if paid_depth >= 0.10:
+        # At 50% paid: roughly 2x min. At 10% paid: about 1%-1.5% of pool.
+        mid_low = min_cash * 2.0
+        mid_high = max(mid_low, min(prize_pool * 0.015, average_paid_payout * 18))
+        t = (0.50 - paid_depth) / 0.40
+        payout = mid_low + (mid_high - mid_low) * (t ** 1.8)
+        return round(min(payout, prize_pool), 2)
+
+    # Top 10% of paid: top-heavy curve to first place.
+    # Example: rank near 1st can be thousands, rank just inside top 10% paid is still modest.
+    top_band_rank = max(1, paid_spots * 0.10)
+    t = max(0.0, min(1.0, (top_band_rank - rank) / max(top_band_rank - 1, 1)))
+    top_band_floor = max(min_cash * 3.0, min(prize_pool * 0.012, average_paid_payout * 15))
+    payout = top_band_floor + (top_prize - top_band_floor) * (t ** 2.15)
     return round(max(0.0, min(payout, prize_pool)), 2)
 
 
 def estimate_expected_payout_from_probabilities(contest, projected_rank, ceiling_rank, cash_probability, top_10_probability, top_1_probability, top_0_1_probability):
-    """
-    Conservative EV model.
-
-    Important: the app's Top 10/1/0.1 numbers are lineup-strength indicators, not true
-    Monte Carlo probabilities from a full field simulation. Treating them as literal odds
-    created fake $6k EV entries. This blends rank-based payout first and only adds a small
-    upside component.
-    """
     contest_size = max(1, safe_int(contest.get("contest_size", 1), 1))
     paid_spots = max(1, min(contest_size, safe_int(contest.get("estimated_paid_spots", contest.get("paid_positions", 1)), 1)))
-    entry_fee = max(0.01, safe_float(contest.get("entry_fee", 1.0), 1.0))
-
-    projected_rank = max(1, min(safe_int(projected_rank, contest_size), contest_size))
-    ceiling_rank = max(1, min(safe_int(ceiling_rank, contest_size), contest_size))
 
     projected_payout = payout_for_rank(projected_rank, contest)
     ceiling_payout = payout_for_rank(ceiling_rank, contest)
     min_cash_payout = payout_for_rank(paid_spots, contest)
 
-    # Convert displayed strength indicators into tiny EV weights, not literal probabilities.
     p_cash = max(0.0, min(1.0, safe_float(cash_probability, 0) / 100.0))
-    p_top10 = max(0.0, min(1.0, safe_float(top_10_probability, 0) / 100.0))
-    p_top1 = max(0.0, min(1.0, safe_float(top_1_probability, 0) / 100.0))
-    p_top01 = max(0.0, min(1.0, safe_float(top_0_1_probability, 0) / 100.0))
+    p_top10 = max(0.0, min(p_cash, safe_float(top_10_probability, 0) / 100.0))
+    p_top1 = max(0.0, min(p_top10, safe_float(top_1_probability, 0) / 100.0))
+    p_top01 = max(0.0, min(p_top1, safe_float(top_0_1_probability, 0) / 100.0))
 
-    rank_top01 = max(1, round(contest_size * 0.001))
-    rank_top1 = max(1, round(contest_size * 0.01))
-    rank_top10 = max(1, round(contest_size * 0.10))
+    # Use representative ranks, but keep the tail contribution small.
+    rank_top01 = max(1, round(contest_size * 0.0005))
+    rank_top1 = max(1, round(contest_size * 0.005))
+    rank_top10 = max(1, round(contest_size * 0.05))
 
-    upside_component = (
-        p_top01 * payout_for_rank(rank_top01, contest) * 0.08
-        + p_top1 * payout_for_rank(rank_top1, contest) * 0.06
-        + p_top10 * payout_for_rank(rank_top10, contest) * 0.035
-        + p_cash * min_cash_payout * 0.18
+    tail_ev = (
+        p_top01 * payout_for_rank(rank_top01, contest) * 0.16
+        + max(0.0, p_top1 - p_top01) * payout_for_rank(rank_top1, contest) * 0.12
+        + max(0.0, p_top10 - p_top1) * payout_for_rank(rank_top10, contest) * 0.08
     )
 
-    # Rank-based payout is king. Median outside the money should usually be negative EV.
-    expected = projected_payout * 0.72 + ceiling_payout * 0.18 + upside_component
+    # Main EV stays tied to the actual projected/ceiling ranks so the UI is honest.
+    rank_based_ev = projected_payout * 0.55 + ceiling_payout * 0.18 + (p_cash * min_cash_payout * 0.27)
+    expected = rank_based_ev + tail_ev
 
-    # Safety cap: unless ceiling is truly elite, EV cannot explode from probability labels.
-    realistic_cap = max(
-        entry_fee * 0.25,
-        projected_payout * 1.15 + ceiling_payout * 0.35 + min_cash_payout * 0.35,
-    )
-    if ceiling_rank > max(1, round(contest_size * 0.01)):
-        expected = min(expected, realistic_cap)
+    # Hard cap: if projected rank misses the cash line, expected payout should not explode.
+    if safe_int(projected_rank, contest_size) > paid_spots:
+        expected = min(expected, max(min_cash_payout * 1.25, ceiling_payout * 0.42 + min_cash_payout * p_cash))
 
     return {
         "expected_payout": round(max(0.0, expected), 2),
         "projected_payout": round(projected_payout, 2),
         "ceiling_payout": round(ceiling_payout, 2),
         "min_cash_payout": round(min_cash_payout, 2),
-        "top_10_rank_payout": payout_for_rank(rank_top10, contest),
-        "top_1_rank_payout": payout_for_rank(rank_top1, contest),
-        "top_0_1_rank_payout": payout_for_rank(rank_top01, contest),
+        "top_10_rank_payout": payout_for_rank(max(1, round(contest_size * 0.10)), contest),
+        "top_1_rank_payout": payout_for_rank(max(1, round(contest_size * 0.01)), contest),
+        "top_0_1_rank_payout": payout_for_rank(max(1, round(contest_size * 0.001)), contest),
     }
 
 def simulate_single_lineup(lineup_data, request: ContestSimulationRequest, lineup_number=1):
@@ -3560,29 +3649,32 @@ def simulate_single_lineup(lineup_data, request: ContestSimulationRequest, lineu
 
     # Make probabilities contest-aware.
     # More paid spots helps min-cash probability. Multi-entry fields make top-end outcomes harder.
-    payout_adjustment = max(0.55, min(1.35, payout_rate / 0.20))
-    entry_adjustment = 1.0 + (0.06 if single_entry else 0.0) - min(0.42, math.log10(max(max_entries, 1)) * 0.075)
+    payout_adjustment = max(0.55, min(1.55, payout_rate / 0.20))
+    entry_adjustment = 1.0 + (0.08 if single_entry else 0.0) - min(0.30, math.log10(max(max_entries, 1)) * 0.055)
+    cash_probability = max(0.5, min(99.0, cash_probability * payout_adjustment))
+    top_10_probability = max(0.1, min(85.0, top_10_probability * entry_adjustment))
+    top_1_probability = max(0.01, min(50.0, top_1_probability * entry_adjustment))
+    top_0_1_probability = max(0.001, min(15.0, top_0_1_probability * entry_adjustment))
 
-    # Keep display probabilities realistic. They are strength estimates, not guaranteed odds.
-    if projected_rank <= paid_spots:
-        rank_cash_base = 48.0 + (1.0 - projected_rank / max(paid_spots, 1)) * 34.0
-    else:
-        distance_out = (projected_rank - paid_spots) / max(contest_size - paid_spots, 1)
-        rank_cash_base = max(3.0, 28.0 * (1.0 - distance_out))
+    # Honest probability caps. If the median/projection misses the cash line,
+    # do not allow the UI to show a fake 50%+ min-cash rate or huge EV.
+    top_10_rank = max(1, round(contest_size * 0.10))
+    top_1_rank = max(1, round(contest_size * 0.01))
+    top_0_1_rank = max(1, round(contest_size * 0.001))
 
-    cash_probability = max(1.0, min(88.0, (cash_probability * 0.35 + rank_cash_base * 0.65) * payout_adjustment))
+    if projected_rank > paid_spots:
+        cash_probability = min(cash_probability, 34.0 if ceiling_rank <= paid_spots else 18.0)
+    if projected_rank > top_10_rank:
+        top_10_probability = min(top_10_probability, 16.0 if ceiling_rank <= top_10_rank else 7.5)
+    if projected_rank > top_1_rank:
+        top_1_probability = min(top_1_probability, 3.2 if ceiling_rank <= top_1_rank else 1.1)
+    if projected_rank > top_0_1_rank:
+        top_0_1_probability = min(top_0_1_probability, 0.35 if ceiling_rank <= top_0_1_rank else 0.08)
 
-    top_10_cut = max(1, round(contest_size * 0.10))
-    top_1_cut = max(1, round(contest_size * 0.01))
-    top_01_cut = max(1, round(contest_size * 0.001))
-
-    rank_top10_base = 42.0 if ceiling_rank <= top_10_cut else max(1.0, 26.0 * (top_10_cut / max(ceiling_rank, 1)))
-    rank_top1_base = 14.0 if ceiling_rank <= top_1_cut else max(0.1, 8.0 * (top_1_cut / max(ceiling_rank, 1)))
-    rank_top01_base = 3.5 if ceiling_rank <= top_01_cut else max(0.01, 1.4 * (top_01_cut / max(ceiling_rank, 1)))
-
-    top_10_probability = max(0.1, min(65.0, (top_10_probability * 0.30 + rank_top10_base * 0.70) * entry_adjustment))
-    top_1_probability = max(0.01, min(22.0, (top_1_probability * 0.25 + rank_top1_base * 0.75) * entry_adjustment))
-    top_0_1_probability = max(0.001, min(5.0, (top_0_1_probability * 0.20 + rank_top01_base * 0.80) * entry_adjustment))
+    cash_probability = round(max(0.0, min(99.0, cash_probability)), 1)
+    top_10_probability = round(max(0.0, min(cash_probability, top_10_probability)), 1)
+    top_1_probability = round(max(0.0, min(top_10_probability, top_1_probability)), 2)
+    top_0_1_probability = round(max(0.0, min(top_1_probability, top_0_1_probability)), 3)
 
     payout_model = estimate_expected_payout_from_probabilities(
         contest=contest,
@@ -4416,6 +4508,19 @@ def health():
     }
 
 
+@app.get("/persistence-status")
+def persistence_status():
+    return {
+        "success": True,
+        "database_persistence_enabled": database_available(),
+        "database_url_configured": bool(DATABASE_URL),
+        "psycopg_installed": psycopg is not None,
+        "active_slate_persisted": has_persistent_active_slate(),
+        "data_dir": str(DATA_DIR),
+        "note": "For DigitalOcean App Platform, set DATABASE_URL to a Managed PostgreSQL database so the admin CSV persists for all users.",
+    }
+
+
 @app.get("/slate-status")
 def slate_status():
     players = add_values(load_players())
@@ -4426,7 +4531,8 @@ def slate_status():
         "player_count": len(players),
         "active_player_count": active_count,
         "inactive_player_count": inactive_count,
-        "has_imported_slate": ACTIVE_SLATE_PATH.exists(),
+        "has_imported_slate": has_persistent_active_slate(),
+        "database_persistence_enabled": database_available(),
         "speed_boost": "enabled",
         "salary_cap": SALARY_CAP,
         "roster_slots": ROSTER_SLOTS,
@@ -4477,8 +4583,7 @@ async def upload_dk_csv(
 def use_sample_slate(request: AdminPasswordRequest):
     if request.admin_password != ADMIN_PASSWORD:
         return {"success": False, "error": "Invalid admin password."}
-    if ACTIVE_SLATE_PATH.exists():
-        ACTIVE_SLATE_PATH.unlink()
+    clear_active_slate()
     ensure_sample_players_file()
     players = load_players()
     return {
@@ -4493,8 +4598,7 @@ def use_sample_slate(request: AdminPasswordRequest):
 def clear_imported_slate(admin_password: str = Form(...)):
     if admin_password != ADMIN_PASSWORD:
         return {"success": False, "error": "Invalid admin password."}
-    if ACTIVE_SLATE_PATH.exists():
-        ACTIVE_SLATE_PATH.unlink()
+    clear_active_slate()
     ensure_sample_players_file()
     return {
         "success": True,
