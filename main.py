@@ -189,8 +189,7 @@ class ContestSimulationRequest(BaseModel):
     field_size: int = 5000
     entry_fee: float = 5.0
     prize_pool: float = 1000.0
-    top_prize: float = 0.0
-    min_cash_payout: float = 0.0
+    top_prize: float = 1000.0
     paid_positions: int = 0
     payout_rate: float = 0.20
     payout_percent: float = 20.0
@@ -1743,6 +1742,19 @@ def score_lineup(lineup, mode, randomness=0):
 
     if mode == "cash":
         randomness = min(randomness, 10)
+    else:
+        # Tournament optimizer: keep projection as the anchor, but lean harder into
+        # ceiling paths that can actually finish near the top of large-field GPPs.
+        stack = best_stack_info(lineup)
+        stack_size = safe_int(stack.get("size", 0), 0)
+        counts = stack.get("counts", {}) or {}
+        secondary = max([v for k, v in counts.items() if k != stack.get("team", "") and v >= 2] or [0])
+        avg_leverage = sum(safe_float(p.get("leverage_score", 45), 45) for p in lineup) / len(lineup) if lineup else 0
+        avg_own = sum(safe_float(p.get("ownership", 10), 10) for p in lineup) / len(lineup) if lineup else 0
+        score += max(0, stack_size - 3) * 2.25
+        score += secondary * 0.9
+        score += max(0, avg_leverage - 50) * 0.045
+        score += max(0, 16 - avg_own) * 0.08
 
     return score + deterministic_random_bonus(lineup, randomness)
 
@@ -2117,7 +2129,7 @@ def build_all_lineups(
                                     "lineup": lineup,
                                 }
 
-                                valid_lineups.append(add_lineup_metadata(lineup_data))
+                                valid_lineups.append(attach_builder_scores(add_lineup_metadata(lineup_data), None))
 
                                 if len(valid_lineups) >= 1200:
                                     valid_lineups.sort(key=lambda x: x["optimizer_score"], reverse=True)
@@ -2396,6 +2408,122 @@ def optimizer_debug_error(message, debug_report):
         return f"{message} Missing: {compact}"
     return message
 
+
+
+def lineup_ceiling_builder_score(lineup_data, request=None):
+    """
+    Big GPP ceiling-first builder score.
+
+    This is intentionally different from cash projection sorting. For massive-field
+    tournaments we still want strong projections, but we also need a realistic path
+    to a top finish: correlated stacks, leverage, team totals, low-owned upside,
+    and fewer dead/fade plays.
+    """
+    lineup = lineup_data.get("lineup", []) if isinstance(lineup_data, dict) else []
+    if not lineup:
+        return 0.0
+
+    mode = str(getattr(request, "mode", lineup_data.get("mode", "gpp")) or "gpp").lower()
+    strategy = str(getattr(request, "strategy_mode", "custom") or "custom").lower()
+    stack_type = str(getattr(request, "stack_type", "auto") or "auto").lower()
+
+    projection = safe_float(lineup_data.get("projected_points", 0), 0)
+    boosted = sum(safe_float(p.get("boosted_projection", p.get("projection", 0)), 0) for p in lineup)
+    salary = safe_int(lineup_data.get("total_salary", sum(safe_int(p.get("salary", 0), 0) for p in lineup)), 0)
+    remaining = SALARY_CAP - salary
+    stack = best_stack_info(lineup)
+    stack_size = safe_int(stack.get("size", 0), 0)
+    stack_team = stack.get("team", "")
+    counts = stack.get("counts", {}) or {}
+    secondary_sizes = sorted([v for k, v in counts.items() if k != stack_team and v >= 2], reverse=True)
+    secondary_size = secondary_sizes[0] if secondary_sizes else 0
+
+    avg_ownership = sum(safe_float(p.get("ownership", 10), 10) for p in lineup) / len(lineup)
+    avg_leverage = sum(safe_float(p.get("leverage_score", 45), 45) for p in lineup) / len(lineup)
+    avg_core = sum(safe_float(p.get("core_play_score", 50), 50) for p in lineup) / len(lineup)
+    total_vegas = sum(safe_float(p.get("vegas_boost", 0), 0) for p in lineup)
+    stack_team_total = lineup_stack_team_total(lineup)
+    core_profile = lineup_core_profile(lineup)
+    core_count = safe_int(core_profile.get("core_play_count", 0), 0)
+    strong_count = safe_int(core_profile.get("strong_play_count", 0), 0)
+    bad_chalk_count = safe_int(core_profile.get("bad_chalk_count", 0), 0)
+    fade_count = safe_int(core_profile.get("fade_count", 0), 0)
+    conflict = pitcher_vs_hitter_conflict(lineup)
+
+    # Cash/H2H should still prefer projection, safety, and salary usage.
+    if mode == "cash" or strategy == "cash_double_up":
+        safety = safe_float(lineup_quality_profile(lineup, "cash").get("lineup_quality_breakdown", {}).get("safety_score", 80), 80)
+        cash_salary = 8 if remaining <= 800 else 3 if remaining <= 1600 else -4
+        return round(projection * 1.55 + boosted * 0.45 + safety * 0.18 + cash_salary - (12 if conflict else 0), 3)
+
+    # Projection remains the base. We are not building random lottery lineups.
+    score = projection * 1.18 + boosted * 0.52
+
+    # Big GPPs need stack paths to first place. Reward true MLB structures.
+    if stack_size >= 5:
+        score += 28
+    elif stack_size == 4:
+        score += 20
+    elif stack_size == 3:
+        score += 9
+    elif stack_size <= 2:
+        score -= 8
+
+    if secondary_size >= 3:
+        score += 10
+    elif secondary_size == 2:
+        score += 6
+
+    # Match requested stack structures.
+    if stack_type in ["5-2", "5_2"]:
+        if stack_size >= 5 and secondary_size >= 2:
+            score += 12
+        elif stack_size < 5:
+            score -= 10
+    elif stack_type in ["4-3", "4_3"]:
+        if stack_size >= 4 and secondary_size >= 3:
+            score += 13
+        elif stack_size >= 4 and secondary_size >= 2:
+            score += 6
+        else:
+            score -= 7
+    elif stack_type in ["5-man", "5", "five"]:
+        score += 8 if stack_size >= 5 else -9
+
+    # Leverage and low-owned upside matter more for large-field tournaments.
+    score += max(0, avg_leverage - 45) * 0.34
+    score += max(0, 18 - avg_ownership) * 0.55
+    score += max(0, stack_team_total - 4.2) * 4.5
+    score += max(0, total_vegas) * 2.6
+    score += max(0, avg_core - 58) * 0.12
+    score += core_count * 2.2 + strong_count * 0.95
+
+    # Salary rules: do not require perfect salary in big GPPs, but avoid leaving too much unused.
+    if remaining <= 300:
+        score += 2
+    elif remaining <= 1800:
+        score += 5
+    elif remaining <= 3500:
+        score += 1
+    else:
+        score -= min(10, (remaining - 3500) / 350)
+
+    # Penalize the stuff that kills top-heavy tournament chances.
+    score -= bad_chalk_count * 5.5
+    score -= fade_count * 6.5
+    if conflict:
+        score -= 14
+
+    return round(score, 3)
+
+
+def attach_builder_scores(lineup_data, request=None):
+    score = lineup_ceiling_builder_score(lineup_data, request)
+    lineup_data["ceiling_builder_score"] = score
+    lineup_data["big_gpp_builder_score"] = score
+    lineup_data["builder_goal"] = "Ceiling-first tournament finish" if str(lineup_data.get("mode", "gpp")).lower() == "gpp" else "Cash safety / projection"
+    return lineup_data
+
 def build_fast_multi_lineups_for_pro(request, count):
     """
     Fast lineup builder for Pro multi-lineup mode.
@@ -2622,12 +2750,12 @@ def build_fast_multi_lineups_for_pro(request, count):
             "optimizer_score": round(score, 2),
             "lineup": lineup,
         }
-        candidate_lineups.append(add_lineup_metadata(lineup_data))
+        candidate_lineups.append(attach_builder_scores(add_lineup_metadata(lineup_data), request))
 
         if len(candidate_lineups) >= max(count * 3, count):
             break
 
-    candidate_lineups.sort(key=lambda x: x["optimizer_score"], reverse=True)
+    candidate_lineups.sort(key=lambda x: x.get("ceiling_builder_score", x.get("optimizer_score", 0)), reverse=True)
 
     if not candidate_lineups:
         # Fallback 1: relax advanced rules but still respect locks/excludes and active slate.
@@ -2677,7 +2805,7 @@ def build_fast_multi_lineups_for_pro(request, count):
                 "optimizer_score": round(score, 2),
                 "lineup": lineup,
             }
-            candidate_lineups.append(add_lineup_metadata(lineup_data))
+            candidate_lineups.append(attach_builder_scores(add_lineup_metadata(lineup_data), request))
 
             if len(candidate_lineups) >= max(count * 2, count):
                 break
@@ -2722,14 +2850,14 @@ def build_fast_multi_lineups_for_pro(request, count):
             seen.add(key)
             projection = sum(p.get("projection", 0) for p in lineup)
             score = score_lineup(lineup, mode, 0)
-            candidate_lineups.append(add_lineup_metadata({
+            candidate_lineups.append(attach_builder_scores(add_lineup_metadata({
                 "mode": mode,
                 "total_salary": salary,
                 "projected_points": round(projection, 2),
                 "optimizer_score": round(score, 2),
                 "lineup": lineup,
                 "lineup_warning": "Used fallback pool because active-only slate could not build a valid lineup.",
-            }))
+            }), request))
             if len(candidate_lineups) >= count:
                 break
         trim_report = fallback_trim
@@ -2738,7 +2866,7 @@ def build_fast_multi_lineups_for_pro(request, count):
     if not candidate_lineups:
         return [], "No valid MLB lineups found. Auto cleanup may have removed too much of this slate. Re-upload CSV or reactivate players in Player Lab.", trim_report, checked
 
-    candidate_lineups.sort(key=lambda x: x["optimizer_score"], reverse=True)
+    candidate_lineups.sort(key=lambda x: x.get("ceiling_builder_score", x.get("optimizer_score", 0)), reverse=True)
 
     selected = diversify_lineups(
         all_lineups=candidate_lineups,
@@ -2876,19 +3004,24 @@ def normalize_contest_request(request: ContestSimulationRequest):
     # Entry fee / buy-in per entry.
     entry_fee = max(0.0, safe_float(getattr(request, "entry_fee", 5.0), 5.0))
 
-    # Total prize pool.
+    # Total prize pool. Keep top_prize fallback for older frontend builds.
     prize_pool = safe_float(getattr(request, "prize_pool", 0), 0)
+    if prize_pool <= 0:
+        prize_pool = safe_float(getattr(request, "top_prize", 1000.0), 1000.0)
     prize_pool = max(1.0, prize_pool)
 
-    # Max entries allowed by contest.
+    # Max entries allowed by contest. Single-entry contests are easier to rank in
+    # than max-entry lottery fields, so this affects field pressure.
     max_entries = safe_int(getattr(request, "max_entries", 1), 1)
     max_entries = max(1, min(max_entries, 150))
     single_entry = bool(getattr(request, "single_entry", False)) or max_entries <= 1
     if single_entry:
         max_entries = 1
 
-    # Paid positions can be entered directly. If not provided, fall back to payout_rate / payout_percent.
+    # Paid positions can be entered directly. If not provided, fall back to
+    # payout_rate / payout_percent.
     paid_positions = safe_int(getattr(request, "paid_positions", 0), 0)
+
     payout_rate = safe_float(getattr(request, "payout_rate", 0), 0)
     if payout_rate <= 0:
         payout_rate = safe_float(getattr(request, "payout_percent", 20.0), 20.0) / 100
@@ -2900,34 +3033,6 @@ def normalize_contest_request(request: ContestSimulationRequest):
         payout_rate = max(0.01, min(payout_rate, 0.80))
         paid_positions = max(1, min(contest_size, round(contest_size * payout_rate)))
 
-    # First-place payout and min-cash payout are the two most important pieces
-    # for a realistic DFS payout curve. If the frontend does not send them yet,
-    # derive conservative values from the contest inputs.
-    entered_top_prize = safe_float(getattr(request, "top_prize", 0), 0)
-    if entered_top_prize > 0 and entered_top_prize <= prize_pool:
-        top_prize = entered_top_prize
-    else:
-        if contest_size >= 50000 or max_entries >= 100:
-            top_pct = 0.30
-        elif contest_size >= 10000 or max_entries >= 20:
-            top_pct = 0.27
-        elif single_entry:
-            top_pct = 0.16
-        else:
-            top_pct = 0.20
-        top_prize = max(entry_fee * 20, prize_pool * top_pct)
-        top_prize = min(top_prize, prize_pool * 0.45)
-
-    entered_min_cash = safe_float(getattr(request, "min_cash_payout", 0), 0)
-    if entered_min_cash > 0:
-        min_cash_payout = entered_min_cash
-    else:
-        # DK-style min cash is often 1.5x entry in GPPs.
-        min_cash_payout = max(entry_fee * 1.5, entry_fee + 1.0)
-
-    min_cash_payout = min(max(0.0, min_cash_payout), max(prize_pool, 1.0))
-    top_prize = max(top_prize, min_cash_payout)
-
     return {
         "contest_size": contest_size,
         "field_size": contest_size,
@@ -2937,8 +3042,6 @@ def normalize_contest_request(request: ContestSimulationRequest):
         "paid_positions": paid_positions,
         "entry_fee": entry_fee,
         "prize_pool": prize_pool,
-        "top_prize": round(top_prize, 2),
-        "min_cash_payout": round(min_cash_payout, 2),
         "max_entries": max_entries,
         "single_entry": single_entry,
         "total_entry_cost": round(entry_fee * max_entries, 2),
@@ -3149,147 +3252,78 @@ def simulator_focus_label(focus: str):
 
 
 
-def _payout_curve_alpha(paid_spots, prize_pool, top_prize, min_cash):
-    """Solve a power-curve alpha so the synthetic payout table sums near prize_pool."""
-    paid_spots = max(1, safe_int(paid_spots, 1))
-    prize_pool = max(1.0, safe_float(prize_pool, 1.0))
-    top_prize = max(0.0, safe_float(top_prize, 0.0))
-    min_cash = max(0.0, safe_float(min_cash, 0.0))
-
-    if paid_spots <= 1 or top_prize <= min_cash:
-        return 1.0
-
-    # If top prize + min cash floor already exceeds the pool, scale happens later.
-    floor_total = min_cash * paid_spots
-    extra_needed = max(0.0, prize_pool - floor_total)
-    extra_possible = max(1e-9, (top_prize - min_cash) * paid_spots)
-    target_average_power = max(0.000001, min(0.999999, extra_needed / extra_possible))
-
-    # Average x^alpha over x in [0,1] is close to 1/(alpha+1). Use binary search
-    # on the discrete paid-rank grid so the curve matches the actual paid spots.
-    lo, hi = 0.05, 5000.0
-    for _ in range(80):
-        mid = (lo + hi) / 2.0
-        total_power = 0.0
-        for rank in range(1, paid_spots + 1):
-            x = (paid_spots - rank) / max(paid_spots - 1, 1)
-            total_power += x ** mid
-        avg_power = total_power / paid_spots
-        if avg_power > target_average_power:
-            lo = mid
-        else:
-            hi = mid
-    return (lo + hi) / 2.0
-
-
 def payout_for_rank(rank, contest):
     """
-    Realistic DFS rank-to-payout lookup from entered contest details.
-
-    Important behavior:
-    - Outside paid positions = $0.
-    - Last paid spot = min-cash.
-    - 1st place = top_prize.
-    - Curve is solved so the total paid table approximates the prize pool.
-    This prevents impossible outputs like 1,000th place paying $1,000+ in a
-    contest where min cash is around $27.
+    Approximate a realistic DFS payout curve when the user enters only contest
+    size, paid spots, prize pool, and buy-in. This is not a sportsbook/provider
+    payout table, but it behaves like common DFS tournaments:
+    - Cash/H2H: flatter min-cash style payout.
+    - Single-entry GPP: moderately top-heavy.
+    - Massive-field GPP: very top-heavy.
     """
     contest_size = max(1, safe_int(contest.get("contest_size", 1), 1))
-    paid_spots = max(1, min(contest_size, safe_int(contest.get("estimated_paid_spots", 1), 1)))
+    paid_spots = max(1, safe_int(contest.get("estimated_paid_spots", 1), 1))
     entry_fee = max(0.01, safe_float(contest.get("entry_fee", 1.0), 1.0))
     prize_pool = max(1.0, safe_float(contest.get("prize_pool", 1.0), 1.0))
-    top_prize = safe_float(contest.get("top_prize", 0), 0)
-    min_cash = safe_float(contest.get("min_cash_payout", 0), 0)
-
-    if min_cash <= 0:
-        min_cash = max(entry_fee * 1.5, entry_fee + 1.0)
-    if top_prize <= 0 or top_prize > prize_pool:
-        max_entries = max(1, safe_int(contest.get("max_entries", 1), 1))
-        if contest_size >= 50000 or max_entries >= 100:
-            top_prize = prize_pool * 0.30
-        elif contest_size >= 10000 or max_entries >= 20:
-            top_prize = prize_pool * 0.27
-        elif bool(contest.get("single_entry", False)):
-            top_prize = prize_pool * 0.16
-        else:
-            top_prize = prize_pool * 0.20
-
-    min_cash = max(0.0, min(min_cash, prize_pool))
-    top_prize = max(min_cash, min(top_prize, prize_pool))
+    max_entries = max(1, safe_int(contest.get("max_entries", 1), 1))
+    single_entry = bool(contest.get("single_entry", False))
 
     rank = max(1, min(safe_int(rank, contest_size), contest_size))
     if rank > paid_spots:
         return 0.0
+
+    payout_rate = paid_spots / contest_size
+
+    # Cash/H2H/double-up style contests should not use top-heavy GPP payouts.
+    if payout_rate >= 0.45 and max_entries == 1:
+        return round(max(entry_fee * 1.75, prize_pool / max(paid_spots, 1)), 2)
+
+    min_cash = max(entry_fee * 1.5, prize_pool * 0.00035)
+
+    if contest_size >= 100000:
+        top_pct = 0.22
+        curve_alpha = 4.2
+    elif contest_size >= 25000 or max_entries >= 50:
+        top_pct = 0.18
+        curve_alpha = 3.65
+    elif single_entry:
+        top_pct = 0.10
+        curve_alpha = 2.65
+    else:
+        top_pct = 0.14
+        curve_alpha = 3.05
+
+    top_prize = max(entry_fee * 25, prize_pool * top_pct)
     if paid_spots <= 1:
-        return round(min(prize_pool, top_prize), 2)
-    if rank == 1:
-        return round(top_prize, 2)
-    if rank == paid_spots:
-        return round(min_cash, 2)
+        return round(min(top_prize, prize_pool), 2)
 
-    alpha = _payout_curve_alpha(paid_spots, prize_pool, top_prize, min_cash)
-    x = (paid_spots - rank) / max(paid_spots - 1, 1)
-    payout = min_cash + (top_prize - min_cash) * (x ** alpha)
+    # rank_position = 1.0 for 1st, 0.0 for last paid.
+    rank_position = (paid_spots - rank) / max(paid_spots - 1, 1)
+    payout = min_cash + (top_prize - min_cash) * (rank_position ** curve_alpha)
 
-    # Never show lower paid places as huge payouts. The solved curve already
-    # handles most of this; this clamp protects odd user-entered prize pools.
-    if rank > paid_spots * 0.25:
-        payout = min(payout, max(min_cash * 3.0, entry_fee * 5.0))
-    if rank > paid_spots * 0.50:
-        payout = min(payout, max(min_cash * 1.75, entry_fee * 3.0))
-
+    # Keep individual payout within the actual prize pool.
     return round(max(0.0, min(payout, prize_pool)), 2)
-
-
-def probability_to_finish_at_or_better(projected_rank, ceiling_rank, cutoff_rank, contest_size):
-    """Conservative probability that a lineup beats a rank cutoff."""
-    contest_size = max(1, safe_int(contest_size, 1))
-    projected_rank = max(1, min(safe_int(projected_rank, contest_size), contest_size))
-    ceiling_rank = max(1, min(safe_int(ceiling_rank, projected_rank), contest_size))
-    cutoff_rank = max(1, min(safe_int(cutoff_rank, contest_size), contest_size))
-
-    if projected_rank <= cutoff_rank:
-        edge = (cutoff_rank - projected_rank) / max(cutoff_rank, 1)
-        return round(max(50.0, min(92.0, 62.0 + edge * 24.0)), 2)
-
-    if ceiling_rank <= cutoff_rank:
-        # Cutoff is between the median and ceiling outcome.
-        ratio = (projected_rank - cutoff_rank) / max(projected_rank - ceiling_rank, 1)
-        return round(max(6.0, min(46.0, 8.0 + ratio * 34.0)), 2)
-
-    # Even the ceiling rank misses the cutoff, so this should be rare.
-    ratio = cutoff_rank / max(ceiling_rank, 1)
-    return round(max(0.001, min(8.0, (ratio ** 2.15) * 9.0)), 3)
 
 
 def estimate_expected_payout_from_probabilities(contest, projected_rank, ceiling_rank, cash_probability, top_10_probability, top_1_probability, top_0_1_probability):
     contest_size = max(1, safe_int(contest.get("contest_size", 1), 1))
     paid_spots = max(1, safe_int(contest.get("estimated_paid_spots", 1), 1))
 
-    # Rebuild probabilities from the rank range so payout math matches shown ranks.
-    cash_probability = probability_to_finish_at_or_better(projected_rank, ceiling_rank, paid_spots, contest_size)
-    top_10_cutoff = max(1, round(contest_size * 0.10))
-    top_1_cutoff = max(1, round(contest_size * 0.01))
-    top_0_1_cutoff = max(1, round(contest_size * 0.001))
-    top_10_probability = min(cash_probability, probability_to_finish_at_or_better(projected_rank, ceiling_rank, top_10_cutoff, contest_size))
-    top_1_probability = min(top_10_probability, probability_to_finish_at_or_better(projected_rank, ceiling_rank, top_1_cutoff, contest_size))
-    top_0_1_probability = min(top_1_probability, probability_to_finish_at_or_better(projected_rank, ceiling_rank, top_0_1_cutoff, contest_size))
+    p_cash = max(0.0, min(1.0, safe_float(cash_probability, 0) / 100.0))
+    p_top10 = max(0.0, min(p_cash, safe_float(top_10_probability, 0) / 100.0))
+    p_top1 = max(0.0, min(p_top10, safe_float(top_1_probability, 0) / 100.0))
+    p_top01 = max(0.0, min(p_top1, safe_float(top_0_1_probability, 0) / 100.0))
 
-    p_cash = max(0.0, min(1.0, cash_probability / 100.0))
-    p_top10 = max(0.0, min(p_cash, top_10_probability / 100.0))
-    p_top1 = max(0.0, min(p_top10, top_1_probability / 100.0))
-    p_top01 = max(0.0, min(p_top1, top_0_1_probability / 100.0))
-
-    # Non-overlapping buckets.
+    # Convert cumulative probabilities into non-overlapping buckets.
     bucket_top01 = p_top01
     bucket_top1 = max(0.0, p_top1 - p_top01)
     bucket_top10 = max(0.0, p_top10 - p_top1)
     bucket_cash = max(0.0, p_cash - p_top10)
 
-    rank_top01 = max(1, round(contest_size * 0.001))
-    rank_top1 = max(1, round(contest_size * 0.01))
-    rank_top10 = max(1, round(contest_size * 0.10))
-    rank_cash = max(1, round((paid_spots + rank_top10) / 2))
+    rank_top01 = max(1, round(contest_size * 0.0005))
+    rank_top1 = max(1, round(contest_size * 0.005))
+    rank_top10 = max(1, round(contest_size * 0.05))
+    rank_cash = max(1, round((paid_spots + max(rank_top10, 1)) / 2))
 
     expected = (
         bucket_top01 * payout_for_rank(rank_top01, contest)
@@ -3301,6 +3335,10 @@ def estimate_expected_payout_from_probabilities(contest, projected_rank, ceiling
     projected_payout = payout_for_rank(projected_rank, contest)
     ceiling_payout = payout_for_rank(ceiling_rank, contest)
 
+    # Blend model EV with rank-based payout so the shown projected rank and payout
+    # agree with each other. The probabilities still drive upside EV.
+    expected = expected * 0.72 + projected_payout * 0.18 + ceiling_payout * 0.10
+
     return {
         "expected_payout": round(expected, 2),
         "projected_payout": round(projected_payout, 2),
@@ -3309,11 +3347,6 @@ def estimate_expected_payout_from_probabilities(contest, projected_rank, ceiling
         "top_10_rank_payout": payout_for_rank(max(1, round(contest_size * 0.10)), contest),
         "top_1_rank_payout": payout_for_rank(max(1, round(contest_size * 0.01)), contest),
         "top_0_1_rank_payout": payout_for_rank(max(1, round(contest_size * 0.001)), contest),
-        "cash_probability": round(cash_probability, 1),
-        "top_10_probability": round(top_10_probability, 1),
-        "top_1_probability": round(top_1_probability, 2),
-        "top_0_1_probability": round(top_0_1_probability, 3),
-        "payout_model_note": "Rank-based payout curve. Exact payouts require the real contest payout table.",
     }
 
 def simulate_single_lineup(lineup_data, request: ContestSimulationRequest, lineup_number=1):
@@ -3476,8 +3509,15 @@ def simulate_single_lineup(lineup_data, request: ContestSimulationRequest, lineu
     ceiling_rank_ratio = max(0.00005, min(0.85, projected_rank_ratio * (0.34 if focus == "big_field_gpp" else 0.42) - (top_1_probability / 1000.0) - (top_0_1_probability / 600.0)))
     ceiling_rank = max(1, min(contest_size, round(contest_size * ceiling_rank_ratio)))
 
-    # Make probabilities payout-aware and rank-consistent. The old model inflated
-    # Top 1% / Top 0.1% outcomes and created impossible ROI numbers.
+    # Make probabilities contest-aware.
+    # More paid spots helps min-cash probability. Multi-entry fields make top-end outcomes harder.
+    payout_adjustment = max(0.55, min(1.55, payout_rate / 0.20))
+    entry_adjustment = 1.0 + (0.08 if single_entry else 0.0) - min(0.30, math.log10(max(max_entries, 1)) * 0.055)
+    cash_probability = max(0.5, min(99.0, cash_probability * payout_adjustment))
+    top_10_probability = max(0.1, min(85.0, top_10_probability * entry_adjustment))
+    top_1_probability = max(0.01, min(50.0, top_1_probability * entry_adjustment))
+    top_0_1_probability = max(0.001, min(15.0, top_0_1_probability * entry_adjustment))
+
     payout_model = estimate_expected_payout_from_probabilities(
         contest=contest,
         projected_rank=projected_rank,
@@ -3487,10 +3527,6 @@ def simulate_single_lineup(lineup_data, request: ContestSimulationRequest, lineu
         top_1_probability=top_1_probability,
         top_0_1_probability=top_0_1_probability,
     )
-    cash_probability = safe_float(payout_model.get("cash_probability", cash_probability), cash_probability)
-    top_10_probability = safe_float(payout_model.get("top_10_probability", top_10_probability), top_10_probability)
-    top_1_probability = safe_float(payout_model.get("top_1_probability", top_1_probability), top_1_probability)
-    top_0_1_probability = safe_float(payout_model.get("top_0_1_probability", top_0_1_probability), top_0_1_probability)
     expected_payout = safe_float(payout_model.get("expected_payout", 0), 0)
     projected_payout = safe_float(payout_model.get("projected_payout", 0), 0)
     ceiling_payout = safe_float(payout_model.get("ceiling_payout", 0), 0)
@@ -3534,8 +3570,6 @@ def simulate_single_lineup(lineup_data, request: ContestSimulationRequest, lineu
         "top_10_rank_payout": payout_model.get("top_10_rank_payout", 0),
         "top_1_rank_payout": payout_model.get("top_1_rank_payout", 0),
         "top_0_1_rank_payout": payout_model.get("top_0_1_rank_payout", 0),
-        "payout_model_note": payout_model.get("payout_model_note", "Rank-based payout curve."),
-        "top_prize": contest.get("top_prize", 0),
         "max_entry_expected_value": max_entry_expected_value,
         "max_entry_roi_percent": max_entry_roi_percent,
         "buy_in_per_entry": round(entry_fee, 2),
@@ -3618,7 +3652,6 @@ def simulate_contest_payload(request: ContestSimulationRequest):
         "best_ceiling_payout": best.get("ceiling_payout", 0),
         "best_recommendation": best.get("recommendation", "Playable"),
         "best_roi_percent": best.get("roi_percent", 0),
-        "payout_model_note": best.get("payout_model_note", "Rank-based payout curve. Exact payouts require the real contest payout table."),
     }
 
     return {
@@ -4258,7 +4291,8 @@ def ai_lineup_builder(request: AutoLineupBuilderRequest):
         return {"success": False, "error": "AI builder could not find valid lineups. Try clearing locks/excludes or lowering the salary floor.", "lineups": [], "exposures": []}
 
     selected.sort(key=lambda item: (
-        safe_float(item.get("win_probability", 0), 0),
+        safe_float(item.get("ceiling_builder_score", item.get("big_gpp_builder_score", 0)), 0),
+        safe_float(item.get("projected_points", 0), 0),
         safe_float(item.get("lineup_quality_score", 0), 0),
         safe_float(item.get("optimizer_score", 0), 0),
     ), reverse=True)
