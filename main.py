@@ -2408,6 +2408,21 @@ def diversify_lineups(
             selected.append(candidate)
             update_exposure(candidate["lineup"], exposure_tracker)
 
+    # Emergency fill: live users should never tap Generate and see nothing.
+    # If exposure/similarity rules are too strict for a small candidate pool,
+    # fill remaining slots with the best unique valid lineups and mark them.
+    if len(selected) < count:
+        for candidate in all_lineups:
+            if len(selected) >= count:
+                break
+            key = lineup_key(candidate["lineup"])
+            if any(lineup_key(existing["lineup"]) == key for existing in selected):
+                continue
+            candidate = dict(candidate)
+            candidate["lineup_warning"] = candidate.get("lineup_warning") or "Filled after relaxing exposure/similarity rules because the slate candidate pool was small."
+            selected.append(candidate)
+            update_exposure(candidate["lineup"], exposure_tracker)
+
     return selected
 
 
@@ -4441,39 +4456,120 @@ def ai_picks_status():
 
 @app.post("/ai-lineup-builder/build")
 def ai_lineup_builder(request: AutoLineupBuilderRequest):
-    tuned = apply_auto_builder_strategy(request)
-    selected, error, trim_report, checked = build_fast_multi_lineups_for_pro(tuned, tuned.count)
-    if error:
-        return {"success": False, "error": error, "lineups": [], "exposures": []}
-    if not selected:
-        return {"success": False, "error": "AI builder could not find valid lineups. Try clearing locks/excludes or lowering the salary floor.", "lineups": [], "exposures": []}
+    """
+    Production-safe AI builder.
 
-    selected.sort(key=lambda item: (
-        safe_float(item.get("ceiling_builder_score", item.get("big_gpp_builder_score", 0)), 0),
-        safe_float(item.get("projected_points", 0), 0),
-        safe_float(item.get("lineup_quality_score", 0), 0),
-        safe_float(item.get("optimizer_score", 0), 0),
-    ), reverse=True)
+    The previous version could return no visible result when stack/min-salary/exposure
+    settings were too strict for the uploaded slate. This version tries the requested
+    build first, then progressively relaxes constraints so the app always returns
+    either lineups or a clear backend error.
+    """
+    try:
+        tuned = apply_auto_builder_strategy(request)
+        requested_count = tuned.count if tuned.count in [1, 5, 10, 20] else 10
 
-    return {
-        "success": True,
-        "mode": tuned.mode,
-        "contest_focus": tuned.contest_focus,
-        "build_style": tuned.build_style,
-        "strategy_mode": tuned.strategy_mode,
-        "stack_type": tuned.stack_type,
-        "requested_count": tuned.count,
-        "returned_count": len(selected),
-        "lineups": selected,
-        "exposures": calculate_exposures(selected),
-        "ai_picks": ai_picks_summary(),
-        "ai_builder_notes": auto_builder_notes(tuned, selected),
-        "trim_report": trim_report,
-        "combinations_checked": checked,
-        "salary_cap": SALARY_CAP,
-        "roster_slots": ROSTER_SLOTS,
-        "generated_at": datetime.utcnow().isoformat() + "Z",
-    }
+        attempts = []
+
+        # 1) Requested AI/takedown build.
+        attempts.append(("requested_ai_takedown", tuned))
+
+        # 2) Keep GPP strategy but relax salary floor and stack type slightly.
+        relaxed_one = AutoLineupBuilderRequest(**tuned.dict())
+        relaxed_one.min_salary = min(relaxed_one.min_salary, 44000)
+        relaxed_one.stack_type = "4-3"
+        relaxed_one.force_team_stack = True
+        relaxed_one.force_qb_stack = True
+        relaxed_one.max_same_players = 8
+        relaxed_one.max_exposure = 80
+        attempts.append(("relaxed_salary_stack", relaxed_one))
+
+        # 3) Allow any strong stack, keep pitcher-vs-hitter safety.
+        relaxed_two = AutoLineupBuilderRequest(**tuned.dict())
+        relaxed_two.min_salary = 0
+        relaxed_two.stack_type = "auto"
+        relaxed_two.force_team_stack = True
+        relaxed_two.force_qb_stack = True
+        relaxed_two.max_same_players = 9
+        relaxed_two.max_exposure = 100
+        attempts.append(("relaxed_exposure_salary", relaxed_two))
+
+        # 4) Final emergency: no forced stack. This should only happen on thin or weird slates.
+        emergency = AutoLineupBuilderRequest(**tuned.dict())
+        emergency.min_salary = 0
+        emergency.stack_type = "auto"
+        emergency.force_team_stack = False
+        emergency.force_qb_stack = False
+        emergency.max_same_players = 9
+        emergency.max_exposure = 100
+        attempts.append(("emergency_valid_lineups", emergency))
+
+        last_error = None
+        last_trim_report = {}
+        last_checked = 0
+        selected = []
+        used_attempt = "none"
+        used_request = tuned
+
+        for label, attempt_request in attempts:
+            selected, error, trim_report, checked = build_fast_multi_lineups_for_pro(attempt_request, requested_count)
+            last_error = error
+            last_trim_report = trim_report or {}
+            last_checked = checked
+            if selected:
+                used_attempt = label
+                used_request = attempt_request
+                break
+
+        if not selected:
+            return {
+                "success": False,
+                "error": last_error or "AI Builder could not create valid lineups from this slate. Check /optimizer-debug for missing positions or too many excluded/locked players.",
+                "lineups": [],
+                "exposures": [],
+                "trim_report": last_trim_report,
+                "combinations_checked": last_checked,
+            }
+
+        selected.sort(key=lambda item: (
+            safe_float(item.get("ceiling_builder_score", item.get("big_gpp_builder_score", 0)), 0),
+            safe_float(item.get("projected_points", 0), 0),
+            safe_float(item.get("lineup_quality_score", 0), 0),
+            safe_float(item.get("optimizer_score", 0), 0),
+        ), reverse=True)
+
+        notes = auto_builder_notes(used_request, selected)
+        if used_attempt != "requested_ai_takedown":
+            notes.insert(0, f"Build guardrail used: {used_attempt}. Constraints were relaxed so Generate Builds returns valid lineups instead of doing nothing.")
+        if len(selected) < requested_count:
+            notes.append(f"Returned {len(selected)} of {requested_count}. The slate did not have enough unique valid builds under the current rules.")
+
+        return {
+            "success": True,
+            "mode": used_request.mode,
+            "contest_focus": tuned.contest_focus,
+            "build_style": tuned.build_style,
+            "strategy_mode": used_request.strategy_mode,
+            "stack_type": used_request.stack_type,
+            "requested_count": requested_count,
+            "returned_count": len(selected),
+            "lineups": selected,
+            "exposures": calculate_exposures(selected),
+            "ai_picks": ai_picks_summary(),
+            "ai_builder_notes": notes,
+            "build_attempt_used": used_attempt,
+            "trim_report": last_trim_report,
+            "combinations_checked": last_checked,
+            "salary_cap": SALARY_CAP,
+            "roster_slots": ROSTER_SLOTS,
+            "generated_at": datetime.utcnow().isoformat() + "Z",
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"AI Builder backend error: {str(e)}",
+            "lineups": [],
+            "exposures": [],
+        }
 
 @app.get("/")
 def root():
@@ -4723,34 +4819,48 @@ def optimizer_debug():
 
 @app.post("/optimize-multiple")
 def optimize_multiple_lineups(request: MultiOptimizeRequest):
-    count = request.count if request.count in [1, 5, 10, 20] else 1
+    try:
+        count = request.count if request.count in [1, 5, 10, 20] else 1
 
-    # Always use the fast builder for this endpoint.
-    # This fixes Pro mode when count is 1 and prevents full DraftKings CSV slates from timing out.
-    selected, error, trim_report, checked = build_fast_multi_lineups_for_pro(request, count)
+        selected, error, trim_report, checked = build_fast_multi_lineups_for_pro(request, count)
 
-    if error:
-        return {"error": error, "lineups": [], "exposures": [], "trim_report": trim_report, "position_debug": trim_report.get("position_debug", {})}
+        # If user selected an aggressive GPP setup that is too strict, do not silently fail.
+        if (error or not selected) and str(request.mode).lower() == "gpp":
+            relaxed = MultiOptimizeRequest(**request.dict())
+            relaxed.min_salary = 0
+            relaxed.force_team_stack = False
+            relaxed.force_qb_stack = False
+            relaxed.max_exposure = 100
+            relaxed.max_same_players = 9
+            selected, error, trim_report, checked = build_fast_multi_lineups_for_pro(relaxed, count)
+            if selected:
+                for item in selected:
+                    item["lineup_warning"] = item.get("lineup_warning") or "Generated after relaxing strict GPP constraints because the first build returned no lineups."
 
-    if not selected:
-        return {"error": "No valid MLB lineups found with your current locks and excludes.", "lineups": [], "exposures": []}
+        if error and not selected:
+            return {"error": error, "lineups": [], "exposures": [], "trim_report": trim_report, "position_debug": (trim_report or {}).get("position_debug", {})}
 
-    return {
-        "mode": request.mode,
-        "requested_count": count,
-        "returned_count": len(selected),
-        "slate_source": current_slate_source(),
-        "sport": "MLB",
-        "salary_cap": SALARY_CAP,
-        "roster_slots": ROSTER_SLOTS,
-        "speed_boost": "enabled",
-        "trim_report": trim_report,
-        "combinations_checked": checked,
-        "lineups": selected,
-        "exposures": calculate_exposures(selected),
-        "player_min_exposure": normalize_exposure_limits(request.player_min_exposure),
-        "player_max_exposure": normalize_exposure_limits(request.player_max_exposure),
-    }
+        if not selected:
+            return {"error": "No valid MLB lineups found with your current locks and excludes.", "lineups": [], "exposures": []}
+
+        return {
+            "mode": request.mode,
+            "requested_count": count,
+            "returned_count": len(selected),
+            "slate_source": current_slate_source(),
+            "sport": "MLB",
+            "salary_cap": SALARY_CAP,
+            "roster_slots": ROSTER_SLOTS,
+            "speed_boost": "enabled",
+            "trim_report": trim_report,
+            "combinations_checked": checked,
+            "lineups": selected,
+            "exposures": calculate_exposures(selected),
+            "player_min_exposure": normalize_exposure_limits(request.player_min_exposure),
+            "player_max_exposure": normalize_exposure_limits(request.player_max_exposure),
+        }
+    except Exception as e:
+        return {"error": f"Optimizer backend error: {str(e)}", "lineups": [], "exposures": []}
 
 @app.post("/export-lineups-csv")
 def export_lineups_csv(request: MultiOptimizeRequest):
