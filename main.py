@@ -11,6 +11,7 @@ import hashlib
 import re
 import math
 import os
+import random
 from datetime import datetime
 
 app = FastAPI(title="DFS Edge MLB API")
@@ -4386,6 +4387,261 @@ def get_value_plays():
     }
 
 
+
+def emergency_safe_lineup_builder(request, count, reason="optimizer rules too strict"):
+    """
+    Last-resort production-safe builder.
+    This prevents the live app from returning nothing when the takedown engine gets too restrictive.
+    It still respects DraftKings MLB roster construction, salary cap, locks, and excludes.
+    It relaxes advanced stack/leverage rules only after the main builder fails.
+    """
+    locked_players = request.locked_players or []
+    excluded_players = set(request.excluded_players or [])
+    mode = str(getattr(request, "mode", "gpp") or "gpp").lower()
+    target_count = count if count in [1, 5, 10, 20] else 1
+
+    raw_players = add_values(load_players())
+    if not raw_players:
+        return [], "No players are loaded. Admin must upload today’s DraftKings CSV.", {}, 0
+
+    error = validate_locks(raw_players, locked_players, list(excluded_players))
+    if error:
+        return [], error, {}, 0
+
+    def usable_player(p, allow_inactive=False):
+        if p.get("name") in excluded_players:
+            return False
+        if not allow_inactive and not bool(p.get("active", True)):
+            return False
+        try:
+            salary = int(float(p.get("salary", 0) or 0))
+        except Exception:
+            salary = 0
+        if salary <= 0:
+            return False
+        return str(p.get("position", "")).upper() in {"P", "C", "1B", "2B", "3B", "SS", "OF"}
+
+    active_pool = [p for p in raw_players if usable_player(p, allow_inactive=False)]
+    full_pool = [p for p in raw_players if usable_player(p, allow_inactive=True)]
+    pool = active_pool if len(active_pool) >= 10 else full_pool
+
+    trim_report = {
+        "safe_fallback": True,
+        "reason": reason,
+        "active_pool_count": len(active_pool),
+        "fallback_pool_count": len(full_pool),
+    }
+
+    locked_set = set(locked_players)
+    locked_objects = [p for p in full_pool if p.get("name") in locked_set]
+
+    required = {"P": 2, "C": 1, "1B": 1, "2B": 1, "3B": 1, "SS": 1, "OF": 3}
+
+    def pos(p):
+        return str(p.get("position", "")).upper()
+
+    def count_pos(lineup, position):
+        return len([p for p in lineup if pos(p) == position])
+
+    def position_valid(lineup):
+        return len(lineup) == 10 and all(count_pos(lineup, k) == v for k, v in required.items())
+
+    def emergency_grade(p):
+        # Takedown-friendly but safe fallback grade.
+        projection = safe_float(p.get("projection", 0))
+        ceiling = safe_float(p.get("ceiling", projection * 1.35))
+        leverage = safe_float(p.get("leverage_score", p.get("leverage", 0)))
+        trend = safe_float(p.get("trend_score", 50))
+        vegas = safe_float(p.get("vegas_boost", 0))
+        ownership = safe_float(p.get("ownership", 10))
+        salary = max(1, safe_float(p.get("salary", 1)))
+        active_bonus = 2.0 if bool(p.get("active", True)) else -12.0
+        core_bonus = 4.0 if str(p.get("play_tag", p.get("core_label", ""))).lower().find("core") >= 0 else 0.0
+        bad_chalk_penalty = 4.0 if str(p.get("play_tag", p.get("core_label", ""))).lower().find("chalk") >= 0 else 0.0
+        value = (projection / salary) * 1000
+        return (
+            projection * 2.2
+            + ceiling * 1.2
+            + leverage * 0.45
+            + trend * 0.04
+            + vegas * 1.8
+            + value * 1.15
+            + max(0, 18 - ownership) * 0.18
+            + active_bonus
+            + core_bonus
+            - bad_chalk_penalty
+        )
+
+    groups = {k: [p for p in pool if pos(p) == k] for k in required}
+    for k in groups:
+        groups[k].sort(key=emergency_grade, reverse=True)
+
+    # If active pool is position-thin, fall back to all valid players for the missing positions only.
+    full_groups = {k: [p for p in full_pool if pos(p) == k] for k in required}
+    for k in full_groups:
+        full_groups[k].sort(key=emergency_grade, reverse=True)
+        if len(groups.get(k, [])) < required[k]:
+            groups[k] = full_groups[k]
+
+    if any(len(groups[k]) < required[k] for k in required):
+        missing = [f"{k}:{len(groups[k])}/{required[k]}" for k in required if len(groups[k]) < required[k]]
+        return [], "Not enough DraftKings MLB players by position after upload: " + ", ".join(missing), trim_report, 0
+
+    def choose_candidate(position, used, attempt, slot_index, prefer_team=None):
+        candidates = groups[position]
+        if not candidates:
+            return None
+
+        # Prefer stacks for hitters in GPP/takedown modes, but do not require it.
+        if prefer_team and position != "P":
+            stacked = [p for p in candidates if p.get("team") == prefer_team and p.get("name") not in used]
+            if stacked:
+                return stacked[(attempt + slot_index) % len(stacked)]
+
+        # Rotate through a wider pool so multi-lineups are different.
+        width = min(len(candidates), 45 if position in ["OF", "P"] else 28)
+        for j in range(width):
+            idx = (attempt * 7 + slot_index * 11 + j) % width
+            cand = candidates[idx]
+            if cand.get("name") not in used:
+                return cand
+        return None
+
+    def repair_salary(lineup):
+        used = {p.get("name") for p in lineup}
+        salary = sum(int(float(p.get("salary", 0) or 0)) for p in lineup)
+        if salary <= SALARY_CAP:
+            return lineup
+
+        for idx, current in sorted(list(enumerate(lineup)), key=lambda item: safe_float(item[1].get("salary", 0)), reverse=True):
+            if salary <= SALARY_CAP:
+                break
+            if current.get("name") in locked_set:
+                continue
+            position = pos(current)
+            replacements = [
+                p for p in full_groups[position]
+                if p.get("name") not in used and safe_float(p.get("salary", 0)) < safe_float(current.get("salary", 0))
+            ]
+            replacements.sort(key=lambda p: (safe_float(p.get("salary", 0)), -emergency_grade(p)))
+            for repl in replacements[:40]:
+                new_salary = salary - safe_float(current.get("salary", 0)) + safe_float(repl.get("salary", 0))
+                if new_salary <= SALARY_CAP:
+                    used.remove(current.get("name"))
+                    used.add(repl.get("name"))
+                    lineup[idx] = repl
+                    salary = new_salary
+                    break
+        return lineup
+
+    def team_counts(lineup):
+        counts = {}
+        for p in lineup:
+            if pos(p) == "P":
+                continue
+            team = p.get("team", "")
+            counts[team] = counts.get(team, 0) + 1
+        return counts
+
+    # Stack teams are chosen from high-grade hitter teams.
+    hitter_pool = [p for p in pool if pos(p) != "P"]
+    team_scores = {}
+    for p in hitter_pool:
+        team_scores[p.get("team", "")] = team_scores.get(p.get("team", ""), 0) + emergency_grade(p)
+    stack_teams = [team for team, _ in sorted(team_scores.items(), key=lambda x: x[1], reverse=True) if team]
+    if not stack_teams:
+        stack_teams = [None]
+
+    lineups = []
+    seen = set()
+    attempts = 0
+    max_attempts = max(2500, target_count * 350)
+
+    while attempts < max_attempts and len(lineups) < max(target_count * 3, target_count):
+        attempts += 1
+        lineup = []
+        used = set()
+
+        # Add locks first, but reject impossible locked rosters.
+        impossible_lock = False
+        for lp in locked_objects:
+            position = pos(lp)
+            if count_pos(lineup, position) >= required[position]:
+                impossible_lock = True
+                break
+            lineup.append(lp)
+            used.add(lp.get("name"))
+        if impossible_lock:
+            continue
+
+        stack_team = stack_teams[attempts % len(stack_teams)]
+
+        slot_plan = ["P", "P", "C", "1B", "2B", "3B", "SS", "OF", "OF", "OF"]
+        for slot_index, position in enumerate(slot_plan):
+            if count_pos(lineup, position) >= required[position]:
+                continue
+            cand = choose_candidate(position, used, attempts, slot_index, prefer_team=stack_team)
+            if cand is None:
+                cand = choose_candidate(position, used, attempts + 31, slot_index, prefer_team=None)
+            if cand is None:
+                break
+            lineup.append(cand)
+            used.add(cand.get("name"))
+
+        if not position_valid(lineup):
+            continue
+        lineup = repair_salary(lineup)
+        if not position_valid(lineup):
+            continue
+
+        salary = sum(int(float(p.get("salary", 0) or 0)) for p in lineup)
+        if salary > SALARY_CAP:
+            continue
+        if not has_all_locked(lineup, locked_players):
+            continue
+
+        # Respect team cap if possible. If the cap is too restrictive, only relax after many attempts.
+        max_team = int(getattr(request, "max_players_per_team", 5) or 5)
+        if attempts < (max_attempts * 0.65) and max(team_counts(lineup).values() or [0]) > max_team:
+            continue
+
+        key = lineup_key(lineup)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        projection = sum(safe_float(p.get("projection", 0)) for p in lineup)
+        score = score_lineup(lineup, mode, min(max(int(getattr(request, "randomness", 0) or 0), 0), 65))
+        metadata = add_lineup_metadata({
+            "mode": mode,
+            "total_salary": salary,
+            "projected_points": round(projection, 2),
+            "optimizer_score": round(score, 2),
+            "lineup": lineup,
+            "lineup_warning": "Safe fallback builder was used because primary takedown rules could not return enough valid lineups.",
+        })
+        lineups.append(metadata)
+
+    if not lineups:
+        return [], "Safe fallback still could not build a valid MLB lineup. Check that today’s CSV includes P, C, 1B, 2B, 3B, SS, and at least 3 OF under the $50,000 cap.", trim_report, attempts
+
+    lineups.sort(key=lambda x: x.get("optimizer_score", 0), reverse=True)
+
+    selected = diversify_lineups(
+        all_lineups=lineups,
+        count=target_count,
+        max_exposure=100,
+        max_same_players=9,
+        locked_players=locked_players,
+        player_min_exposure={},
+        player_max_exposure={},
+    )
+    if not selected:
+        selected = lineups[:target_count]
+
+    return selected[:target_count], None, trim_report, attempts
+
+
 @app.post("/optimize")
 def optimize_lineup(request: OptimizeRequest):
     all_lineups, error, trim_report, checked = build_all_lineups(
@@ -4401,10 +4657,20 @@ def optimize_lineup(request: OptimizeRequest):
         randomness=request.randomness,
     )
 
-    if error:
-        return {"error": error}
-    if not all_lineups:
-        return {"error": "No valid MLB lineup found with your current locks and excludes."}
+    if error or not all_lineups:
+        safe_request = MultiOptimizeRequest(**request.dict(), count=1)
+        fallback_lineups, fallback_error, fallback_report, fallback_checked = emergency_safe_lineup_builder(
+            safe_request,
+            1,
+            reason=error or "single lineup primary builder returned nothing",
+        )
+        if fallback_lineups:
+            all_lineups = fallback_lineups
+            trim_report = fallback_report
+            checked = checked + fallback_checked
+            error = None
+        else:
+            return {"error": fallback_error or error or "No valid MLB lineup found with your current locks and excludes."}
 
     result = all_lineups[0]
     result["trim_report"] = trim_report
@@ -4418,15 +4684,33 @@ def optimize_lineup(request: OptimizeRequest):
 def optimize_multiple_lineups(request: MultiOptimizeRequest):
     count = request.count if request.count in [1, 5, 10, 20] else 1
 
-    # Always use the fast builder for this endpoint.
-    # This fixes Pro mode when count is 1 and prevents full DraftKings CSV slates from timing out.
+    # Primary builder: true takedown / pro optimizer.
     selected, error, trim_report, checked = build_fast_multi_lineups_for_pro(request, count)
+
+    fallback_used = False
+    primary_error = error
+
+    # Live-app safety: never let strict takedown rules make the Generate button return nothing.
+    if error or not selected or len(selected) < count:
+        fallback_selected, fallback_error, fallback_report, fallback_checked = emergency_safe_lineup_builder(
+            request,
+            count,
+            reason=primary_error or "primary builder returned fewer lineups than requested",
+        )
+        if fallback_selected:
+            selected = fallback_selected
+            error = None
+            trim_report = fallback_report
+            checked = checked + fallback_checked
+            fallback_used = True
+        else:
+            error = fallback_error or primary_error
 
     if error:
         return {"error": error, "lineups": [], "exposures": []}
 
     if not selected:
-        return {"error": "No valid MLB lineups found with your current locks and excludes.", "lineups": [], "exposures": []}
+        return {"error": "No valid MLB lineups found. Check today’s CSV position pool, salary cap, locks, excludes, and active player statuses.", "lineups": [], "exposures": []}
 
     return {
         "mode": request.mode,
@@ -4437,6 +4721,8 @@ def optimize_multiple_lineups(request: MultiOptimizeRequest):
         "salary_cap": SALARY_CAP,
         "roster_slots": ROSTER_SLOTS,
         "speed_boost": "enabled",
+        "fallback_used": fallback_used,
+        "fallback_note": "Safe fallback builder used to keep live lineup generation working." if fallback_used else "Primary takedown builder used.",
         "trim_report": trim_report,
         "combinations_checked": checked,
         "lineups": selected,
