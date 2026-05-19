@@ -11,7 +11,6 @@ import hashlib
 import re
 import math
 import os
-import random
 from datetime import datetime
 
 app = FastAPI(title="DFS Edge MLB API")
@@ -27,7 +26,13 @@ app.add_middleware(
 SALARY_CAP = 50000
 ADMIN_PASSWORD = "dfsedge_admin_2026"
 
-BASE_DIR = Path(__file__).parent
+APP_DIR = Path(__file__).parent
+# Persistent data directory for live hosting.
+# On Render, add a Persistent Disk mounted at /var/data.
+# Locally, this safely falls back to the backend folder.
+DATA_DIR = Path(os.getenv("DFS_EDGE_DATA_DIR", "/var/data" if Path("/var/data").exists() else str(APP_DIR)))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+BASE_DIR = DATA_DIR
 SAMPLE_PLAYERS_PATH = BASE_DIR / "sample_players.json"
 ACTIVE_SLATE_PATH = BASE_DIR / "active_slate.json"
 MARKET_STATE_PATH = BASE_DIR / "market_state.json"
@@ -136,21 +141,24 @@ class MultiOptimizeRequest(BaseModel):
 
 
 class UpdatePlayerRequest(BaseModel):
-    admin_password: str
+    admin_password: str = ""
+    auth_token: str = ""
     player_name: str
     projection: float
     ownership: float
 
 
 class UpdatePlayerStatusRequest(BaseModel):
-    admin_password: str
+    admin_password: str = ""
+    auth_token: str = ""
     player_name: str
     active: bool
     inactive_reason: str = "manual_cleanup"
 
 
 class AdminPasswordRequest(BaseModel):
-    admin_password: str
+    admin_password: str = ""
+    auth_token: str = ""
 
 
 class RegisterRequest(BaseModel):
@@ -173,7 +181,8 @@ class SaveLineupRequest(BaseModel):
 
 
 class UpdateUserRoleRequest(BaseModel):
-    admin_password: str
+    admin_password: str = ""
+    auth_token: str = ""
     email: str
     role: str
 
@@ -1721,9 +1730,6 @@ def score_lineup(lineup, mode, randomness=0):
     projection = sum(p["projection"] for p in lineup)
     salary = sum(p["salary"] for p in lineup)
 
-    # Base score still matters, but GPP builds now get a separate takedown objective.
-    # The old model over-weighted median projection and produced safe/playable lineups.
-    # Massive-field DFS needs lineups with top-end ceiling, stack correlation, and leverage.
     score = projection
     score += sum(safe_float(p.get("projection_boost", 0)) for p in lineup)
     score += ownership_score_for_lineup(lineup, mode)
@@ -1746,13 +1752,8 @@ def score_lineup(lineup, mode, randomness=0):
 
     if mode == "cash":
         randomness = min(randomness, 10)
-        return score + deterministic_random_bonus(lineup, randomness)
 
-    # TRUE TAKEDOWN MODE:
-    # In GPP, the primary sort key becomes top-end outcome strength, not median safety.
-    # This pushes 4/5-man stacks, low-owned leverage, high ceiling, core-play counts,
-    # and uniqueness while heavily penalizing bad chalk/fades/conflicts.
-    return takedown_score_for_lineup(lineup, base_score=score, randomness=randomness)
+    return score + deterministic_random_bonus(lineup, randomness)
 
 
 def has_all_locked(lineup, locked_players):
@@ -1958,92 +1959,6 @@ def lineup_quality_profile(lineup, mode="gpp"):
     }
 
 
-def takedown_score_for_lineup(lineup, base_score=0.0, randomness=0):
-    """
-    Massive-field GPP objective. This is intentionally different from cash/safe
-    optimization. It rewards a lineup for the things that actually create a
-    first-place outcome: ceiling, stack correlation, leverage, uniqueness, and
-    core strength. Median projection still matters, but it is not allowed to
-    dominate the sort.
-    """
-    if not lineup:
-        return 0.0
-
-    projection = sum(safe_float(p.get("projection", 0), 0) for p in lineup)
-    boosted = sum(safe_float(p.get("boosted_projection", p.get("projection", 0)), 0) for p in lineup)
-    salary = sum(safe_int(p.get("salary", 0), 0) for p in lineup)
-    remaining = SALARY_CAP - salary
-    ownership_values = [safe_float(p.get("ownership", 10), 10) for p in lineup]
-    avg_ownership = sum(ownership_values) / len(ownership_values)
-    max_ownership = max(ownership_values) if ownership_values else 0
-    low_owned_count = len([o for o in ownership_values if o <= 10])
-    chalk_count = len([o for o in ownership_values if o >= 24])
-
-    leverage_values = [safe_float(p.get("leverage_score", 50), 50) for p in lineup]
-    avg_leverage = sum(leverage_values) / len(leverage_values)
-    high_leverage_count = len([v for v in leverage_values if v >= 62])
-
-    core_profile = lineup_core_profile(lineup)
-    core_count = safe_int(core_profile.get("core_play_count", 0), 0)
-    strong_count = safe_int(core_profile.get("strong_play_count", 0), 0)
-    fade_count = safe_int(core_profile.get("fade_count", 0), 0)
-    bad_chalk_count = safe_int(core_profile.get("bad_chalk_count", 0), 0)
-
-    stack = best_stack_info(lineup)
-    stack_size = safe_int(stack.get("size", 0), 0)
-    team_counts = stack.get("counts", {}) if isinstance(stack, dict) else {}
-    secondary_stack = max([c for c in team_counts.values() if c < stack_size], default=0)
-
-    stack_bonus = 0.0
-    if stack_size >= 5:
-        stack_bonus += 42.0
-    elif stack_size == 4:
-        stack_bonus += 31.0
-    elif stack_size == 3:
-        stack_bonus += 16.0
-    if secondary_stack >= 3:
-        stack_bonus += 20.0
-    elif secondary_stack == 2:
-        stack_bonus += 11.0
-
-    # A winning MLB GPP lineup usually needs correlation, but it cannot be made
-    # only of weak projected bats. Use boosted ceiling as the first pillar.
-    ceiling_component = boosted * 1.24 + projection * 0.34
-    leverage_component = avg_leverage * 0.54 + high_leverage_count * 3.2 + low_owned_count * 1.7
-    core_component = core_count * 5.4 + strong_count * 2.2
-
-    # Do not blindly reward leaving too much salary. A little leftover can reduce
-    # duplicates, but too much usually lowers raw-score potential.
-    if 300 <= remaining <= 2200:
-        uniqueness_bonus = 7.5
-    elif 2201 <= remaining <= 3900:
-        uniqueness_bonus = 4.0
-    elif remaining > 3900:
-        uniqueness_bonus = -6.5
-    else:
-        uniqueness_bonus = 2.0
-
-    chalk_penalty = max(0.0, avg_ownership - 18.0) * 1.65 + max(0.0, max_ownership - 32.0) * 1.2
-    chalk_penalty += chalk_count * 2.2 + bad_chalk_count * 9.5
-    fade_penalty = fade_count * 12.0
-    conflict_penalty = 18.0 if pitcher_vs_hitter_conflict(lineup) else 0.0
-
-    takedown_score = (
-        base_score * 0.22
-        + ceiling_component
-        + leverage_component
-        + stack_bonus
-        + core_component
-        + uniqueness_bonus
-        - chalk_penalty
-        - fade_penalty
-        - conflict_penalty
-    )
-
-    takedown_score += deterministic_random_bonus(lineup, min(max(randomness, 0), 100)) * 0.72
-    return round(takedown_score, 4)
-
-
 def add_lineup_metadata(lineup_data):
     lineup = lineup_data["lineup"]
     mode = lineup_data.get("mode", "cash")
@@ -2062,24 +1977,6 @@ def add_lineup_metadata(lineup_data):
     lineup_data.update(leverage_profile)
     lineup_data.update(lineup_core_profile(lineup))
     lineup_data.update(lineup_quality_profile(lineup, mode))
-
-    # Frontend compatibility: older UI sections expect a compact lineup_iq object
-    # with stack/leverage/ceiling/safety keys. Keep the richer breakdown too.
-    q_breakdown = lineup_data.get("lineup_quality_breakdown", {}) or {}
-    lineup_data["lineup_iq_score"] = lineup_data.get("lineup_quality_score", 0)
-    lineup_data["lineup_iq_label"] = lineup_data.get("lineup_quality_label", "Playable")
-    lineup_data["lineup_iq"] = {
-        "projection": q_breakdown.get("projection_score", 0),
-        "ceiling": q_breakdown.get("ceiling_score", 0),
-        "leverage": q_breakdown.get("leverage_score", 0),
-        "stack_strength": q_breakdown.get("stack_score", 0),
-        "core": q_breakdown.get("core_score", 0),
-        "salary": q_breakdown.get("salary_score", 0),
-        "safety": q_breakdown.get("safety_score", 0),
-        "fade_penalty": q_breakdown.get("fade_penalty", 0),
-        "bad_chalk_penalty": q_breakdown.get("bad_chalk_penalty", 0),
-    }
-
     lineup_data["lineup_health"] = calculate_lineup_health_profile(lineup_data)
 
     return lineup_data
@@ -3115,76 +3012,91 @@ def simulator_focus_label(focus: str):
 
 def payout_for_rank(rank, contest):
     """
-    Approximate a realistic DFS payout curve when the user enters only contest
-    size, paid spots, prize pool, and buy-in. This is not a sportsbook/provider
-    payout table, but it behaves like common DFS tournaments:
-    - Cash/H2H: flatter min-cash style payout.
-    - Single-entry GPP: moderately top-heavy.
-    - Massive-field GPP: very top-heavy.
+    Realistic estimated DraftKings-style payout curve when the exact payout table
+    is not available. It is intentionally top-heavy and keeps lower paid places
+    near min-cash instead of treating every paid finish like a huge payout.
     """
+    rank = safe_int(rank, 0)
     contest_size = max(1, safe_int(contest.get("contest_size", 1), 1))
-    paid_spots = max(1, safe_int(contest.get("estimated_paid_spots", 1), 1))
-    entry_fee = max(0.01, safe_float(contest.get("entry_fee", 1.0), 1.0))
-    prize_pool = max(1.0, safe_float(contest.get("prize_pool", 1.0), 1.0))
+    paid_spots = max(1, min(contest_size, safe_int(contest.get("paid_positions") or contest.get("estimated_paid_spots", 1), 1)))
+    prize_pool = max(1.0, safe_float(contest.get("prize_pool", 1), 1))
+    entry_fee = max(0.0, safe_float(contest.get("entry_fee", 0), 0))
     max_entries = max(1, safe_int(contest.get("max_entries", 1), 1))
-    single_entry = bool(contest.get("single_entry", False))
+    single_entry = bool(contest.get("single_entry", False)) or max_entries <= 1
 
-    rank = max(1, min(safe_int(rank, contest_size), contest_size))
-    if rank > paid_spots:
+    if rank <= 0 or rank > paid_spots:
         return 0.0
 
+    # Cash/H2H style payout: flatter, not a lottery curve.
     payout_rate = paid_spots / contest_size
+    if payout_rate >= 0.40 and single_entry:
+        min_cash = max(entry_fee * 1.75, entry_fee + 0.01)
+        top_cash = max(min_cash, prize_pool / max(paid_spots, 1))
+        return round(max(min_cash, min(top_cash * 1.15, prize_pool)), 2)
 
-    # Cash/H2H/double-up style contests should not use top-heavy GPP payouts.
-    if payout_rate >= 0.45 and max_entries == 1:
-        return round(max(entry_fee * 1.75, prize_pool / max(paid_spots, 1)), 2)
+    avg_paid = prize_pool / max(paid_spots, 1)
+    min_cash = max(entry_fee * 2.0, min(entry_fee * 3.5, avg_paid * 0.58))
 
-    min_cash = max(entry_fee * 1.5, prize_pool * 0.00035)
+    # Approximate first prize. Large 150-max fields are usually top-heavy but not
+    # so top-heavy that mid-paid ranks become huge payouts.
+    top_prize = max(min_cash * 20, prize_pool * (0.16 if max_entries >= 20 else 0.13))
+    top_prize = min(top_prize, prize_pool * 0.22)
 
-    if contest_size >= 100000:
-        top_pct = 0.22
-        curve_alpha = 4.2
-    elif contest_size >= 25000 or max_entries >= 50:
-        top_pct = 0.18
-        curve_alpha = 3.65
-    elif single_entry:
-        top_pct = 0.10
-        curve_alpha = 2.65
+    r_top10 = min(paid_spots, 10)
+    r_top01 = max(r_top10 + 1, min(paid_spots, round(contest_size * 0.001)))
+    r_top1 = max(r_top01 + 1, min(paid_spots, round(contest_size * 0.01)))
+    r_top5 = max(r_top1 + 1, min(paid_spots, round(contest_size * 0.05)))
+
+    # Anchor payouts by rank tiers.
+    p_top10_end = max(min_cash * 12, prize_pool * 0.012)
+    p_top01_end = max(min_cash * 7, prize_pool * 0.0020)
+    p_top1_end = max(min_cash * 3.2, prize_pool * 0.00025)
+    p_top5_end = max(min_cash * 1.35, min_cash + entry_fee)
+
+    def interp(r, a_rank, b_rank, a_pay, b_pay):
+        if b_rank <= a_rank:
+            return b_pay
+        t = max(0.0, min(1.0, (r - a_rank) / (b_rank - a_rank)))
+        # Curved interpolation: payout falls fast near the top, then flattens.
+        t = t ** 0.72
+        return a_pay + (b_pay - a_pay) * t
+
+    if rank == 1:
+        payout = top_prize
+    elif rank <= r_top10:
+        payout = interp(rank, 1, r_top10, top_prize, p_top10_end)
+    elif rank <= r_top01:
+        payout = interp(rank, r_top10, r_top01, p_top10_end, p_top01_end)
+    elif rank <= r_top1:
+        payout = interp(rank, r_top01, r_top1, p_top01_end, p_top1_end)
+    elif rank <= r_top5:
+        payout = interp(rank, r_top1, r_top5, p_top1_end, p_top5_end)
     else:
-        top_pct = 0.14
-        curve_alpha = 3.05
+        payout = interp(rank, r_top5, paid_spots, p_top5_end, min_cash)
 
-    top_prize = max(entry_fee * 25, prize_pool * top_pct)
-    if paid_spots <= 1:
-        return round(min(top_prize, prize_pool), 2)
-
-    # rank_position = 1.0 for 1st, 0.0 for last paid.
-    rank_position = (paid_spots - rank) / max(paid_spots - 1, 1)
-    payout = min_cash + (top_prize - min_cash) * (rank_position ** curve_alpha)
-
-    # Keep individual payout within the actual prize pool.
     return round(max(0.0, min(payout, prize_pool)), 2)
 
 
 def estimate_expected_payout_from_probabilities(contest, projected_rank, ceiling_rank, cash_probability, top_10_probability, top_1_probability, top_0_1_probability):
     contest_size = max(1, safe_int(contest.get("contest_size", 1), 1))
-    paid_spots = max(1, safe_int(contest.get("estimated_paid_spots", 1), 1))
+    paid_spots = max(1, min(contest_size, safe_int(contest.get("paid_positions") or contest.get("estimated_paid_spots", 1), 1)))
 
-    p_cash = max(0.0, min(1.0, safe_float(cash_probability, 0) / 100.0))
-    p_top10 = max(0.0, min(p_cash, safe_float(top_10_probability, 0) / 100.0))
-    p_top1 = max(0.0, min(p_top10, safe_float(top_1_probability, 0) / 100.0))
-    p_top01 = max(0.0, min(p_top1, safe_float(top_0_1_probability, 0) / 100.0))
+    # Normalize probabilities into non-overlapping buckets.
+    p_top01 = max(0.0, min(safe_float(top_0_1_probability, 0), 100.0)) / 100.0
+    p_top1 = max(p_top01, min(safe_float(top_1_probability, 0) / 100.0, 1.0))
+    p_top10 = max(p_top1, min(safe_float(top_10_probability, 0) / 100.0, 1.0))
+    p_cash = max(p_top10, min(safe_float(cash_probability, 0) / 100.0, 1.0))
 
-    # Convert cumulative probabilities into non-overlapping buckets.
     bucket_top01 = p_top01
     bucket_top1 = max(0.0, p_top1 - p_top01)
     bucket_top10 = max(0.0, p_top10 - p_top1)
     bucket_cash = max(0.0, p_cash - p_top10)
 
-    rank_top01 = max(1, round(contest_size * 0.0005))
-    rank_top1 = max(1, round(contest_size * 0.005))
-    rank_top10 = max(1, round(contest_size * 0.05))
-    rank_cash = max(1, round((paid_spots + max(rank_top10, 1)) / 2))
+    rank_top01 = max(1, round(contest_size * 0.001))
+    rank_top1 = max(rank_top01 + 1, round(contest_size * 0.01))
+    rank_top10 = max(rank_top1 + 1, round(contest_size * 0.10))
+    rank_cash = max(rank_top10 + 1, round((paid_spots + rank_top10) / 2))
+    rank_cash = min(rank_cash, paid_spots)
 
     expected = (
         bucket_top01 * payout_for_rank(rank_top01, contest)
@@ -3196,19 +3108,17 @@ def estimate_expected_payout_from_probabilities(contest, projected_rank, ceiling
     projected_payout = payout_for_rank(projected_rank, contest)
     ceiling_payout = payout_for_rank(ceiling_rank, contest)
 
-    # Blend model EV with rank-based payout so the shown projected rank and payout
-    # agree with each other. The probabilities still drive upside EV.
-    expected = expected * 0.72 + projected_payout * 0.18 + ceiling_payout * 0.10
-
     return {
         "expected_payout": round(expected, 2),
         "projected_payout": round(projected_payout, 2),
+        "median_payout": round(projected_payout, 2),
         "ceiling_payout": round(ceiling_payout, 2),
         "min_cash_payout": payout_for_rank(paid_spots, contest),
-        "top_10_rank_payout": payout_for_rank(max(1, round(contest_size * 0.10)), contest),
-        "top_1_rank_payout": payout_for_rank(max(1, round(contest_size * 0.01)), contest),
-        "top_0_1_rank_payout": payout_for_rank(max(1, round(contest_size * 0.001)), contest),
+        "top_10_rank_payout": payout_for_rank(rank_top10, contest),
+        "top_1_rank_payout": payout_for_rank(rank_top1, contest),
+        "top_0_1_rank_payout": payout_for_rank(rank_top01, contest),
     }
+
 
 def simulate_single_lineup(lineup_data, request: ContestSimulationRequest, lineup_number=1):
     contest = normalize_contest_request(request)
@@ -3370,14 +3280,47 @@ def simulate_single_lineup(lineup_data, request: ContestSimulationRequest, lineu
     ceiling_rank_ratio = max(0.00005, min(0.85, projected_rank_ratio * (0.34 if focus == "big_field_gpp" else 0.42) - (top_1_probability / 1000.0) - (top_0_1_probability / 600.0)))
     ceiling_rank = max(1, min(contest_size, round(contest_size * ceiling_rank_ratio)))
 
-    # Make probabilities contest-aware.
-    # More paid spots helps min-cash probability. Multi-entry fields make top-end outcomes harder.
-    payout_adjustment = max(0.55, min(1.55, payout_rate / 0.20))
-    entry_adjustment = 1.0 + (0.08 if single_entry else 0.0) - min(0.30, math.log10(max(max_entries, 1)) * 0.055)
-    cash_probability = max(0.5, min(99.0, cash_probability * payout_adjustment))
-    top_10_probability = max(0.1, min(85.0, top_10_probability * entry_adjustment))
-    top_1_probability = max(0.01, min(50.0, top_1_probability * entry_adjustment))
-    top_0_1_probability = max(0.001, min(15.0, top_0_1_probability * entry_adjustment))
+    # Make probabilities contest-aware and realistic.
+    # Big-field GPP outcomes are extremely hard to hit. A strong lineup should
+    # show upside, but not pretend it has a 20-40% chance to land top 1%.
+    payout_adjustment = max(0.55, min(1.35, payout_rate / 0.20))
+    multi_entry_penalty = 1.0 if single_entry else max(0.58, 1.0 - math.log10(max(max_entries, 1)) * 0.13)
+    field_scale = max(0.30, min(1.20, math.sqrt(12000 / max(contest_size, 1200))))
+    strength_scale = max(0.0, min(1.0, (focus_score - 52.0) / 42.0))
+    quality_scale = max(0.0, min(1.0, (quality_score - 45.0) / 45.0))
+    combined_strength = max(0.0, min(1.0, strength_scale * 0.65 + quality_scale * 0.35))
+
+    if focus == "cash_h2h":
+        cash_probability = max(2.0, min(96.0, cash_probability * payout_adjustment))
+        top_10_probability = max(0.5, min(22.0, 4.0 + combined_strength * 15.0 * field_scale))
+        top_1_probability = max(0.02, min(3.5, 0.15 + combined_strength * 2.6 * field_scale))
+        top_0_1_probability = max(0.001, min(0.25, top_1_probability * 0.06))
+    elif focus == "big_field_gpp":
+        cash_probability = max(1.0, min(70.0, cash_probability * payout_adjustment * 0.82))
+        top_10_probability = max(0.3, min(28.0, 4.0 + combined_strength * 18.0 * field_scale * multi_entry_penalty))
+        top_1_probability = max(0.02, min(6.0, 0.12 + combined_strength * 4.8 * field_scale * multi_entry_penalty))
+        top_0_1_probability = max(0.001, min(0.70, 0.006 + combined_strength * 0.48 * field_scale * multi_entry_penalty))
+    else:
+        cash_probability = max(1.0, min(82.0, cash_probability * payout_adjustment * 0.90))
+        top_10_probability = max(0.4, min(32.0, 5.0 + combined_strength * 19.0 * field_scale * multi_entry_penalty))
+        top_1_probability = max(0.02, min(7.0, 0.18 + combined_strength * 5.3 * field_scale * multi_entry_penalty))
+        top_0_1_probability = max(0.001, min(0.85, 0.008 + combined_strength * 0.60 * field_scale * multi_entry_penalty))
+
+    # Recalculate rank estimates from realistic strength after probability caps.
+    median_strength = max(1.0, min(99.0, quality_score * 0.48 + focus_score * 0.32 + projection * 0.10 + stack_correlation * 0.35 + leverage_points * 0.22))
+    projected_rank_ratio = max(0.06, min(0.985, 1.0 - (median_strength / 115.0)))
+    projected_rank = max(1, min(contest_size, round(contest_size * projected_rank_ratio)))
+
+    ceiling_rank_ratio = max(
+        0.0008,
+        min(
+            projected_rank_ratio * 0.55,
+            0.080 - (combined_strength * 0.050) - (top_1_probability / 100.0) * 0.70 - (top_0_1_probability / 100.0) * 4.50,
+        ),
+    )
+    if focus == "big_field_gpp":
+        ceiling_rank_ratio = max(0.0008, ceiling_rank_ratio * 0.72)
+    ceiling_rank = max(1, min(contest_size, round(contest_size * ceiling_rank_ratio)))
 
     payout_model = estimate_expected_payout_from_probabilities(
         contest=contest,
@@ -3426,6 +3369,7 @@ def simulate_single_lineup(lineup_data, request: ContestSimulationRequest, lineu
         "expected_value": expected_value,
         "expected_payout": round(expected_payout, 2),
         "projected_payout": round(projected_payout, 2),
+        "median_payout": round(projected_payout, 2),
         "ceiling_payout": round(ceiling_payout, 2),
         "min_cash_payout": payout_model.get("min_cash_payout", 0),
         "top_10_rank_payout": payout_model.get("top_10_rank_payout", 0),
@@ -3450,23 +3394,6 @@ def simulate_single_lineup(lineup_data, request: ContestSimulationRequest, lineu
         "win_probability": round(win_probability, 1),
         "lineup_quality_label": quality_label,
         "lineup_quality_breakdown": breakdown,
-        "lineup_iq_score": round(quality_score, 1),
-        "lineup_iq_label": quality_label,
-        "lineup_iq": {
-            "projection": breakdown.get("projection_score", 0),
-            "ceiling": breakdown.get("ceiling_score", 0),
-            "leverage": breakdown.get("leverage_score", 0),
-            "stack_strength": breakdown.get("stack_score", 0),
-            "core": breakdown.get("core_score", 0),
-            "salary": breakdown.get("salary_score", 0),
-            "safety": breakdown.get("safety_score", 0),
-            "fade_penalty": breakdown.get("fade_penalty", 0),
-            "bad_chalk_penalty": breakdown.get("bad_chalk_penalty", 0),
-        },
-        "stack_score": breakdown.get("stack_score", 0),
-        "leverage_score": breakdown.get("leverage_score", 0),
-        "ceiling_score": breakdown.get("ceiling_score", 0),
-        "safety_score": breakdown.get("safety_score", 0),
     }
 
     return {
@@ -3579,8 +3506,8 @@ def data_engine_status():
 
 @app.post("/data-engine/enrich-slate")
 def enrich_active_slate(request: AdminPasswordRequest):
-    if request.admin_password != ADMIN_PASSWORD:
-        return {"success": False, "error": "Invalid admin password."}
+    if not is_admin_authorized(request):
+        return {"success": False, "error": "Admin session expired. Log in as admin again."}
 
     enriched_players, cleanup_stats = apply_auto_slate_cleanup(load_players(), respect_manual_overrides=True)
     save_active_slate(enriched_players)
@@ -3718,6 +3645,27 @@ def find_user_by_token(token):
         if user.get("token") == token:
             return email, user, users
     return "", None, users
+
+
+def is_admin_token(token):
+    if not token:
+        return False
+    email, user, _ = find_user_by_token(token)
+    if not user:
+        return False
+    role = role_for_email(email, user.get("role", "free"))
+    return role == "admin"
+
+
+def is_admin_authorized(request_or_password=None, token=""):
+    password = ""
+    auth_token = token or ""
+    if isinstance(request_or_password, str):
+        password = request_or_password
+    elif request_or_password is not None:
+        password = getattr(request_or_password, "admin_password", "") or ""
+        auth_token = getattr(request_or_password, "auth_token", "") or getattr(request_or_password, "admin_token", "") or auth_token
+    return password == ADMIN_PASSWORD or is_admin_token(auth_token)
 
 
 @app.post("/auth/register")
@@ -3866,8 +3814,8 @@ def request_pro_subscription(request: AuthTokenRequest):
 
 @app.post("/admin/set-user-role")
 def set_user_role(request: UpdateUserRoleRequest):
-    if request.admin_password != ADMIN_PASSWORD:
-        return {"success": False, "error": "Invalid admin password."}
+    if not is_admin_authorized(request):
+        return {"success": False, "error": "Admin session expired. Log in as admin again."}
 
     email = normalize_email(request.email)
     role = str(request.role or "free").lower().strip()
@@ -4244,16 +4192,19 @@ def slate_status():
         "pool_limits": POOL_LIMITS,
         "auto_cleanup_enabled": True,
         "auto_cleanup_position_limits": AUTO_CLEANUP_POSITION_LIMITS,
+        "data_dir": str(DATA_DIR),
+        "daily_slate_persistent": True,
     }
 
 
 @app.post("/admin/upload-dk-csv")
 async def upload_dk_csv(
-    admin_password: str = Form(...),
+    admin_password: str = Form(""),
+    admin_token: str = Form(""),
     file: UploadFile = File(...),
 ):
-    if admin_password != ADMIN_PASSWORD:
-        return {"success": False, "error": "Invalid admin password."}
+    if not is_admin_authorized(admin_password, admin_token):
+        return {"success": False, "error": "Admin session expired. Log in as admin again."}
 
     if not file.filename.lower().endswith(".csv"):
         return {"success": False, "error": "Please upload a CSV file."}
@@ -4286,8 +4237,8 @@ async def upload_dk_csv(
 
 @app.post("/admin/use-sample")
 def use_sample_slate(request: AdminPasswordRequest):
-    if request.admin_password != ADMIN_PASSWORD:
-        return {"success": False, "error": "Invalid admin password."}
+    if not is_admin_authorized(request):
+        return {"success": False, "error": "Admin session expired. Log in as admin again."}
     if ACTIVE_SLATE_PATH.exists():
         ACTIVE_SLATE_PATH.unlink()
     ensure_sample_players_file()
@@ -4301,9 +4252,9 @@ def use_sample_slate(request: AdminPasswordRequest):
 
 
 @app.post("/admin/clear-slate")
-def clear_imported_slate(admin_password: str = Form(...)):
-    if admin_password != ADMIN_PASSWORD:
-        return {"success": False, "error": "Invalid admin password."}
+def clear_imported_slate(admin_password: str = Form(""), admin_token: str = Form("")):
+    if not is_admin_authorized(admin_password, admin_token):
+        return {"success": False, "error": "Admin session expired. Log in as admin again."}
     if ACTIVE_SLATE_PATH.exists():
         ACTIVE_SLATE_PATH.unlink()
     ensure_sample_players_file()
@@ -4315,8 +4266,8 @@ def clear_imported_slate(admin_password: str = Form(...)):
 
 @app.post("/admin/update-player")
 def update_player(request: UpdatePlayerRequest):
-    if request.admin_password != ADMIN_PASSWORD:
-        return {"success": False, "error": "Invalid admin password."}
+    if not is_admin_authorized(request):
+        return {"success": False, "error": "Admin session expired. Log in as admin again."}
     if request.projection < 0:
         return {"success": False, "error": "Projection cannot be negative."}
     if request.ownership < 0 or request.ownership > 100:
@@ -4340,8 +4291,8 @@ def update_player(request: UpdatePlayerRequest):
 
 @app.post("/admin/update-player-status")
 def update_player_status(request: UpdatePlayerStatusRequest):
-    if request.admin_password != ADMIN_PASSWORD:
-        return {"success": False, "error": "Invalid admin password."}
+    if not is_admin_authorized(request):
+        return {"success": False, "error": "Admin session expired. Log in as admin again."}
 
     players = load_players()
     target_name = request.player_name.strip()
@@ -4387,261 +4338,6 @@ def get_value_plays():
     }
 
 
-
-def emergency_safe_lineup_builder(request, count, reason="optimizer rules too strict"):
-    """
-    Last-resort production-safe builder.
-    This prevents the live app from returning nothing when the takedown engine gets too restrictive.
-    It still respects DraftKings MLB roster construction, salary cap, locks, and excludes.
-    It relaxes advanced stack/leverage rules only after the main builder fails.
-    """
-    locked_players = request.locked_players or []
-    excluded_players = set(request.excluded_players or [])
-    mode = str(getattr(request, "mode", "gpp") or "gpp").lower()
-    target_count = count if count in [1, 5, 10, 20] else 1
-
-    raw_players = add_values(load_players())
-    if not raw_players:
-        return [], "No players are loaded. Admin must upload today’s DraftKings CSV.", {}, 0
-
-    error = validate_locks(raw_players, locked_players, list(excluded_players))
-    if error:
-        return [], error, {}, 0
-
-    def usable_player(p, allow_inactive=False):
-        if p.get("name") in excluded_players:
-            return False
-        if not allow_inactive and not bool(p.get("active", True)):
-            return False
-        try:
-            salary = int(float(p.get("salary", 0) or 0))
-        except Exception:
-            salary = 0
-        if salary <= 0:
-            return False
-        return str(p.get("position", "")).upper() in {"P", "C", "1B", "2B", "3B", "SS", "OF"}
-
-    active_pool = [p for p in raw_players if usable_player(p, allow_inactive=False)]
-    full_pool = [p for p in raw_players if usable_player(p, allow_inactive=True)]
-    pool = active_pool if len(active_pool) >= 10 else full_pool
-
-    trim_report = {
-        "safe_fallback": True,
-        "reason": reason,
-        "active_pool_count": len(active_pool),
-        "fallback_pool_count": len(full_pool),
-    }
-
-    locked_set = set(locked_players)
-    locked_objects = [p for p in full_pool if p.get("name") in locked_set]
-
-    required = {"P": 2, "C": 1, "1B": 1, "2B": 1, "3B": 1, "SS": 1, "OF": 3}
-
-    def pos(p):
-        return str(p.get("position", "")).upper()
-
-    def count_pos(lineup, position):
-        return len([p for p in lineup if pos(p) == position])
-
-    def position_valid(lineup):
-        return len(lineup) == 10 and all(count_pos(lineup, k) == v for k, v in required.items())
-
-    def emergency_grade(p):
-        # Takedown-friendly but safe fallback grade.
-        projection = safe_float(p.get("projection", 0))
-        ceiling = safe_float(p.get("ceiling", projection * 1.35))
-        leverage = safe_float(p.get("leverage_score", p.get("leverage", 0)))
-        trend = safe_float(p.get("trend_score", 50))
-        vegas = safe_float(p.get("vegas_boost", 0))
-        ownership = safe_float(p.get("ownership", 10))
-        salary = max(1, safe_float(p.get("salary", 1)))
-        active_bonus = 2.0 if bool(p.get("active", True)) else -12.0
-        core_bonus = 4.0 if str(p.get("play_tag", p.get("core_label", ""))).lower().find("core") >= 0 else 0.0
-        bad_chalk_penalty = 4.0 if str(p.get("play_tag", p.get("core_label", ""))).lower().find("chalk") >= 0 else 0.0
-        value = (projection / salary) * 1000
-        return (
-            projection * 2.2
-            + ceiling * 1.2
-            + leverage * 0.45
-            + trend * 0.04
-            + vegas * 1.8
-            + value * 1.15
-            + max(0, 18 - ownership) * 0.18
-            + active_bonus
-            + core_bonus
-            - bad_chalk_penalty
-        )
-
-    groups = {k: [p for p in pool if pos(p) == k] for k in required}
-    for k in groups:
-        groups[k].sort(key=emergency_grade, reverse=True)
-
-    # If active pool is position-thin, fall back to all valid players for the missing positions only.
-    full_groups = {k: [p for p in full_pool if pos(p) == k] for k in required}
-    for k in full_groups:
-        full_groups[k].sort(key=emergency_grade, reverse=True)
-        if len(groups.get(k, [])) < required[k]:
-            groups[k] = full_groups[k]
-
-    if any(len(groups[k]) < required[k] for k in required):
-        missing = [f"{k}:{len(groups[k])}/{required[k]}" for k in required if len(groups[k]) < required[k]]
-        return [], "Not enough DraftKings MLB players by position after upload: " + ", ".join(missing), trim_report, 0
-
-    def choose_candidate(position, used, attempt, slot_index, prefer_team=None):
-        candidates = groups[position]
-        if not candidates:
-            return None
-
-        # Prefer stacks for hitters in GPP/takedown modes, but do not require it.
-        if prefer_team and position != "P":
-            stacked = [p for p in candidates if p.get("team") == prefer_team and p.get("name") not in used]
-            if stacked:
-                return stacked[(attempt + slot_index) % len(stacked)]
-
-        # Rotate through a wider pool so multi-lineups are different.
-        width = min(len(candidates), 45 if position in ["OF", "P"] else 28)
-        for j in range(width):
-            idx = (attempt * 7 + slot_index * 11 + j) % width
-            cand = candidates[idx]
-            if cand.get("name") not in used:
-                return cand
-        return None
-
-    def repair_salary(lineup):
-        used = {p.get("name") for p in lineup}
-        salary = sum(int(float(p.get("salary", 0) or 0)) for p in lineup)
-        if salary <= SALARY_CAP:
-            return lineup
-
-        for idx, current in sorted(list(enumerate(lineup)), key=lambda item: safe_float(item[1].get("salary", 0)), reverse=True):
-            if salary <= SALARY_CAP:
-                break
-            if current.get("name") in locked_set:
-                continue
-            position = pos(current)
-            replacements = [
-                p for p in full_groups[position]
-                if p.get("name") not in used and safe_float(p.get("salary", 0)) < safe_float(current.get("salary", 0))
-            ]
-            replacements.sort(key=lambda p: (safe_float(p.get("salary", 0)), -emergency_grade(p)))
-            for repl in replacements[:40]:
-                new_salary = salary - safe_float(current.get("salary", 0)) + safe_float(repl.get("salary", 0))
-                if new_salary <= SALARY_CAP:
-                    used.remove(current.get("name"))
-                    used.add(repl.get("name"))
-                    lineup[idx] = repl
-                    salary = new_salary
-                    break
-        return lineup
-
-    def team_counts(lineup):
-        counts = {}
-        for p in lineup:
-            if pos(p) == "P":
-                continue
-            team = p.get("team", "")
-            counts[team] = counts.get(team, 0) + 1
-        return counts
-
-    # Stack teams are chosen from high-grade hitter teams.
-    hitter_pool = [p for p in pool if pos(p) != "P"]
-    team_scores = {}
-    for p in hitter_pool:
-        team_scores[p.get("team", "")] = team_scores.get(p.get("team", ""), 0) + emergency_grade(p)
-    stack_teams = [team for team, _ in sorted(team_scores.items(), key=lambda x: x[1], reverse=True) if team]
-    if not stack_teams:
-        stack_teams = [None]
-
-    lineups = []
-    seen = set()
-    attempts = 0
-    max_attempts = max(2500, target_count * 350)
-
-    while attempts < max_attempts and len(lineups) < max(target_count * 3, target_count):
-        attempts += 1
-        lineup = []
-        used = set()
-
-        # Add locks first, but reject impossible locked rosters.
-        impossible_lock = False
-        for lp in locked_objects:
-            position = pos(lp)
-            if count_pos(lineup, position) >= required[position]:
-                impossible_lock = True
-                break
-            lineup.append(lp)
-            used.add(lp.get("name"))
-        if impossible_lock:
-            continue
-
-        stack_team = stack_teams[attempts % len(stack_teams)]
-
-        slot_plan = ["P", "P", "C", "1B", "2B", "3B", "SS", "OF", "OF", "OF"]
-        for slot_index, position in enumerate(slot_plan):
-            if count_pos(lineup, position) >= required[position]:
-                continue
-            cand = choose_candidate(position, used, attempts, slot_index, prefer_team=stack_team)
-            if cand is None:
-                cand = choose_candidate(position, used, attempts + 31, slot_index, prefer_team=None)
-            if cand is None:
-                break
-            lineup.append(cand)
-            used.add(cand.get("name"))
-
-        if not position_valid(lineup):
-            continue
-        lineup = repair_salary(lineup)
-        if not position_valid(lineup):
-            continue
-
-        salary = sum(int(float(p.get("salary", 0) or 0)) for p in lineup)
-        if salary > SALARY_CAP:
-            continue
-        if not has_all_locked(lineup, locked_players):
-            continue
-
-        # Respect team cap if possible. If the cap is too restrictive, only relax after many attempts.
-        max_team = int(getattr(request, "max_players_per_team", 5) or 5)
-        if attempts < (max_attempts * 0.65) and max(team_counts(lineup).values() or [0]) > max_team:
-            continue
-
-        key = lineup_key(lineup)
-        if key in seen:
-            continue
-        seen.add(key)
-
-        projection = sum(safe_float(p.get("projection", 0)) for p in lineup)
-        score = score_lineup(lineup, mode, min(max(int(getattr(request, "randomness", 0) or 0), 0), 65))
-        metadata = add_lineup_metadata({
-            "mode": mode,
-            "total_salary": salary,
-            "projected_points": round(projection, 2),
-            "optimizer_score": round(score, 2),
-            "lineup": lineup,
-            "lineup_warning": "Safe fallback builder was used because primary takedown rules could not return enough valid lineups.",
-        })
-        lineups.append(metadata)
-
-    if not lineups:
-        return [], "Safe fallback still could not build a valid MLB lineup. Check that today’s CSV includes P, C, 1B, 2B, 3B, SS, and at least 3 OF under the $50,000 cap.", trim_report, attempts
-
-    lineups.sort(key=lambda x: x.get("optimizer_score", 0), reverse=True)
-
-    selected = diversify_lineups(
-        all_lineups=lineups,
-        count=target_count,
-        max_exposure=100,
-        max_same_players=9,
-        locked_players=locked_players,
-        player_min_exposure={},
-        player_max_exposure={},
-    )
-    if not selected:
-        selected = lineups[:target_count]
-
-    return selected[:target_count], None, trim_report, attempts
-
-
 @app.post("/optimize")
 def optimize_lineup(request: OptimizeRequest):
     all_lineups, error, trim_report, checked = build_all_lineups(
@@ -4657,20 +4353,10 @@ def optimize_lineup(request: OptimizeRequest):
         randomness=request.randomness,
     )
 
-    if error or not all_lineups:
-        safe_request = MultiOptimizeRequest(**request.dict(), count=1)
-        fallback_lineups, fallback_error, fallback_report, fallback_checked = emergency_safe_lineup_builder(
-            safe_request,
-            1,
-            reason=error or "single lineup primary builder returned nothing",
-        )
-        if fallback_lineups:
-            all_lineups = fallback_lineups
-            trim_report = fallback_report
-            checked = checked + fallback_checked
-            error = None
-        else:
-            return {"error": fallback_error or error or "No valid MLB lineup found with your current locks and excludes."}
+    if error:
+        return {"error": error}
+    if not all_lineups:
+        return {"error": "No valid MLB lineup found with your current locks and excludes."}
 
     result = all_lineups[0]
     result["trim_report"] = trim_report
@@ -4684,33 +4370,15 @@ def optimize_lineup(request: OptimizeRequest):
 def optimize_multiple_lineups(request: MultiOptimizeRequest):
     count = request.count if request.count in [1, 5, 10, 20] else 1
 
-    # Primary builder: true takedown / pro optimizer.
+    # Always use the fast builder for this endpoint.
+    # This fixes Pro mode when count is 1 and prevents full DraftKings CSV slates from timing out.
     selected, error, trim_report, checked = build_fast_multi_lineups_for_pro(request, count)
-
-    fallback_used = False
-    primary_error = error
-
-    # Live-app safety: never let strict takedown rules make the Generate button return nothing.
-    if error or not selected or len(selected) < count:
-        fallback_selected, fallback_error, fallback_report, fallback_checked = emergency_safe_lineup_builder(
-            request,
-            count,
-            reason=primary_error or "primary builder returned fewer lineups than requested",
-        )
-        if fallback_selected:
-            selected = fallback_selected
-            error = None
-            trim_report = fallback_report
-            checked = checked + fallback_checked
-            fallback_used = True
-        else:
-            error = fallback_error or primary_error
 
     if error:
         return {"error": error, "lineups": [], "exposures": []}
 
     if not selected:
-        return {"error": "No valid MLB lineups found. Check today’s CSV position pool, salary cap, locks, excludes, and active player statuses.", "lineups": [], "exposures": []}
+        return {"error": "No valid MLB lineups found with your current locks and excludes.", "lineups": [], "exposures": []}
 
     return {
         "mode": request.mode,
@@ -4721,8 +4389,6 @@ def optimize_multiple_lineups(request: MultiOptimizeRequest):
         "salary_cap": SALARY_CAP,
         "roster_slots": ROSTER_SLOTS,
         "speed_boost": "enabled",
-        "fallback_used": fallback_used,
-        "fallback_note": "Safe fallback builder used to keep live lineup generation working." if fallback_used else "Primary takedown builder used.",
         "trim_report": trim_report,
         "combinations_checked": checked,
         "lineups": selected,
@@ -5319,8 +4985,8 @@ def market_intelligence_status():
 
 @app.post("/market-intelligence/refresh")
 def market_intelligence_refresh(request: AdminPasswordRequest):
-    if request.admin_password != ADMIN_PASSWORD:
-        return {"success": False, "error": "Invalid admin password."}
+    if not is_admin_authorized(request):
+        return {"success": False, "error": "Admin session expired. Log in as admin again."}
     summary = market_intelligence_summary(persist_snapshot=True)
     summary["message"] = "Ownership drift and Vegas movement refreshed. Current market snapshot saved for future comparison."
     return summary
@@ -5332,8 +4998,8 @@ def slate_intelligence_status():
 
 @app.post("/slate-intelligence/refresh")
 def slate_intelligence_refresh(request: AdminPasswordRequest):
-    if request.admin_password != ADMIN_PASSWORD:
-        return {"success": False, "error": "Invalid admin password."}
+    if not is_admin_authorized(request):
+        return {"success": False, "error": "Admin session expired. Log in as admin again."}
 
     enriched_players, cleanup_stats = apply_auto_slate_cleanup(load_players(), respect_manual_overrides=True)
     save_active_slate(enriched_players)
