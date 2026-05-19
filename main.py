@@ -43,19 +43,17 @@ DEFAULT_ADMIN_PASSWORD = "Zero2SixtyAdmin2026!"
 ROSTER_SLOTS = ["P", "P", "C", "1B", "2B", "3B", "SS", "OF", "OF", "OF"]
 
 POOL_LIMITS = {
-    # Larger live pools so DraftKings slates do not fail after auto-cleanup.
-    # The optimizer still trims for speed, but keeps enough depth at every MLB position.
-    "P": 40,
-    "C": 28,
-    "1B": 30,
-    "2B": 30,
-    "3B": 30,
-    "SS": 30,
-    "OF": 90,
+    "P": 120,
+    "C": 80,
+    "1B": 80,
+    "2B": 80,
+    "3B": 80,
+    "SS": 80,
+    "OF": 220,
 }
 
 # Higher cap so larger live slates can still find valid MLB builds.
-MAX_COMBINATIONS_TO_CHECK = 150000
+MAX_COMBINATIONS_TO_CHECK = 500000
 
 # Auto Slate Cleanup keeps large DraftKings CSV uploads usable for DFS.
 # These are MVP safety caps until real confirmed-lineup/injury APIs are connected.
@@ -810,7 +808,7 @@ def load_players():
             with open(ACTIVE_SLATE_PATH, "r", encoding="utf-8") as f:
                 active_players = json.load(f)
             if isinstance(active_players, list) and len(active_players) >= 10:
-                return active_players
+                return ensure_minimum_position_players(active_players)
         except Exception:
             pass
 
@@ -828,6 +826,48 @@ def load_players():
 
 
 def save_active_slate(players):
+
+
+def ensure_minimum_position_players(players):
+    required_minimums = {
+        "P": 2,
+        "C": 1,
+        "1B": 1,
+        "2B": 1,
+        "3B": 1,
+        "SS": 1,
+        "OF": 3,
+    }
+
+    position_counts = {}
+
+    for p in players:
+        pos = normalize_position(p.get("position", ""))
+        if not p.get("active", True):
+            continue
+        position_counts[pos] = position_counts.get(pos, 0) + 1
+
+    failed = False
+
+    for pos, minimum in required_minimums.items():
+        if position_counts.get(pos, 0) < minimum:
+            failed = True
+
+    if failed:
+        repaired = []
+
+        for p in players:
+            if (
+                safe_int(p.get("salary", 0), 0) > 0
+                and normalize_position(p.get("position", "")) in ["P","C","1B","2B","3B","SS","OF"]
+            ):
+                p["active"] = True
+                repaired.append(p)
+
+        return repaired
+
+    return players
+
     with open(ACTIVE_SLATE_PATH, "w", encoding="utf-8") as f:
         json.dump(players, f, indent=2)
 
