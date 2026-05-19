@@ -826,6 +826,8 @@ def load_players():
 
 
 def save_active_slate(players):
+    with open(ACTIVE_SLATE_PATH, "w", encoding="utf-8") as f:
+        json.dump(players, f, indent=2)
 
 
 def ensure_minimum_position_players(players):
@@ -847,11 +849,7 @@ def ensure_minimum_position_players(players):
             continue
         position_counts[pos] = position_counts.get(pos, 0) + 1
 
-    failed = False
-
-    for pos, minimum in required_minimums.items():
-        if position_counts.get(pos, 0) < minimum:
-            failed = True
+    failed = any(position_counts.get(pos, 0) < minimum for pos, minimum in required_minimums.items())
 
     if failed:
         repaired = []
@@ -859,17 +857,16 @@ def ensure_minimum_position_players(players):
         for p in players:
             if (
                 safe_int(p.get("salary", 0), 0) > 0
-                and normalize_position(p.get("position", "")) in ["P","C","1B","2B","3B","SS","OF"]
+                and normalize_position(p.get("position", "")) in ["P", "C", "1B", "2B", "3B", "SS", "OF"]
             ):
                 p["active"] = True
+                if str(p.get("inactive_reason", "")).startswith("auto_"):
+                    p["inactive_reason"] = ""
                 repaired.append(p)
 
         return repaired
 
     return players
-
-    with open(ACTIVE_SLATE_PATH, "w", encoding="utf-8") as f:
-        json.dump(players, f, indent=2)
 
 
 def current_slate_source():
