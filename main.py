@@ -43,17 +43,19 @@ DEFAULT_ADMIN_PASSWORD = "Zero2SixtyAdmin2026!"
 ROSTER_SLOTS = ["P", "P", "C", "1B", "2B", "3B", "SS", "OF", "OF", "OF"]
 
 POOL_LIMITS = {
-    "P": 22,
-    "C": 16,
-    "1B": 18,
-    "2B": 18,
-    "3B": 18,
-    "SS": 18,
-    "OF": 42,
+    # Larger live pools so DraftKings slates do not fail after auto-cleanup.
+    # The optimizer still trims for speed, but keeps enough depth at every MLB position.
+    "P": 40,
+    "C": 28,
+    "1B": 30,
+    "2B": 30,
+    "3B": 30,
+    "SS": 30,
+    "OF": 90,
 }
 
-# Reduced for performance (prevents Pro mode timeout)
-MAX_COMBINATIONS_TO_CHECK = 60000
+# Higher cap so larger live slates can still find valid MLB builds.
+MAX_COMBINATIONS_TO_CHECK = 150000
 
 # Auto Slate Cleanup keeps large DraftKings CSV uploads usable for DFS.
 # These are MVP safety caps until real confirmed-lineup/injury APIs are connected.
@@ -1525,6 +1527,97 @@ def trim_player_pool(players, locked_players):
     return trimmed, report
 
 
+
+
+def has_required_mlb_positions(pool):
+    groups = {
+        "P": [p for p in pool if normalize_position(p.get("position", "")) == "P"],
+        "C": [p for p in pool if normalize_position(p.get("position", "")) == "C"],
+        "1B": [p for p in pool if normalize_position(p.get("position", "")) == "1B"],
+        "2B": [p for p in pool if normalize_position(p.get("position", "")) == "2B"],
+        "3B": [p for p in pool if normalize_position(p.get("position", "")) == "3B"],
+        "SS": [p for p in pool if normalize_position(p.get("position", "")) == "SS"],
+        "OF": [p for p in pool if normalize_position(p.get("position", "")) == "OF"],
+    }
+    return (
+        len(groups["P"]) >= 2
+        and len(groups["C"]) >= 1
+        and len(groups["1B"]) >= 1
+        and len(groups["2B"]) >= 1
+        and len(groups["3B"]) >= 1
+        and len(groups["SS"]) >= 1
+        and len(groups["OF"]) >= 3
+    )
+
+
+def is_manual_inactive_player(player):
+    """
+    Manual admin scratches should stay excluded.
+    Auto cleanup trims should NOT prevent the optimizer from building lineups.
+    """
+    if bool(player.get("active", True)):
+        return False
+    reason = str(player.get("inactive_reason", "")).lower()
+    return bool(player.get("manual_status_override", False)) or reason.startswith("manual")
+
+
+def valid_optimizer_player(player):
+    return (
+        safe_int(player.get("salary", 0), 0) > 0
+        and normalize_position(player.get("position", "")) in ["P", "C", "1B", "2B", "3B", "SS", "OF"]
+    )
+
+
+def build_optimizer_pool_with_fallback(players, locked_players=None, excluded_players=None):
+    """
+    Production-safe pool builder.
+
+    1. Try the cleaned ACTIVE slate first.
+    2. If auto cleanup trimmed too hard and a position is missing, fall back to
+       the full uploaded DraftKings slate.
+    3. Still respect manual admin inactive/excluded players.
+
+    This fixes the recurring live error:
+    "Not enough players at each MLB position" after today's CSV upload.
+    """
+    locked_players = locked_players or []
+    excluded_players = excluded_players or []
+    excluded_set = set(excluded_players)
+
+    all_valid = [
+        p for p in players
+        if p.get("name") not in excluded_set
+        and valid_optimizer_player(p)
+        and not is_manual_inactive_player(p)
+    ]
+
+    active_valid = [p for p in all_valid if bool(p.get("active", True))]
+
+    # First attempt: cleaned active slate.
+    optimized_pool, trim_report = trim_player_pool(active_valid, locked_players)
+    trim_report["fallback_used"] = False
+    trim_report["pool_source"] = "active_cleaned_slate"
+
+    if has_required_mlb_positions(optimized_pool):
+        return optimized_pool, trim_report
+
+    # Second attempt: all valid uploaded DK rows, including auto-trimmed players.
+    fallback_pool, fallback_report = trim_player_pool(all_valid, locked_players)
+    fallback_report["fallback_used"] = True
+    fallback_report["pool_source"] = "full_uploaded_slate_after_auto_cleanup_fallback"
+    fallback_report["active_cleaned_pool_count"] = len(active_valid)
+    fallback_report["full_valid_pool_count"] = len(all_valid)
+
+    if has_required_mlb_positions(fallback_pool):
+        return fallback_pool, fallback_report
+
+    # Final attempt: do not trim at all. This is slower but prevents a dead slate.
+    all_valid_sorted = list(all_valid)
+    all_valid_sorted.sort(key=player_grade, reverse=True)
+    fallback_report["pool_source"] = "full_uploaded_slate_untrimmed_emergency_fallback"
+    fallback_report["untrimmed_count"] = len(all_valid_sorted)
+    return all_valid_sorted, fallback_report
+
 def validate_locks(players, locked_players, excluded_players):
     names = set(p["name"] for p in players)
     missing_locked = [p for p in locked_players if p not in names]
@@ -2013,11 +2106,11 @@ def build_all_lineups(
     if error:
         return [], error, {}, 0
 
-    available_players = [
-        p for p in players
-        if p["name"] not in excluded_players and bool(p.get("active", True))
-    ]
-    optimized_pool, trim_report = trim_player_pool(available_players, locked_players)
+    optimized_pool, trim_report = build_optimizer_pool_with_fallback(
+        players,
+        locked_players=locked_players,
+        excluded_players=excluded_players,
+    )
 
     pitchers = [p for p in optimized_pool if p["position"] == "P"]
     catchers = [p for p in optimized_pool if p["position"] == "C"]
@@ -2036,7 +2129,7 @@ def build_all_lineups(
         or not shortstops
         or len(outfielders) < 3
     ):
-        return [], "Not enough players at each MLB position to build a DraftKings lineup.", trim_report, 0
+        return [], f"Not enough players at each MLB position even after full-slate fallback. Pool counts: P={len(pitchers)}, C={len(catchers)}, 1B={len(first_base)}, 2B={len(second_base)}, 3B={len(third_base)}, SS={len(shortstops)}, OF={len(outfielders)}.", trim_report, 0
 
     for group in [pitchers, catchers, first_base, second_base, third_base, shortstops, outfielders]:
         group.sort(key=player_grade, reverse=True)
@@ -2338,11 +2431,17 @@ def build_fast_multi_lineups_for_pro(request, count):
     if error:
         return [], error, {}, 0
 
+    optimized_pool, trim_report = build_optimizer_pool_with_fallback(
+        players,
+        locked_players=locked_players,
+        excluded_players=excluded_players,
+    )
     available = [
         p for p in players
-        if p["name"] not in excluded_players and bool(p.get("active", True))
+        if p["name"] not in excluded_players
+        and valid_optimizer_player(p)
+        and not is_manual_inactive_player(p)
     ]
-    optimized_pool, trim_report = trim_player_pool(available, locked_players)
 
     groups = {
         "P": [p for p in optimized_pool if p["position"] == "P"],
@@ -2363,7 +2462,7 @@ def build_fast_multi_lineups_for_pro(request, count):
         or not groups["SS"]
         or len(groups["OF"]) < 3
     ):
-        return [], "Not enough players at each MLB position to build Pro lineups.", trim_report, 0
+        return [], f"Not enough players at each MLB position even after full-slate fallback. Pool counts: P={len(groups['P'])}, C={len(groups['C'])}, 1B={len(groups['1B'])}, 2B={len(groups['2B'])}, 3B={len(groups['3B'])}, SS={len(groups['SS'])}, OF={len(groups['OF'])}.", trim_report, 0
 
     for key in groups:
         groups[key].sort(key=player_grade, reverse=True)
@@ -2846,7 +2945,7 @@ def build_fast_simulator_portfolio(request: ContestSimulationRequest):
     }
 
     if len(groups["P"]) < 2 or not groups["C"] or not groups["1B"] or not groups["2B"] or not groups["3B"] or not groups["SS"] or len(groups["OF"]) < 3:
-        return [], "Not enough players at each MLB position to run the simulator. Upload a larger DraftKings slate or clear filters."
+        return [], f"Not enough players at each MLB position to run the simulator even after full-slate fallback. Pool counts: P={len(groups['P'])}, C={len(groups['C'])}, 1B={len(groups['1B'])}, 2B={len(groups['2B'])}, 3B={len(groups['3B'])}, SS={len(groups['SS'])}, OF={len(groups['OF'])}."
 
     for key in groups:
         groups[key].sort(key=player_grade, reverse=True)
