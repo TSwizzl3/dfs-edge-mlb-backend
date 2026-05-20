@@ -10,6 +10,7 @@ import io
 import hashlib
 import re
 import math
+import random
 import os
 from datetime import datetime
 
@@ -3146,6 +3147,356 @@ def simulator_focus_label(focus: str):
 
 
 
+
+# =========================
+# DFS EDGE MLB SIM ENGINE V2
+# =========================
+# This replaces the old "score -> guessed rank -> guessed payout" simulator with
+# an actual Monte Carlo-style model:
+# - each player gets floor/median/ceiling/volatility
+# - candidate lineups are scored across many simulated slate outcomes
+# - opponent field scores are generated from ownership-weighted field lineups
+# - ranks are estimated against the full contest size
+# - payouts/EV/ROI come from rank outcomes, not fake prize-pool scaling
+
+def clamp_number(value, low, high):
+    return max(low, min(high, value))
+
+
+def player_simulation_profile(player):
+    position = normalize_position(player.get("position", ""))
+    median = safe_float(player.get("boosted_projection", player.get("projection", 0)), 0)
+    ownership = safe_float(player.get("ownership", 10), 10)
+    leverage = safe_float(player.get("leverage_score", 45), 45)
+    trend = safe_float(player.get("trend_score", 50), 50)
+    team_total = safe_float(player.get("team_total", 4.2), 4.2)
+    data_boost = safe_float(player.get("data_engine_boost", 0), 0)
+
+    if position == "P":
+        base_volatility = 0.29
+        if median >= 22:
+            base_volatility -= 0.06
+        elif median <= 12:
+            base_volatility += 0.06
+        floor_mult = 0.44
+        ceiling_mult = 1.72
+    else:
+        base_volatility = 0.43
+        if median >= 11:
+            base_volatility -= 0.03
+        elif median <= 5:
+            base_volatility += 0.08
+        floor_mult = 0.18
+        ceiling_mult = 2.35
+
+    # Lower-owned leverage plays are volatile but carry more true tournament ceiling.
+    leverage_ceiling_boost = clamp_number((leverage - 50) / 100, -0.08, 0.18)
+    trend_boost = clamp_number((trend - 50) / 250, -0.06, 0.12)
+    vegas_boost = clamp_number((team_total - 4.2) / 20, -0.05, 0.10) if position != "P" else 0
+
+    volatility = clamp_number(base_volatility + max(0, 12 - ownership) * 0.004 - max(0, ownership - 28) * 0.003, 0.16, 0.62)
+    floor = max(0.0, median * floor_mult * (1 - volatility * 0.20))
+    ceiling = median * (ceiling_mult + leverage_ceiling_boost + trend_boost + vegas_boost) + max(0.0, data_boost)
+
+    boom_rate = clamp_number(0.08 + leverage / 700 + max(0, 16 - ownership) / 350 + max(0, trend - 55) / 500, 0.02, 0.34)
+    bust_rate = clamp_number(0.18 + volatility * 0.45 + max(0, ownership - 25) / 260, 0.08, 0.48)
+
+    return {
+        "floor_projection": round(floor, 2),
+        "median_projection": round(median, 2),
+        "ceiling_projection": round(max(ceiling, median + 1.0), 2),
+        "volatility_score": round(volatility * 100, 1),
+        "boom_rate": round(boom_rate, 4),
+        "bust_rate": round(bust_rate, 4),
+    }
+
+
+def sample_player_outcome_v2(player, team_environment=None):
+    profile = player_simulation_profile(player)
+    floor = safe_float(profile.get("floor_projection", 0), 0)
+    median = safe_float(profile.get("median_projection", 0), 0)
+    ceiling = safe_float(profile.get("ceiling_projection", median), median)
+    boom_rate = safe_float(profile.get("boom_rate", 0.1), 0.1)
+    bust_rate = safe_float(profile.get("bust_rate", 0.25), 0.25)
+    position = normalize_position(player.get("position", ""))
+
+    r = random.random()
+
+    if r < bust_rate:
+        value = random.triangular(0, median * 0.72, floor)
+    elif r > 1 - boom_rate:
+        value = random.triangular(median * 1.05, ceiling * 1.08, ceiling)
+    else:
+        value = random.triangular(floor, ceiling, median)
+
+    if team_environment is not None and position != "P":
+        team = normalize_team(player.get("team", ""))
+        value *= team_environment.get(team, 1.0)
+
+    return round(max(0.0, value), 2)
+
+
+def team_environment_multipliers_for_lineup(lineup):
+    counts = {}
+    for player in lineup:
+        if normalize_position(player.get("position", "")) != "P":
+            team = normalize_team(player.get("team", ""))
+            counts[team] = counts.get(team, 0) + 1
+
+    multipliers = {}
+    for team, count in counts.items():
+        # Correlation: a stack can fail together or smash together.
+        if count >= 5:
+            multipliers[team] = random.triangular(0.72, 1.42, 1.04)
+        elif count == 4:
+            multipliers[team] = random.triangular(0.78, 1.32, 1.03)
+        elif count == 3:
+            multipliers[team] = random.triangular(0.84, 1.22, 1.01)
+        else:
+            multipliers[team] = random.triangular(0.90, 1.14, 1.0)
+    return multipliers
+
+
+def simulate_lineup_score_v2(lineup):
+    if not lineup:
+        return 0.0
+
+    env = team_environment_multipliers_for_lineup(lineup)
+    total = 0.0
+
+    for player in lineup:
+        total += sample_player_outcome_v2(player, env)
+
+    # Add a small explicit bonus when a full stack hits together.
+    stack = best_stack_info(lineup)
+    stack_size = safe_int(stack.get("size", 0), 0)
+    if stack_size >= 5:
+        total += random.triangular(-2.0, 8.0, 1.2)
+    elif stack_size == 4:
+        total += random.triangular(-1.2, 5.0, 0.8)
+
+    return round(max(0.0, total), 2)
+
+
+def weighted_choice_from_players(players, used_names=None, ownership_weight=1.0, projection_weight=0.50):
+    used_names = used_names or set()
+    candidates = [p for p in players if p.get("name") not in used_names and bool(p.get("active", True))]
+    if not candidates:
+        return None
+
+    weights = []
+    for p in candidates:
+        ownership = max(0.5, safe_float(p.get("ownership", 5), 5))
+        proj = max(0.5, safe_float(p.get("boosted_projection", p.get("projection", 0)), 0))
+        salary = max(2500, safe_int(p.get("salary", 3000), 3000))
+        value = max(0.2, (proj / salary) * 1000)
+        weight = (ownership ** ownership_weight) * (proj ** projection_weight) * (value ** 0.35)
+        weights.append(max(0.01, weight))
+
+    return random.choices(candidates, weights=weights, k=1)[0]
+
+
+def build_random_field_lineup_v2(position_groups, contest):
+    used = set()
+    lineup = []
+    max_entries = max(1, safe_int(contest.get("max_entries", 1), 1))
+    single_entry = bool(contest.get("single_entry", False)) or max_entries <= 1
+
+    # Large max-entry fields are chalkier; single-entry is a little more balanced.
+    ownership_weight = 1.18 if max_entries >= 50 else (1.02 if not single_entry else 0.82)
+    projection_weight = 0.62 if single_entry else 0.52
+
+    # Field stacks: many MLB GPP lineups stack hitters.
+    stack_team = None
+    hitter_pool = []
+    for pos in ["C", "1B", "2B", "3B", "SS", "OF"]:
+        hitter_pool.extend(position_groups.get(pos, []))
+    if hitter_pool and random.random() < (0.72 if max_entries >= 20 else 0.52):
+        teams = {}
+        for p in hitter_pool:
+            team = normalize_team(p.get("team", ""))
+            teams[team] = teams.get(team, 0.0) + max(0.5, safe_float(p.get("ownership", 5), 5)) + max(0.0, safe_float(p.get("team_total", 4.2), 4.2) - 3.6) * 5
+        if teams:
+            stack_team = random.choices(list(teams.keys()), weights=list(teams.values()), k=1)[0]
+
+    for slot in ["P", "P"]:
+        p = weighted_choice_from_players(position_groups.get("P", []), used, ownership_weight, projection_weight)
+        if p:
+            lineup.append(p)
+            used.add(p.get("name"))
+
+    for slot in ["C", "1B", "2B", "3B", "SS", "OF", "OF", "OF"]:
+        group = position_groups.get(slot, [])
+        selected = None
+
+        if stack_team and slot != "P" and random.random() < 0.62:
+            stack_group = [p for p in group if normalize_team(p.get("team", "")) == stack_team]
+            selected = weighted_choice_from_players(stack_group, used, ownership_weight, projection_weight)
+
+        if not selected:
+            selected = weighted_choice_from_players(group, used, ownership_weight, projection_weight)
+
+        if selected:
+            lineup.append(selected)
+            used.add(selected.get("name"))
+
+    salary = sum(safe_int(p.get("salary", 0), 0) for p in lineup)
+    if len(lineup) != 10 or salary > SALARY_CAP:
+        return None
+    return lineup
+
+
+def generate_field_score_samples_v2(contest, sample_count=1400):
+    players = add_values(load_players())
+    players = [p for p in players if valid_optimizer_player(p) and not is_manual_inactive_player(p)]
+    if not has_required_mlb_positions(players):
+        return []
+
+    optimized_pool, _ = trim_player_pool(players, [])
+    position_groups = {
+        "P": [p for p in optimized_pool if normalize_position(p.get("position", "")) == "P"],
+        "C": [p for p in optimized_pool if normalize_position(p.get("position", "")) == "C"],
+        "1B": [p for p in optimized_pool if normalize_position(p.get("position", "")) == "1B"],
+        "2B": [p for p in optimized_pool if normalize_position(p.get("position", "")) == "2B"],
+        "3B": [p for p in optimized_pool if normalize_position(p.get("position", "")) == "3B"],
+        "SS": [p for p in optimized_pool if normalize_position(p.get("position", "")) == "SS"],
+        "OF": [p for p in optimized_pool if normalize_position(p.get("position", "")) == "OF"],
+    }
+
+    scores = []
+    attempts = 0
+    max_attempts = sample_count * 8
+
+    while len(scores) < sample_count and attempts < max_attempts:
+        attempts += 1
+        lineup = build_random_field_lineup_v2(position_groups, contest)
+        if not lineup:
+            continue
+        scores.append(simulate_lineup_score_v2(lineup))
+
+    scores.sort()
+    return scores
+
+
+def rank_from_score_against_field(score, field_scores, contest_size):
+    if not field_scores:
+        return contest_size
+
+    # Field scores are sorted ascending.
+    lo = 0
+    hi = len(field_scores)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if field_scores[mid] <= score:
+            lo = mid + 1
+        else:
+            hi = mid
+
+    beaten = lo
+    beat_rate = beaten / len(field_scores)
+    rank = 1 + round((1.0 - beat_rate) * (contest_size - 1))
+    return max(1, min(contest_size, rank))
+
+
+def percentile_value(sorted_values, percentile):
+    if not sorted_values:
+        return 0
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    idx = int(round((len(sorted_values) - 1) * percentile))
+    idx = max(0, min(len(sorted_values) - 1, idx))
+    return sorted_values[idx]
+
+
+def monte_carlo_lineup_simulation_v2(lineup, contest, runs=700, field_scores=None):
+    contest_size = max(10, safe_int(contest.get("contest_size", 5000), 5000))
+    paid_spots = max(1, min(contest_size, safe_int(contest.get("paid_positions") or contest.get("estimated_paid_spots", 1), 1)))
+    entry_fee = max(0.01, safe_float(contest.get("entry_fee", 5.0), 5.0))
+
+    if field_scores is None:
+        field_scores = generate_field_score_samples_v2(contest)
+
+    ranks = []
+    scores = []
+    payouts = []
+
+    for _ in range(runs):
+        score = simulate_lineup_score_v2(lineup)
+        rank = rank_from_score_against_field(score, field_scores, contest_size)
+        payout = payout_for_rank(rank, contest)
+        scores.append(score)
+        ranks.append(rank)
+        payouts.append(payout)
+
+    ranks_sorted = sorted(ranks)
+    scores_sorted = sorted(scores)
+    payouts_sorted = sorted(payouts)
+
+    expected_payout = sum(payouts) / len(payouts) if payouts else 0.0
+    expected_value = expected_payout - entry_fee
+
+    cash_probability = len([r for r in ranks if r <= paid_spots]) / len(ranks) * 100 if ranks else 0
+    top_10_cutoff = max(1, round(contest_size * 0.10))
+    top_1_cutoff = max(1, round(contest_size * 0.01))
+    top_01_cutoff = max(1, round(contest_size * 0.001))
+    win_cutoff = 1
+
+    top_10_probability = len([r for r in ranks if r <= top_10_cutoff]) / len(ranks) * 100 if ranks else 0
+    top_1_probability = len([r for r in ranks if r <= top_1_cutoff]) / len(ranks) * 100 if ranks else 0
+    top_0_1_probability = len([r for r in ranks if r <= top_01_cutoff]) / len(ranks) * 100 if ranks else 0
+    win_probability = len([r for r in ranks if r <= win_cutoff]) / len(ranks) * 100 if ranks else 0
+
+    median_rank = int(percentile_value(ranks_sorted, 0.50))
+    average_rank = int(round(sum(ranks) / len(ranks))) if ranks else contest_size
+    ceiling_rank = int(percentile_value(ranks_sorted, 0.05))  # best 5% outcome
+    takedown_rank = int(percentile_value(ranks_sorted, 0.01)) # best 1% outcome
+
+    return {
+        "simulation_runs": runs,
+        "average_sim_score": round(sum(scores) / len(scores), 2) if scores else 0,
+        "median_sim_score": round(percentile_value(scores_sorted, 0.50), 2),
+        "ceiling_sim_score": round(percentile_value(scores_sorted, 0.95), 2),
+        "floor_sim_score": round(percentile_value(scores_sorted, 0.05), 2),
+        "average_rank": average_rank,
+        "projected_rank": median_rank,
+        "median_rank": median_rank,
+        "ceiling_rank": max(1, ceiling_rank),
+        "takedown_rank": max(1, takedown_rank),
+        "cash_probability": round(cash_probability, 1),
+        "top_10_probability": round(top_10_probability, 1),
+        "top_1_probability": round(top_1_probability, 2),
+        "top_0_1_probability": round(top_0_1_probability, 3),
+        "win_probability": round(win_probability, 3),
+        "expected_payout": round(expected_payout, 2),
+        # In the UI this is currently labeled "Projected Payout".
+        # For GPPs, this should be probability-weighted expected payout, not median payout,
+        # because the median outcome is often $0 even for a strong tournament lineup.
+        "projected_payout": round(expected_payout, 2),
+        "median_payout": round(percentile_value(payouts_sorted, 0.50), 2),
+        "ceiling_payout": round(percentile_value(payouts_sorted, 0.95), 2),
+        "best_payout": round(max(payouts) if payouts else 0, 2),
+        "expected_value": round(expected_value, 2),
+        "roi_percent": round((expected_value / entry_fee) * 100, 1) if entry_fee > 0 else 0,
+        "min_cash_payout": payout_for_rank(paid_spots, contest),
+        "top_10_rank_payout": payout_for_rank(top_10_cutoff, contest),
+        "top_1_rank_payout": payout_for_rank(top_1_cutoff, contest),
+        "top_0_1_rank_payout": payout_for_rank(top_01_cutoff, contest),
+    }
+
+
+def attach_player_sim_profiles_to_lineup(lineup):
+    updated = []
+    for player in lineup:
+        item = dict(player)
+        item.update(player_simulation_profile(item))
+        updated.append(item)
+    return updated
+
+# =========================
+# END DFS EDGE MLB SIM ENGINE V2
+# =========================
+
+
 def payout_for_rank(rank, contest):
     """
     Realistic estimated DraftKings-style payout curve when the exact payout table
@@ -3256,9 +3607,11 @@ def estimate_expected_payout_from_probabilities(contest, projected_rank, ceiling
     }
 
 
-def simulate_single_lineup(lineup_data, request: ContestSimulationRequest, lineup_number=1):
+def simulate_single_lineup(lineup_data, request: ContestSimulationRequest, lineup_number=1, field_scores=None):
     contest = normalize_contest_request(request)
     lineup = lineup_data.get("lineup", [])
+    lineup = attach_player_sim_profiles_to_lineup(lineup)
+
     projection = safe_float(lineup_data.get("boosted_projection", lineup_data.get("projected_points", 0)))
     raw_projection = safe_float(lineup_data.get("projected_points", projection))
 
@@ -3273,7 +3626,6 @@ def simulate_single_lineup(lineup_data, request: ContestSimulationRequest, lineu
     contest_size = contest["contest_size"]
     paid_spots = contest["estimated_paid_spots"]
     entry_fee = max(0.01, contest["entry_fee"])
-    prize_pool = max(1.0, contest["prize_pool"])
     payout_rate = safe_float(contest.get("payout_rate", 0.20), 0.20)
     max_entries = safe_int(contest.get("max_entries", 1), 1)
     single_entry = bool(contest.get("single_entry", False))
@@ -3283,234 +3635,140 @@ def simulate_single_lineup(lineup_data, request: ContestSimulationRequest, lineu
 
     quality_profile = lineup_quality_profile(lineup, mode)
     quality_score = safe_float(quality_profile.get("lineup_quality_score", 0), 0)
-    win_probability = safe_float(quality_profile.get("win_probability", 0), 0)
     quality_label = quality_profile.get("lineup_quality_label", "Playable")
     breakdown = quality_profile.get("lineup_quality_breakdown", {})
 
     core_profile = lineup_core_profile(lineup)
+    leverage_profile = lineup_leverage_profile(lineup)
     core_count = safe_int(core_profile.get("core_play_count", 0), 0)
     strong_count = safe_int(core_profile.get("strong_play_count", 0), 0)
     fade_count = safe_int(core_profile.get("fade_count", 0), 0)
     bad_chalk_count = safe_int(core_profile.get("bad_chalk_count", 0), 0)
 
-    leverage_points = max(0.0, 22.0 - ownership)
-    chalk_penalty = max(0.0, ownership - 26.0)
-    conflict_penalty = 7.5 if pitcher_vs_hitter_conflict(lineup) else 0.0
-    salary_remaining = SALARY_CAP - safe_int(lineup_data.get("total_salary", 0), 0)
-    salary_efficiency = 4.0 if 0 <= salary_remaining <= 900 else (1.5 if salary_remaining <= 1800 else -1.0)
+    avg_leverage = safe_float(leverage_profile.get("average_leverage_score", 0), 0)
+    chalk_count = safe_int(leverage_profile.get("chalk_risk_count", 0), 0)
+    salary_remaining = SALARY_CAP - safe_int(lineup_data.get("total_salary", sum(safe_int(p.get("salary", 0), 0) for p in lineup)), 0)
 
+    # True Monte Carlo simulation. Runs are intentionally moderate so mobile/live backend requests stay fast.
+    runs = 450 if contest_size >= 25000 else 600
+    mc = monte_carlo_lineup_simulation_v2(lineup, contest, runs=runs, field_scores=field_scores)
+
+    # Contest focus scores are still useful to sort/show why the lineup is good.
     stack_correlation = 0.0
     if stack_size >= 5:
-        stack_correlation = 18.0
+        stack_correlation = 95.0
     elif stack_size == 4:
-        stack_correlation = 13.0
+        stack_correlation = 82.0
     elif stack_size == 3:
-        stack_correlation = 7.5
+        stack_correlation = 68.0
+    elif stack_size == 2:
+        stack_correlation = 54.0
+    else:
+        stack_correlation = 38.0
 
-    secondary_stack_bonus = 0.0
-    team_counts = stack.get("counts", {}) if isinstance(stack, dict) else {}
-    if any(2 <= count < stack_size for count in team_counts.values()):
-        secondary_stack_bonus = 5.0
+    ceiling_signal = safe_float(mc.get("ceiling_sim_score", projection), projection)
+    floor_signal = safe_float(mc.get("floor_sim_score", projection * 0.55), projection * 0.55)
+    top_1_probability = safe_float(mc.get("top_1_probability", 0), 0)
+    top_0_1_probability = safe_float(mc.get("top_0_1_probability", 0), 0)
+    cash_probability = safe_float(mc.get("cash_probability", 0), 0)
 
-    ceiling_base = (
-        projection
-        + stack_correlation
-        + secondary_stack_bonus
-        + leverage_points * 0.9
-        + core_count * 1.8
-        + strong_count * 0.8
-        + salary_efficiency
+    cash_safety_score = clamp_number(
+        cash_probability * 0.80
+        + quality_score * 0.25
+        + max(0, 50000 - max(0, salary_remaining)) * 0.00002
         - fade_count * 4.0
-        - bad_chalk_count * 3.2
-        - conflict_penalty
+        - bad_chalk_count * 2.0,
+        1,
+        99,
     )
 
-    floor_base = max(
-        0,
-        projection
-        - (10.0 if focus == "cash_h2h" else 14.0)
-        + core_count * 0.9
-        - fade_count * 2.5
-        - conflict_penalty
+    single_entry_edge_score = clamp_number(
+        quality_score * 0.42
+        + avg_leverage * 0.24
+        + stack_correlation * 0.18
+        + top_1_probability * 3.4
+        + core_count * 2.2
+        - bad_chalk_count * 3.6
+        - fade_count * 4.4,
+        1,
+        99,
     )
 
-    cash_safety_score = max(1.0, min(99.0, (
-        projection * 0.62
-        + quality_score * 0.34
-        + max(0, 20 - ownership) * 0.35
-        + salary_efficiency * 1.4
-        - conflict_penalty * 2.0
-        - fade_count * 5.0
-    )))
-
-    single_entry_edge_score = max(1.0, min(99.0, (
-        projection * 0.40
-        + quality_score * 0.38
-        + stack_correlation * 0.55
-        + leverage_points * 0.55
-        + core_count * 2.3
+    big_gpp_ceiling_score = clamp_number(
+        quality_score * 0.24
+        + avg_leverage * 0.26
+        + stack_correlation * 0.24
+        + top_1_probability * 4.6
+        + top_0_1_probability * 18.0
+        + max(0, ceiling_signal - floor_signal) * 0.20
+        - chalk_count * 2.8
         - bad_chalk_count * 4.2
-        - conflict_penalty * 1.5
-    )))
-
-    big_gpp_ceiling_score = max(1.0, min(99.0, (
-        ceiling_base * 0.46
-        + quality_score * 0.24
-        + stack_correlation * 0.92
-        + secondary_stack_bonus * 0.8
-        + leverage_points * 1.15
-        + core_count * 1.5
-        - chalk_penalty * 0.9
-        - fade_count * 3.2
-        - conflict_penalty * 1.15
-    )))
+        - fade_count * 4.8,
+        1,
+        99,
+    )
 
     if focus == "cash_h2h":
         focus_score = cash_safety_score
-        simulated_floor = round(floor_base + 5.0, 2)
-        simulated_ceiling = round(ceiling_base + 4.0, 2)
-        cash_probability = max(5.0, min(98.0, cash_safety_score * 0.86 + (projection - 72) * 0.45))
-        top_10_probability = max(3.0, min(55.0, single_entry_edge_score * 0.38))
-        top_1_probability = max(0.1, min(18.0, big_gpp_ceiling_score * 0.12))
-        top_0_1_probability = max(0.01, min(4.0, top_1_probability * 0.11))
-        rank_strength = cash_safety_score * 0.76 + projection * 0.18 + quality_score * 0.12
-        recommendation = "Cash Core" if cash_probability >= 72 else ("Cash Viable" if cash_probability >= 58 else "Cash Risk")
+        recommendation = "Cash Core" if cash_probability >= 60 else ("Cash Viable" if cash_probability >= 48 else "Cash Risk")
     elif focus == "big_field_gpp":
         focus_score = big_gpp_ceiling_score
-        simulated_floor = round(max(0, floor_base - 3.5), 2)
-        simulated_ceiling = round(ceiling_base + 12.0 + max(0, stack_size - 3) * 2.0, 2)
-        cash_probability = max(1.0, min(72.0, cash_safety_score * 0.48 + projection * 0.08))
-        top_10_probability = max(2.0, min(80.0, big_gpp_ceiling_score * 0.72 + leverage_points * 0.8 + stack_correlation * 0.35 - bad_chalk_count * 2.0))
-        top_1_probability = max(0.1, min(45.0, big_gpp_ceiling_score * 0.32 + leverage_points * 0.48 + max(0, stack_size - 3) * 2.1 - bad_chalk_count * 1.5))
-        top_0_1_probability = max(0.01, min(12.0, top_1_probability * 0.18 + max(0, stack_size - 4) * 0.75 + leverage_points * 0.08))
-        rank_strength = big_gpp_ceiling_score * 0.82 + top_1_probability * 0.8 + top_0_1_probability * 2.6
-        recommendation = "Massive GPP Winner Profile" if top_0_1_probability >= 4.0 or top_1_probability >= 18 else ("Big GPP Upside" if top_1_probability >= 8 else "Needs More Ceiling")
+        recommendation = "Massive GPP Winner Profile" if top_0_1_probability >= 0.30 or top_1_probability >= 3.5 else ("Big GPP Upside" if top_1_probability >= 1.25 else "Needs More Ceiling")
     else:
         focus_score = single_entry_edge_score
-        simulated_floor = round(floor_base + 1.5, 2)
-        simulated_ceiling = round(ceiling_base + 7.0, 2)
-        cash_probability = max(3.0, min(88.0, cash_safety_score * 0.62 + projection * 0.10))
-        top_10_probability = max(4.0, min(72.0, single_entry_edge_score * 0.64 + stack_correlation * 0.25))
-        top_1_probability = max(0.1, min(32.0, single_entry_edge_score * 0.22 + big_gpp_ceiling_score * 0.12 + leverage_points * 0.25))
-        top_0_1_probability = max(0.01, min(7.0, top_1_probability * 0.14 + max(0, stack_size - 3) * 0.4))
-        rank_strength = single_entry_edge_score * 0.76 + quality_score * 0.18 + top_1_probability * 0.55
-        recommendation = "Single Entry Hammer" if single_entry_edge_score >= 82 else ("Strong Single Entry" if single_entry_edge_score >= 70 else "Playable")
+        recommendation = "Single Entry Hammer" if top_1_probability >= 4.0 and quality_score >= 70 else ("Strong Single Entry" if top_1_probability >= 1.75 else "Playable")
 
-    # Larger contests and multi-entry formats are harder to beat.
-    # Single-entry lowers the pressure because the field cannot brute-force 150 builds.
-    entry_pressure = math.log10(max(max_entries, 1)) * 4.2
-    if single_entry:
-        entry_pressure *= 0.25
-
-    payout_pressure = 0.0
-    if payout_rate < 0.18:
-        payout_pressure += (0.18 - payout_rate) * 90
-    elif payout_rate > 0.22:
-        payout_pressure -= min(8.0, (payout_rate - 0.22) * 55)
-
-    field_pressure = math.log10(max(contest_size, 100)) * 8.0 + entry_pressure + payout_pressure
-    normalized_strength = max(1.0, min(99.0, rank_strength - field_pressure + 30.0))
-    projected_rank_ratio = max(0.0008, min(0.985, 1.0 - (normalized_strength / 112.0)))
-    projected_rank = max(1, min(contest_size, round(contest_size * projected_rank_ratio)))
-
-    ceiling_rank_ratio = max(0.00005, min(0.85, projected_rank_ratio * (0.34 if focus == "big_field_gpp" else 0.42) - (top_1_probability / 1000.0) - (top_0_1_probability / 600.0)))
-    ceiling_rank = max(1, min(contest_size, round(contest_size * ceiling_rank_ratio)))
-
-    # Make probabilities contest-aware and realistic.
-    # Big-field GPP outcomes are extremely hard to hit. A strong lineup should
-    # show upside, but not pretend it has a 20-40% chance to land top 1%.
-    payout_adjustment = max(0.55, min(1.35, payout_rate / 0.20))
-    multi_entry_penalty = 1.0 if single_entry else max(0.58, 1.0 - math.log10(max(max_entries, 1)) * 0.13)
-    field_scale = max(0.30, min(1.20, math.sqrt(12000 / max(contest_size, 1200))))
-    strength_scale = max(0.0, min(1.0, (focus_score - 52.0) / 42.0))
-    quality_scale = max(0.0, min(1.0, (quality_score - 45.0) / 45.0))
-    combined_strength = max(0.0, min(1.0, strength_scale * 0.65 + quality_scale * 0.35))
-
-    if focus == "cash_h2h":
-        cash_probability = max(2.0, min(96.0, cash_probability * payout_adjustment))
-        top_10_probability = max(0.5, min(22.0, 4.0 + combined_strength * 15.0 * field_scale))
-        top_1_probability = max(0.02, min(3.5, 0.15 + combined_strength * 2.6 * field_scale))
-        top_0_1_probability = max(0.001, min(0.25, top_1_probability * 0.06))
-    elif focus == "big_field_gpp":
-        cash_probability = max(1.0, min(70.0, cash_probability * payout_adjustment * 0.82))
-        top_10_probability = max(0.3, min(28.0, 4.0 + combined_strength * 18.0 * field_scale * multi_entry_penalty))
-        top_1_probability = max(0.02, min(6.0, 0.12 + combined_strength * 4.8 * field_scale * multi_entry_penalty))
-        top_0_1_probability = max(0.001, min(0.70, 0.006 + combined_strength * 0.48 * field_scale * multi_entry_penalty))
-    else:
-        cash_probability = max(1.0, min(82.0, cash_probability * payout_adjustment * 0.90))
-        top_10_probability = max(0.4, min(32.0, 5.0 + combined_strength * 19.0 * field_scale * multi_entry_penalty))
-        top_1_probability = max(0.02, min(7.0, 0.18 + combined_strength * 5.3 * field_scale * multi_entry_penalty))
-        top_0_1_probability = max(0.001, min(0.85, 0.008 + combined_strength * 0.60 * field_scale * multi_entry_penalty))
-
-    # Recalculate rank estimates from realistic strength after probability caps.
-    median_strength = max(1.0, min(99.0, quality_score * 0.48 + focus_score * 0.32 + projection * 0.10 + stack_correlation * 0.35 + leverage_points * 0.22))
-    projected_rank_ratio = max(0.06, min(0.985, 1.0 - (median_strength / 115.0)))
-    projected_rank = max(1, min(contest_size, round(contest_size * projected_rank_ratio)))
-
-    ceiling_rank_ratio = max(
-        0.0008,
-        min(
-            projected_rank_ratio * 0.55,
-            0.080 - (combined_strength * 0.050) - (top_1_probability / 100.0) * 0.70 - (top_0_1_probability / 100.0) * 4.50,
-        ),
-    )
-    if focus == "big_field_gpp":
-        ceiling_rank_ratio = max(0.0008, ceiling_rank_ratio * 0.72)
-    ceiling_rank = max(1, min(contest_size, round(contest_size * ceiling_rank_ratio)))
-
-    payout_model = estimate_expected_payout_from_probabilities(
-        contest=contest,
-        projected_rank=projected_rank,
-        ceiling_rank=ceiling_rank,
-        cash_probability=cash_probability,
-        top_10_probability=top_10_probability,
-        top_1_probability=top_1_probability,
-        top_0_1_probability=top_0_1_probability,
-    )
-    expected_payout = safe_float(payout_model.get("expected_payout", 0), 0)
-    projected_payout = safe_float(payout_model.get("projected_payout", 0), 0)
-    ceiling_payout = safe_float(payout_model.get("ceiling_payout", 0), 0)
-    expected_value = round(expected_payout - entry_fee, 2)
-    roi_percent = round((expected_value / entry_fee) * 100, 1) if entry_fee > 0 else 0
+    expected_payout = safe_float(mc.get("expected_payout", 0), 0)
+    expected_value = safe_float(mc.get("expected_value", 0), 0)
+    roi_percent = safe_float(mc.get("roi_percent", 0), 0)
     max_entry_expected_value = round(expected_value * max_entries, 2)
     max_entry_roi_percent = round((max_entry_expected_value / total_entry_cost) * 100, 1) if total_entry_cost > 0 else roi_percent
 
     tournament_rating = recommendation
-    if focus == "big_field_gpp" and top_0_1_probability >= 5:
+    if focus == "big_field_gpp" and top_0_1_probability >= 0.45:
         tournament_rating = "Nuclear Upside"
-    elif focus == "single_entry_gpp" and single_entry_edge_score >= 86:
+    elif focus == "single_entry_gpp" and top_1_probability >= 5.0:
         tournament_rating = "SE Winner Profile"
-    elif focus == "cash_h2h" and cash_probability >= 75:
+    elif focus == "cash_h2h" and cash_probability >= 65:
         tournament_rating = "Cash Lockbox"
 
     simulation = {
+        "simulation_engine_version": "dfs_edge_mlb_sim_engine_v2_monte_carlo",
         "simulator_focus": focus,
         "simulator_focus_label": simulator_focus_label(focus),
         "contest_focus_score": round(focus_score, 1),
         "cash_safety_score": round(cash_safety_score, 1),
         "single_entry_edge_score": round(single_entry_edge_score, 1),
         "big_gpp_ceiling_score": round(big_gpp_ceiling_score, 1),
-        "projected_rank": projected_rank,
-        "ceiling_rank": ceiling_rank,
+        "projected_rank": mc.get("projected_rank", contest_size),
+        "median_rank": mc.get("median_rank", mc.get("projected_rank", contest_size)),
+        "average_rank": mc.get("average_rank", contest_size),
+        "ceiling_rank": mc.get("ceiling_rank", contest_size),
+        "takedown_rank": mc.get("takedown_rank", contest_size),
         "cash_cutoff_rank": paid_spots,
         "cash_probability": round(cash_probability, 1),
-        "top_0_1_probability": round(top_0_1_probability, 2),
-        "top_1_probability": round(top_1_probability, 1),
-        "top_1_percent_probability": round(top_1_probability, 1),
-        "top_10_probability": round(top_10_probability, 1),
-        "simulated_floor": simulated_floor,
-        "simulated_ceiling": simulated_ceiling,
-        "roi_percent": roi_percent,
-        "estimated_roi_percent": roi_percent,
-        "expected_value": expected_value,
+        "top_0_1_probability": round(top_0_1_probability, 3),
+        "top_1_probability": round(top_1_probability, 2),
+        "top_1_percent_probability": round(top_1_probability, 2),
+        "top_10_probability": round(safe_float(mc.get("top_10_probability", 0), 0), 1),
+        "win_probability": round(safe_float(mc.get("win_probability", 0), 0), 3),
+        "simulated_floor": mc.get("floor_sim_score", 0),
+        "simulated_ceiling": mc.get("ceiling_sim_score", 0),
+        "average_sim_score": mc.get("average_sim_score", 0),
+        "median_sim_score": mc.get("median_sim_score", 0),
+        "simulation_runs": mc.get("simulation_runs", runs),
+        "roi_percent": round(roi_percent, 1),
+        "estimated_roi_percent": round(roi_percent, 1),
+        "expected_value": round(expected_value, 2),
         "expected_payout": round(expected_payout, 2),
-        "projected_payout": round(projected_payout, 2),
-        "median_payout": round(projected_payout, 2),
-        "ceiling_payout": round(ceiling_payout, 2),
-        "min_cash_payout": payout_model.get("min_cash_payout", 0),
-        "top_10_rank_payout": payout_model.get("top_10_rank_payout", 0),
-        "top_1_rank_payout": payout_model.get("top_1_rank_payout", 0),
-        "top_0_1_rank_payout": payout_model.get("top_0_1_rank_payout", 0),
+        "projected_payout": round(safe_float(mc.get("projected_payout", expected_payout), expected_payout), 2),
+        "median_payout": round(safe_float(mc.get("median_payout", 0), 0), 2),
+        "ceiling_payout": round(safe_float(mc.get("ceiling_payout", 0), 0), 2),
+        "best_payout": round(safe_float(mc.get("best_payout", 0), 0), 2),
+        "min_cash_payout": mc.get("min_cash_payout", payout_for_rank(paid_spots, contest)),
+        "top_10_rank_payout": mc.get("top_10_rank_payout", 0),
+        "top_1_rank_payout": mc.get("top_1_rank_payout", 0),
+        "top_0_1_rank_payout": mc.get("top_0_1_rank_payout", 0),
         "max_entry_expected_value": max_entry_expected_value,
         "max_entry_roi_percent": max_entry_roi_percent,
         "buy_in_per_entry": round(entry_fee, 2),
@@ -3527,14 +3785,15 @@ def simulate_single_lineup(lineup_data, request: ContestSimulationRequest, lineu
         "raw_projection": round(raw_projection, 2),
         "boosted_projection": round(projection, 2),
         "lineup_quality_score": round(quality_score, 1),
-        "win_probability": round(win_probability, 1),
         "lineup_quality_label": quality_label,
         "lineup_quality_breakdown": breakdown,
+        "lineup_core_profile": core_profile,
+        "lineup_leverage_profile": leverage_profile,
     }
 
     return {
         "lineup_number": lineup_number,
-        "lineup": lineup_data,
+        "lineup": {**lineup_data, "lineup": lineup},
         "simulation": simulation,
     }
 
@@ -3554,45 +3813,63 @@ def simulate_contest_payload(request: ContestSimulationRequest):
         if error:
             return {"success": False, "error": error, "results": [], "simulations": []}
 
-    results = [simulate_single_lineup(lineup, request, index + 1) for index, lineup in enumerate(lineups)]
-    results.sort(key=lambda item: (item["simulation"].get("contest_focus_score", 0), item["simulation"].get("roi_percent", 0), item["simulation"].get("top_1_probability", 0)), reverse=True)
+    contest = normalize_contest_request(request)
+
+    # Generate the opponent field one time per request so every lineup is measured
+    # against the same simulated contest environment.
+    field_sample_count = 1800 if contest["contest_size"] >= 25000 else 1400
+    field_scores = generate_field_score_samples_v2(contest, sample_count=field_sample_count)
+
+    results = [
+        simulate_single_lineup(lineup, request, index + 1, field_scores=field_scores)
+        for index, lineup in enumerate(lineups)
+    ]
+    results.sort(
+        key=lambda item: (
+            item["simulation"].get("expected_value", 0),
+            item["simulation"].get("top_1_probability", 0),
+            item["simulation"].get("top_0_1_probability", 0),
+            item["simulation"].get("contest_focus_score", 0),
+        ),
+        reverse=True,
+    )
 
     if not results:
         return {"success": False, "error": "No lineups available for simulation.", "results": [], "simulations": []}
 
-    contest = normalize_contest_request(request)
     rois = [safe_float(item["simulation"].get("roi_percent", 0)) for item in results]
     cash_probs = [safe_float(item["simulation"].get("cash_probability", 0)) for item in results]
     evs = [safe_float(item["simulation"].get("expected_value", 0)) for item in results]
     expected_payouts = [safe_float(item["simulation"].get("expected_payout", 0)) for item in results]
     quality_scores = [safe_float(item["simulation"].get("lineup_quality_score", 0)) for item in results]
-    win_probs = [safe_float(item["simulation"].get("win_probability", 0)) for item in results]
     focus_scores = [safe_float(item["simulation"].get("contest_focus_score", 0)) for item in results]
     top_point_one = [safe_float(item["simulation"].get("top_0_1_probability", 0)) for item in results]
     top_ones = [safe_float(item["simulation"].get("top_1_probability", 0)) for item in results]
     best = results[0]["simulation"]
 
     summary = {
+        "simulation_engine_version": "dfs_edge_mlb_sim_engine_v2_monte_carlo",
+        "field_sample_count": len(field_scores),
         "lineup_count": len(results),
         "average_roi_percent": round(sum(rois) / len(rois), 1),
         "average_cash_probability": round(sum(cash_probs) / len(cash_probs), 1),
         "average_lineup_quality": round(sum(quality_scores) / len(quality_scores), 1) if quality_scores else 0,
-        "average_win_probability": round(sum(win_probs) / len(win_probs), 1) if win_probs else 0,
         "best_lineup_quality": round(max(quality_scores), 1) if quality_scores else 0,
-        "best_win_probability": round(max(win_probs), 1) if win_probs else 0,
         "average_focus_score": round(sum(focus_scores) / len(focus_scores), 1) if focus_scores else 0,
         "best_focus_score": round(max(focus_scores), 1) if focus_scores else 0,
-        "best_top_0_1_probability": round(max(top_point_one), 2) if top_point_one else 0,
-        "best_top_1_probability": round(max(top_ones), 1) if top_ones else 0,
+        "best_top_0_1_probability": round(max(top_point_one), 3) if top_point_one else 0,
+        "best_top_1_probability": round(max(top_ones), 2) if top_ones else 0,
         "simulator_focus": best.get("simulator_focus", simulator_focus_from_request(request, contest["contest_size"])),
         "simulator_focus_label": best.get("simulator_focus_label", simulator_focus_label(simulator_focus_from_request(request, contest["contest_size"]))),
         "estimated_total_ev": round(sum(evs), 2),
         "average_expected_payout": round(sum(expected_payouts) / len(expected_payouts), 2) if expected_payouts else 0,
         "best_expected_payout": round(max(expected_payouts), 2) if expected_payouts else 0,
         "best_projected_payout": best.get("projected_payout", 0),
+        "best_median_payout": best.get("median_payout", 0),
         "best_ceiling_payout": best.get("ceiling_payout", 0),
         "best_recommendation": best.get("recommendation", "Playable"),
         "best_roi_percent": best.get("roi_percent", 0),
+        "note": "Projected payout is probability-weighted expected payout. Median payout may be $0 in top-heavy GPPs.",
     }
 
     return {
@@ -3604,7 +3881,6 @@ def simulate_contest_payload(request: ContestSimulationRequest):
         "simulations": [item["simulation"] for item in results],
         "generated_at": datetime.utcnow().isoformat() + "Z",
     }
-
 
 
 @app.get("/data-engine/status")
