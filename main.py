@@ -36,6 +36,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 BASE_DIR = DATA_DIR
 SAMPLE_PLAYERS_PATH = BASE_DIR / "sample_players.json"
 ACTIVE_SLATE_PATH = BASE_DIR / "active_slate.json"
+SLATE_METADATA_PATH = BASE_DIR / "slate_metadata.json"
 MARKET_STATE_PATH = BASE_DIR / "market_state.json"
 USERS_PATH = BASE_DIR / "users.json"
 ADMIN_EMAIL = "zero2sixtygraphics@gmail.com"
@@ -160,6 +161,13 @@ class UpdatePlayerStatusRequest(BaseModel):
 class AdminPasswordRequest(BaseModel):
     admin_password: str = ""
     auth_token: str = ""
+
+
+class SlateMetadataRequest(BaseModel):
+    admin_password: str = ""
+    auth_token: str = ""
+    slate_name: str = ""
+    slate_date: str = ""
 
 
 class RegisterRequest(BaseModel):
@@ -829,6 +837,63 @@ def load_players():
 def save_active_slate(players):
     with open(ACTIVE_SLATE_PATH, "w", encoding="utf-8") as f:
         json.dump(players, f, indent=2)
+
+
+def default_slate_metadata():
+    today = datetime.now().strftime("%Y-%m-%d")
+    if ACTIVE_SLATE_PATH.exists():
+        return {
+            "slate_name": "DraftKings MLB Slate",
+            "slate_date": today,
+            "slate_source": "imported_or_edited_slate",
+            "updated_at": datetime.utcnow().isoformat() + "Z",
+            "updated_by": "system",
+        }
+    return {
+        "slate_name": "MLB Sample Slate",
+        "slate_date": today,
+        "slate_source": "sample_players",
+        "updated_at": datetime.utcnow().isoformat() + "Z",
+        "updated_by": "system",
+    }
+
+
+def load_slate_metadata():
+    meta = default_slate_metadata()
+    try:
+        if SLATE_METADATA_PATH.exists():
+            with open(SLATE_METADATA_PATH, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            if isinstance(saved, dict):
+                meta.update(saved)
+    except Exception:
+        pass
+
+    # Keep source truthful even if a slate was cleared or uploaded.
+    meta["slate_source"] = current_slate_source() if "current_slate_source" in globals() else ("imported_or_edited_slate" if ACTIVE_SLATE_PATH.exists() else "sample_players")
+    if not str(meta.get("slate_name", "")).strip():
+        meta["slate_name"] = "DraftKings MLB Slate" if ACTIVE_SLATE_PATH.exists() else "MLB Sample Slate"
+    if not str(meta.get("slate_date", "")).strip():
+        meta["slate_date"] = datetime.now().strftime("%Y-%m-%d")
+    return meta
+
+
+def save_slate_metadata(slate_name=None, slate_date=None, updated_by="admin"):
+    meta = load_slate_metadata()
+    if slate_name is not None:
+        clean_name = str(slate_name).strip()
+        if clean_name:
+            meta["slate_name"] = clean_name[:120]
+    if slate_date is not None:
+        clean_date = str(slate_date).strip()
+        if clean_date:
+            meta["slate_date"] = clean_date[:40]
+    meta["slate_source"] = current_slate_source() if "current_slate_source" in globals() else ("imported_or_edited_slate" if ACTIVE_SLATE_PATH.exists() else "sample_players")
+    meta["updated_at"] = datetime.utcnow().isoformat() + "Z"
+    meta["updated_by"] = updated_by or "admin"
+    with open(SLATE_METADATA_PATH, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+    return meta
 
 
 def ensure_minimum_position_players(players):
@@ -4592,8 +4657,15 @@ def slate_status():
     players = add_values(load_players())
     active_count = len([p for p in players if bool(p.get("active", True))])
     inactive_count = len(players) - active_count
+    meta = load_slate_metadata()
+    display_label = f"{meta.get('slate_name', 'MLB Slate')} • {meta.get('slate_date', '')}".strip(" •")
     return {
         "slate_source": current_slate_source(),
+        "slate_name": meta.get("slate_name", "MLB Slate"),
+        "slate_date": meta.get("slate_date", ""),
+        "slate_display_name": display_label,
+        "slate_updated_at": meta.get("updated_at", ""),
+        "slate_updated_by": meta.get("updated_by", ""),
         "player_count": len(players),
         "active_player_count": active_count,
         "inactive_player_count": inactive_count,
@@ -4606,6 +4678,31 @@ def slate_status():
         "auto_cleanup_position_limits": AUTO_CLEANUP_POSITION_LIMITS,
         "data_dir": str(DATA_DIR),
         "daily_slate_persistent": True,
+    }
+
+
+@app.post("/admin/slate-metadata")
+def update_slate_metadata(request: SlateMetadataRequest):
+    if not is_admin_authorized(request):
+        return {"success": False, "error": "Admin session expired. Log in as admin again."}
+
+    meta = save_slate_metadata(
+        slate_name=request.slate_name,
+        slate_date=request.slate_date,
+        updated_by=ADMIN_EMAIL if is_admin_token(request.auth_token) else "admin",
+    )
+    players = load_players()
+    active_count = len([p for p in players if bool(p.get("active", True))])
+    return {
+        "success": True,
+        "message": "Slate info saved.",
+        "slate_name": meta.get("slate_name", "MLB Slate"),
+        "slate_date": meta.get("slate_date", ""),
+        "slate_display_name": f"{meta.get('slate_name', 'MLB Slate')} • {meta.get('slate_date', '')}".strip(" •"),
+        "player_count": len(players),
+        "active_player_count": active_count,
+        "inactive_player_count": len(players) - active_count,
+        "slate_source": current_slate_source(),
     }
 
 
@@ -4634,11 +4731,19 @@ async def upload_dk_csv(
 
     cleaned_players, cleanup_stats = apply_auto_slate_cleanup(players, respect_manual_overrides=False)
     save_active_slate(cleaned_players)
+    current_meta = save_slate_metadata(
+        slate_name=f"DraftKings MLB Slate - {datetime.now().strftime('%b %d')}",
+        slate_date=datetime.now().strftime("%Y-%m-%d"),
+        updated_by=ADMIN_EMAIL if is_admin_token(admin_token) else "admin",
+    )
 
     return {
         "success": True,
         "message": "DraftKings MLB CSV uploaded, enriched, and auto-cleaned successfully.",
         "player_count": len(cleaned_players),
+        "slate_name": current_meta.get("slate_name", "DraftKings MLB Slate"),
+        "slate_date": current_meta.get("slate_date", ""),
+        "slate_display_name": f"{current_meta.get('slate_name', 'DraftKings MLB Slate')} • {current_meta.get('slate_date', '')}".strip(" •"),
         "active_player_count": cleanup_stats["active_count"],
         "inactive_player_count": cleanup_stats["inactive_count"],
         "cleanup_stats": cleanup_stats,
@@ -4654,6 +4759,7 @@ def use_sample_slate(request: AdminPasswordRequest):
     if ACTIVE_SLATE_PATH.exists():
         ACTIVE_SLATE_PATH.unlink()
     ensure_sample_players_file()
+    meta = save_slate_metadata("MLB Sample Slate", datetime.now().strftime("%Y-%m-%d"), "admin")
     players = load_players()
     return {
         "success": True,
