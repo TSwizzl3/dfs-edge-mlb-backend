@@ -6398,3 +6398,572 @@ def monte_carlo_lineup_simulation_v2(lineup, contest, runs=700, field_scores=Non
         "tournament_strength": round(strength, 1),
         "ceiling_strength": round(ceiling_strength, 1),
     }
+
+
+# ============================================================
+# DFS EDGE MLB - TOURNAMENT ENGINE V3 OVERRIDES
+# Goal: stop building projection-sorter lineups and target contest-winning
+# tournament equity: ceiling, stack correlation, leverage, uniqueness,
+# and top 0.1% upside. These definitions intentionally come last so the
+# existing FastAPI routes call them at runtime.
+# ============================================================
+
+TOURNAMENT_ENGINE_VERSION = "dfs_edge_mlb_tournament_engine_v3_takedown_ev"
+
+
+def v3_is_gpp_mode(mode, randomness=0):
+    mode = str(mode or "gpp").lower()
+    r = safe_int(randomness, 0)
+    return mode in ["gpp", "single_entry", "big_gpp", "large_gpp", "tournament"] or r >= 20
+
+
+def v3_style_from_request(request, mode="gpp"):
+    raw_style = str(getattr(request, "build_style", "") or getattr(request, "strategy_mode", "") or "").lower()
+    focus = str(getattr(request, "contest_focus", "") or getattr(request, "contest_type", "") or "").lower()
+    r = safe_int(getattr(request, "randomness", 0), 0)
+    if "nuclear" in raw_style or r >= 70:
+        return "nuclear"
+    if "aggressive" in raw_style or "big" in focus or "large" in focus or r >= 35:
+        return "aggressive"
+    if "safe" in raw_style or str(mode).lower() == "cash":
+        return "safe"
+    return "balanced"
+
+
+def v3_player_distribution(player):
+    pos = normalize_position(player.get("position", ""))
+    proj = safe_float(player.get("boosted_projection", player.get("projection", 0)), 0)
+    own = safe_float(player.get("ownership", 12), 12)
+    lev = safe_float(player.get("leverage_score", 45), 45)
+    core = safe_float(player.get("core_play_score", 50), 50)
+    total = safe_float(player.get("team_total", 4.2), 4.2)
+    trend = safe_float(player.get("trend_score", 50), 50)
+    salary = safe_int(player.get("salary", 0), 0)
+    value = (proj / salary) * 1000 if salary > 0 else 0
+
+    if pos == "P":
+        floor_mult = 0.46 if proj < 15 else 0.55
+        p85_mult = 1.28 + max(0, lev - 50) * 0.002
+        p95_mult = 1.55 + max(0, lev - 50) * 0.004
+        p99_mult = 1.92 + max(0, lev - 55) * 0.007
+        if own <= 10:
+            p95_mult += 0.08
+            p99_mult += 0.14
+    else:
+        # MLB hitter outcomes are highly volatile. Tournament winning lineups need this.
+        floor_mult = 0.20
+        p85_mult = 1.72
+        p95_mult = 2.55
+        p99_mult = 3.65
+        if total >= 5.0:
+            p95_mult += 0.20
+            p99_mult += 0.32
+        if own <= 8:
+            p95_mult += 0.28
+            p99_mult += 0.55
+        elif own <= 14:
+            p95_mult += 0.14
+            p99_mult += 0.28
+        if lev >= 60:
+            p95_mult += 0.16
+            p99_mult += 0.34
+        if trend >= 70:
+            p95_mult += 0.10
+            p99_mult += 0.18
+        if value >= 2.2:
+            p85_mult += 0.12
+            p95_mult += 0.10
+
+    floor = round(max(0, proj * floor_mult), 2)
+    p50 = round(proj, 2)
+    p85 = round(max(p50, proj * p85_mult), 2)
+    p95 = round(max(p85, proj * p95_mult + max(0, core - 60) * 0.035), 2)
+    p99 = round(max(p95, proj * p99_mult + max(0, lev - 55) * 0.08), 2)
+    return {"floor": floor, "p50": p50, "p85": p85, "p95": p95, "p99": p99}
+
+
+def v2_player_ceiling(player, percentile="95"):
+    d = v3_player_distribution(player)
+    key = "p99" if str(percentile) in ["99", "p99"] else "p95" if str(percentile) in ["95", "p95"] else "p85"
+    return d[key]
+
+
+def v2_lineup_ceiling_profile(lineup):
+    if not lineup:
+        return {"boosted_projection": 0, "raw_projection": 0, "p85_ceiling_points": 0, "p95_ceiling_points": 0, "p99_ceiling_points": 0, "ceiling_score": 0}
+    raw = sum(safe_float(p.get("projection", 0), 0) for p in lineup)
+    boosted = sum(safe_float(p.get("boosted_projection", p.get("projection", 0)), 0) for p in lineup)
+    p85 = sum(v3_player_distribution(p)["p85"] for p in lineup)
+    p95 = sum(v3_player_distribution(p)["p95"] for p in lineup)
+    p99 = sum(v3_player_distribution(p)["p99"] for p in lineup)
+    hitters = [p for p in lineup if normalize_position(p.get("position", "")) != "P"]
+    stack = best_stack_info(lineup)
+    stack_size = safe_int(stack.get("size", 0), 0)
+    team_total = estimated_team_total(stack.get("team", "")) if stack.get("team") else 4.2
+    stack_bonus = max(0, stack_size - 2) * (3.8 + max(0, team_total - 4.2) * 1.7)
+    avg_own_hitters = sum(safe_float(p.get("ownership", 12), 12) for p in hitters) / len(hitters) if hitters else 12
+    low_owned_bonus = max(0, 18 - avg_own_hitters) * 0.55
+    p95 += stack_bonus + low_owned_bonus
+    p99 += stack_bonus * 1.65 + low_owned_bonus * 1.35
+    # Score rewards separation between median and 95/99 ceiling, not just raw projection.
+    ceiling_gap = max(0, p95 - boosted)
+    ceiling_score = 36 + (boosted - 65) * 0.42 + ceiling_gap * 0.72 + stack_bonus * 1.05 + low_owned_bonus * 0.65
+    ceiling_score = round(max(0, min(100, ceiling_score)), 1)
+    return {
+        "boosted_projection": round(boosted, 2),
+        "raw_projection": round(raw, 2),
+        "p85_ceiling_points": round(p85, 2),
+        "p95_ceiling_points": round(p95, 2),
+        "p99_ceiling_points": round(p99, 2),
+        "ceiling_score": ceiling_score,
+        "ceiling_gap": round(ceiling_gap, 2),
+    }
+
+
+def v2_lineup_stack_profile(lineup):
+    hitters = [p for p in lineup if normalize_position(p.get("position", "")) != "P"]
+    counts = {}
+    for p in hitters:
+        team = normalize_team(p.get("team", ""))
+        counts[team] = counts.get(team, 0) + 1
+    if not counts:
+        return {"stack_score": 0, "stack_label": "No Stack", "primary_stack_team": "", "primary_stack_size": 0, "secondary_stack_team": "", "secondary_stack_size": 0, "stack_counts": {}}
+    ordered = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
+    primary_team, primary_size = ordered[0]
+    secondary_team, secondary_size = (ordered[1] if len(ordered) > 1 else ("", 0))
+    primary_total = estimated_team_total(primary_team)
+    secondary_total = estimated_team_total(secondary_team) if secondary_team else 0
+    primary_players = [p for p in hitters if normalize_team(p.get("team", "")) == primary_team]
+    secondary_players = [p for p in hitters if normalize_team(p.get("team", "")) == secondary_team]
+    primary_ceiling = sum(v3_player_distribution(p)["p95"] for p in primary_players)
+    secondary_ceiling = sum(v3_player_distribution(p)["p95"] for p in secondary_players)
+    primary_own = sum(safe_float(p.get("ownership", 12), 12) for p in primary_players) / len(primary_players) if primary_players else 12
+    secondary_own = sum(safe_float(p.get("ownership", 12), 12) for p in secondary_players) / len(secondary_players) if secondary_players else 12
+
+    size_score = {1: 8, 2: 22, 3: 48, 4: 74, 5: 88}.get(primary_size, 95)
+    if primary_size >= 5:
+        label = "5-Man Takedown Stack"
+    elif primary_size == 4:
+        label = "4-Man GPP Stack"
+    elif primary_size == 3:
+        label = "3-Man Stack"
+    else:
+        label = "Thin Stack"
+
+    secondary_bonus = 0
+    if secondary_size >= 3:
+        secondary_bonus = 13
+        label += " + 3-Man Secondary"
+    elif secondary_size == 2:
+        secondary_bonus = 7
+        label += " + Mini Correlation"
+
+    total_bonus = max(0, primary_total - 4.0) * 8.5 + max(0, secondary_total - 4.0) * 3.5
+    low_own_bonus = max(0, 18 - primary_own) * 0.85 + max(0, 16 - secondary_own) * 0.35
+    ceiling_bonus = max(0, primary_ceiling - 35) * 0.38 + max(0, secondary_ceiling - 20) * 0.18
+    stack_score = round(max(0, min(100, size_score + secondary_bonus + total_bonus + low_own_bonus + ceiling_bonus - max(0, primary_own - 26) * 0.6)), 1)
+    return {
+        "stack_score": stack_score,
+        "stack_label": label,
+        "primary_stack_team": primary_team,
+        "primary_stack_size": primary_size,
+        "primary_stack_team_total": round(primary_total, 1),
+        "secondary_stack_team": secondary_team,
+        "secondary_stack_size": secondary_size,
+        "secondary_stack_team_total": round(secondary_total, 1),
+        "stack_counts": counts,
+        "primary_stack_avg_ownership": round(primary_own, 1),
+    }
+
+
+def v2_lineup_leverage_profile(lineup):
+    if not lineup:
+        return {"leverage_score": 0, "uniqueness_score": 0, "duplication_risk": 100, "average_ownership": 0, "chalk_count": 0, "low_owned_count": 0}
+    avg_own = sum(safe_float(p.get("ownership", 12), 12) for p in lineup) / len(lineup)
+    max_own = max(safe_float(p.get("ownership", 12), 12) for p in lineup)
+    chalk_count = len([p for p in lineup if safe_float(p.get("ownership", 12), 12) >= 24])
+    mega_chalk = len([p for p in lineup if safe_float(p.get("ownership", 12), 12) >= 32])
+    low_count = len([p for p in lineup if safe_float(p.get("ownership", 12), 12) <= 10])
+    mid_low = len([p for p in lineup if 10 < safe_float(p.get("ownership", 12), 12) <= 16])
+    player_lev = sum(safe_float(p.get("leverage_score", 45), 45) for p in lineup) / len(lineup)
+    ceiling = v2_lineup_ceiling_profile(lineup)
+    stack = v2_lineup_stack_profile(lineup)
+    leverage_score = 42 + (player_lev - 45) * 0.72 + low_count * 6.2 + mid_low * 2.4 + max(0, ceiling.get("ceiling_score", 0) - 60) * 0.22
+    leverage_score -= chalk_count * 4.7 + mega_chalk * 5.5 + max(0, avg_own - 18) * 1.1
+    uniqueness_score = 45 + low_count * 7.8 + mid_low * 2.6 + max(0, 18 - avg_own) * 2.1 + stack.get("stack_score", 0) * 0.10 - chalk_count * 5.5 - mega_chalk * 7.0
+    duplication_risk = 100 - uniqueness_score + max(0, avg_own - 16) * 1.8 + chalk_count * 6.0 - max(0, stack.get("primary_stack_size", 0) - 3) * 4.0
+    return {
+        "leverage_score": round(max(0, min(100, leverage_score)), 1),
+        "uniqueness_score": round(max(0, min(100, uniqueness_score)), 1),
+        "duplication_risk": round(max(0, min(100, duplication_risk)), 1),
+        "average_ownership": round(avg_own, 2),
+        "max_ownership": round(max_own, 1),
+        "chalk_count": chalk_count,
+        "low_owned_count": low_count,
+    }
+
+
+def v2_tournament_equity_score(lineup, mode="gpp", style="balanced"):
+    projection = sum(safe_float(p.get("boosted_projection", p.get("projection", 0)), 0) for p in lineup)
+    ceiling = v2_lineup_ceiling_profile(lineup)
+    stack = v2_lineup_stack_profile(lineup)
+    lev = v2_lineup_leverage_profile(lineup)
+    core = lineup_core_profile(lineup)
+    conflict = pitcher_vs_hitter_conflict(lineup)
+    inactive = len([p for p in lineup if not bool(p.get("active", True))])
+    bad_chalk = safe_int(core.get("bad_chalk_count", 0), 0)
+    fade = safe_int(core.get("fade_count", 0), 0)
+    style = str(style or "balanced").lower()
+    if str(mode).lower() == "cash" or style == "safe":
+        score = projection * 0.92 + safe_float(core.get("average_core_play_score", 50), 50) * 0.30 + ceiling.get("ceiling_score", 0) * 0.22 - conflict * 18 - inactive * 100
+    elif style == "nuclear":
+        score = ceiling.get("p99_ceiling_points", 0) * 1.20 + stack.get("stack_score", 0) * 1.42 + lev.get("leverage_score", 0) * 1.08 + lev.get("uniqueness_score", 0) * 0.95 + projection * 0.05
+        score -= bad_chalk * 12 + fade * 10 + conflict * 18 + inactive * 100
+    elif style == "aggressive":
+        score = ceiling.get("p95_ceiling_points", 0) * 1.06 + stack.get("stack_score", 0) * 1.20 + lev.get("leverage_score", 0) * 0.92 + lev.get("uniqueness_score", 0) * 0.70 + projection * 0.10
+        score -= bad_chalk * 10 + fade * 9 + conflict * 18 + inactive * 100
+    else:
+        score = ceiling.get("p95_ceiling_points", 0) * 0.82 + stack.get("stack_score", 0) * 0.82 + lev.get("leverage_score", 0) * 0.62 + projection * 0.30 + lev.get("uniqueness_score", 0) * 0.35
+        score -= bad_chalk * 7 + fade * 8 + conflict * 18 + inactive * 100
+    return round(score, 4)
+
+
+def score_lineup(lineup, mode, randomness=0):
+    style = "nuclear" if safe_int(randomness, 0) >= 65 else ("aggressive" if safe_int(randomness, 0) >= 30 or str(mode).lower() != "cash" else "safe")
+    return round(v2_tournament_equity_score(lineup, mode, style) + deterministic_random_bonus(lineup, min(100, safe_int(randomness, 0))) * (0.55 if style in ["aggressive", "nuclear"] else 0.12), 4)
+
+
+def lineup_quality_profile(lineup, mode="gpp"):
+    if not lineup:
+        return {"lineup_quality_score": 0, "win_probability": 0, "lineup_quality_label": "No Lineup", "lineup_quality_breakdown": {"projection_score": 0, "ceiling_score": 0, "leverage_score": 0, "stack_score": 0, "core_score": 0, "salary_score": 0, "safety_score": 0}}
+    mode = str(mode or "gpp").lower()
+    projection = sum(safe_float(p.get("boosted_projection", p.get("projection", 0)), 0) for p in lineup)
+    ceiling = v2_lineup_ceiling_profile(lineup)
+    stack = v2_lineup_stack_profile(lineup)
+    lev = v2_lineup_leverage_profile(lineup)
+    core = lineup_core_profile(lineup)
+    salary = sum(safe_int(p.get("salary", 0), 0) for p in lineup)
+    remaining = SALARY_CAP - salary
+    projection_score = round(max(0, min(100, (projection - 60) * 1.55)), 1)
+    ceiling_score = safe_float(ceiling.get("ceiling_score", 0), 0)
+    stack_score = safe_float(stack.get("stack_score", 0), 0)
+    leverage_score = safe_float(lev.get("leverage_score", 0), 0)
+    uniqueness_score = safe_float(lev.get("uniqueness_score", 0), 0)
+    core_score = safe_float(core.get("average_core_play_score", 50), 50)
+    salary_score = 92 if 0 <= remaining <= 1700 else 82 if remaining <= 3200 else 70 if remaining <= 5200 else 58
+    safety_score = 93 - len([p for p in lineup if not bool(p.get("active", True))]) * 40 - (22 if pitcher_vs_hitter_conflict(lineup) else 0)
+    safety_score -= safe_int(core.get("fade_count", 0), 0) * 8
+    safety_score = round(max(0, min(100, safety_score)), 1)
+
+    if mode == "cash":
+        quality = projection_score * 0.38 + safety_score * 0.26 + core_score * 0.17 + ceiling_score * 0.08 + leverage_score * 0.05 + salary_score * 0.06
+    else:
+        quality = ceiling_score * 0.31 + stack_score * 0.24 + leverage_score * 0.20 + uniqueness_score * 0.13 + projection_score * 0.07 + core_score * 0.03 + salary_score * 0.02
+    quality -= safe_int(core.get("bad_chalk_count", 0), 0) * (5.0 if mode != "cash" else 2.0)
+    quality = round(max(0, min(100, quality)), 1)
+    takedown_strength = round(max(0, min(100, ceiling_score * 0.34 + stack_score * 0.27 + leverage_score * 0.22 + uniqueness_score * 0.17)), 1)
+
+    if mode != "cash":
+        if takedown_strength >= 82:
+            label = "Takedown Candidate"
+        elif takedown_strength >= 72:
+            label = "Strong GPP Upside"
+        elif takedown_strength >= 60:
+            label = "Playable Tournament Build"
+        elif takedown_strength >= 48:
+            label = "Needs More Upside"
+        else:
+            label = "Weak Tournament Build"
+    else:
+        label = "Cash Core" if quality >= 82 else "Cash Viable" if quality >= 70 else "Risky Cash" if quality >= 55 else "Weak Build"
+    return {
+        "lineup_quality_score": quality,
+        "win_probability": takedown_strength if mode != "cash" else round(max(0, min(100, quality * 0.8 + safety_score * 0.2)), 1),
+        "lineup_quality_label": label,
+        "lineup_quality_breakdown": {
+            "projection_score": projection_score,
+            "ceiling_score": round(ceiling_score, 1),
+            "leverage_score": round(leverage_score, 1),
+            "stack_score": round(stack_score, 1),
+            "core_score": round(core_score, 1),
+            "salary_score": round(salary_score, 1),
+            "safety_score": round(safety_score, 1),
+            "uniqueness_score": round(uniqueness_score, 1),
+            "duplication_risk": round(safe_float(lev.get("duplication_risk", 0), 0), 1),
+        },
+        "takedown_strength": takedown_strength,
+        "tournament_engine_version": TOURNAMENT_ENGINE_VERSION,
+        "p95_ceiling_points": ceiling.get("p95_ceiling_points", 0),
+        "p99_ceiling_points": ceiling.get("p99_ceiling_points", 0),
+        "stack_label": stack.get("stack_label", ""),
+    }
+
+
+def add_lineup_metadata(lineup_data):
+    lineup = lineup_data["lineup"]
+    mode = lineup_data.get("mode", "cash")
+    stack_basic = best_stack_info(lineup)
+    stack = v2_lineup_stack_profile(lineup)
+    lev = v2_lineup_leverage_profile(lineup)
+    ceiling = v2_lineup_ceiling_profile(lineup)
+    lineup_data["best_stack_team"] = stack.get("primary_stack_team") or stack_basic.get("team", "")
+    lineup_data["best_stack_size"] = stack.get("primary_stack_size") or stack_basic.get("size", 0)
+    lineup_data["team_breakdown"] = stack_basic.get("counts", {})
+    lineup_data["pitcher_conflict"] = pitcher_vs_hitter_conflict(lineup)
+    lineup_data["salary_remaining"] = SALARY_CAP - lineup_data["total_salary"]
+    lineup_data["roster_slots"] = ROSTER_SLOTS
+    lineup_data["boost_breakdown"] = lineup_boost_breakdown(lineup, mode)
+    lineup_data["lineup_explanation"] = lineup_explanation(lineup, mode)
+    lineup_data["average_ownership"] = round(sum(safe_float(p.get("ownership", 0), 0) for p in lineup) / len(lineup), 2) if lineup else 0
+    lineup_data.update(lineup_leverage_profile(lineup))
+    lineup_data.update(lineup_core_profile(lineup))
+    lineup_data.update(lineup_quality_profile(lineup, mode))
+    lineup_data["tournament_engine_version"] = TOURNAMENT_ENGINE_VERSION
+    lineup_data["v2_stack_profile"] = stack
+    lineup_data["v2_leverage_profile"] = lev
+    lineup_data["v2_ceiling_profile"] = ceiling
+    lineup_data["stack_correlation_score"] = stack.get("stack_score", 0)
+    lineup_data["ceiling_score"] = ceiling.get("ceiling_score", 0)
+    lineup_data["tournament_notes"] = [
+        f"{stack.get('stack_label', 'Stack profile')} ({stack.get('primary_stack_team', '')} {stack.get('primary_stack_size', 0)})",
+        f"Ceiling {ceiling.get('ceiling_score', 0)} / Leverage {lev.get('leverage_score', 0)} / Unique {lev.get('uniqueness_score', 0)}",
+        "V3 targets first-place equity, not median cash safety." if str(mode).lower() != "cash" else "Cash mode targets median safety and projection.",
+    ]
+    lineup_data["lineup_health"] = calculate_lineup_health_profile(lineup_data)
+    return lineup_data
+
+
+def v2_player_tournament_grade(player, stack_team=None, style="balanced", position_need=None):
+    pos = normalize_position(player.get("position", ""))
+    proj = safe_float(player.get("boosted_projection", player.get("projection", 0)), 0)
+    dist = v3_player_distribution(player)
+    own = safe_float(player.get("ownership", 12), 12)
+    lev = safe_float(player.get("leverage_score", 45), 45)
+    core = safe_float(player.get("core_play_score", 50), 50)
+    total = safe_float(player.get("team_total", 4.2), 4.2)
+    style = str(style or "balanced").lower()
+    grade = dist["p95"] * 1.02 + dist["p99"] * 0.42 + proj * 0.12 + lev * 0.12 + core * 0.03 + max(0, total - 4.2) * 3.0
+    if style == "nuclear":
+        grade = dist["p99"] * 1.20 + dist["p95"] * 0.65 + lev * 0.20 + max(0, 16 - own) * 0.75 + max(0, total - 4.2) * 4.4
+    elif style == "aggressive":
+        grade = dist["p99"] * 0.82 + dist["p95"] * 0.92 + lev * 0.18 + max(0, 18 - own) * 0.52 + max(0, total - 4.2) * 3.7
+    elif style == "safe":
+        grade = proj * 1.35 + dist["p85"] * 0.38 + core * 0.08 - max(0, own - 30) * 0.2
+    if stack_team and normalize_team(player.get("team", "")) == normalize_team(stack_team) and pos != "P":
+        grade += 15.0 if style == "nuclear" else 11.0 if style == "aggressive" else 7.0
+    if pos == "P" and style in ["aggressive", "nuclear"] and own <= 12 and proj >= 13:
+        grade += 4.0
+    if str(player.get("core_play_tier", "")).lower() in ["fade", "inactive"]:
+        grade -= 50
+    if str(player.get("core_play_tier", "")).lower() == "bad_chalk" and style in ["aggressive", "nuclear"]:
+        grade -= 18
+    return grade
+
+
+def build_fast_multi_lineups_for_pro(request, count):
+    mode = str(getattr(request, "mode", "gpp") or "gpp").lower()
+    style = v3_style_from_request(request, mode)
+    randomness = safe_int(getattr(request, "randomness", 0), 0)
+    if style == "aggressive":
+        randomness = max(randomness, 45)
+    if style == "nuclear":
+        randomness = max(randomness, 75)
+    if mode != "cash" and style == "balanced":
+        randomness = max(randomness, 28)
+
+    players = [p for p in add_values(load_players()) if bool(p.get("active", True))]
+    excluded_names = set(getattr(request, "excluded_players", []) or [])
+    locked_players = getattr(request, "locked_players", []) or []
+    max_players_per_team = max(3, min(safe_int(getattr(request, "max_players_per_team", 5), 5), 5 if mode != "cash" else 6))
+    min_salary = safe_int(getattr(request, "min_salary", 0), 0)
+    avoid_conflict = bool(getattr(request, "avoid_pitcher_vs_hitter", True))
+
+    pool = [p for p in players if p.get("name") not in excluded_names and safe_int(p.get("salary", 0), 0) > 0]
+    locked_objects = [p for p in pool if p.get("name") in locked_players]
+    groups = {pos: [] for pos in ["P", "C", "1B", "2B", "3B", "SS", "OF"]}
+    for p in pool:
+        pos = normalize_position(p.get("position", ""))
+        if pos in groups:
+            groups[pos].append(p)
+
+    hitters = [p for p in pool if normalize_position(p.get("position", "")) != "P"]
+    stack_teams = v2_choose_stack_teams(hitters)
+    # Nuclear also tests more lower-owned stack teams, not only best projection teams.
+    if style in ["aggressive", "nuclear"]:
+        team_scores = []
+        by_team = {}
+        for h in hitters:
+            by_team.setdefault(normalize_team(h.get("team", "")), []).append(h)
+        for team, ps in by_team.items():
+            if len(ps) >= 3:
+                avg_own = sum(safe_float(p.get("ownership", 12), 12) for p in ps) / len(ps)
+                ceil = sum(sorted([v3_player_distribution(p)["p99"] for p in ps], reverse=True)[:5])
+                team_scores.append((team, ceil + max(0, 18 - avg_own) * 5 + max(0, estimated_team_total(team) - 4.2) * 12))
+        team_scores.sort(key=lambda x: x[1], reverse=True)
+        for team, _ in team_scores:
+            if team not in stack_teams:
+                stack_teams.append(team)
+    if not stack_teams:
+        stack_teams = [""]
+
+    trim_report = {"tournament_engine_version": TOURNAMENT_ENGINE_VERSION, "builder_style": style, "stack_teams_tested": stack_teams[:12], "candidate_count": 0}
+    candidates = []
+    seen = set()
+    attempts = max(260, count * (95 if style in ["aggressive", "nuclear"] else 65))
+    stack_sizes = [5, 4, 3] if mode != "cash" else [3, 2]
+    if style == "nuclear":
+        stack_sizes = [5, 5, 4, 4, 3]
+    elif style == "aggressive":
+        stack_sizes = [5, 4, 4, 3]
+
+    for i in range(attempts):
+        stack_team = stack_teams[i % len(stack_teams)] if stack_teams else None
+        secondary_options = [t for t in stack_teams if t and t != stack_team]
+        secondary_team = secondary_options[(i // max(1, len(stack_teams))) % len(secondary_options)] if secondary_options else None
+        stack_size = stack_sizes[i % len(stack_sizes)]
+        lineup = v2_attempt_lineup(
+            groups,
+            stack_team=stack_team,
+            stack_size=stack_size,
+            secondary_team=secondary_team,
+            style=style,
+            locked_objects=locked_objects,
+            excluded_names=excluded_names,
+            offset=i + deterministic_random_bonus([{"name": str(i)}], randomness),
+            max_players_per_team=max_players_per_team,
+            min_salary=min_salary,
+            avoid_pitcher_vs_hitter=avoid_conflict,
+        )
+        if not lineup or not v2_lineup_position_valid(lineup):
+            continue
+        if not has_all_locked(lineup, locked_players):
+            continue
+        key = lineup_key(lineup)
+        if key in seen:
+            continue
+        seen.add(key)
+        salary = sum(safe_int(p.get("salary", 0), 0) for p in lineup)
+        if salary > SALARY_CAP or salary < min_salary:
+            continue
+        projection = sum(safe_float(p.get("projection", 0), 0) for p in lineup)
+        data = add_lineup_metadata({"mode": mode, "total_salary": salary, "projected_points": round(projection, 2), "optimizer_score": 0, "lineup": lineup})
+        q = data.get("lineup_quality_breakdown", {})
+        # True objective: take down tournaments. Projection is only a tiebreaker in GPP.
+        if mode == "cash" or style == "safe":
+            objective = safe_float(q.get("projection_score", 0), 0) * 1.15 + safe_float(q.get("safety_score", 0), 0) * 0.95 + safe_float(q.get("core_score", 0), 0) * 0.34
+        elif style == "nuclear":
+            objective = safe_float(q.get("ceiling_score", 0), 0) * 2.10 + safe_float(q.get("stack_score", 0), 0) * 1.85 + safe_float(q.get("leverage_score", 0), 0) * 1.45 + safe_float(q.get("uniqueness_score", 0), 0) * 1.30 - safe_float(q.get("duplication_risk", 0), 0) * 0.42
+        elif style == "aggressive":
+            objective = safe_float(q.get("ceiling_score", 0), 0) * 1.82 + safe_float(q.get("stack_score", 0), 0) * 1.55 + safe_float(q.get("leverage_score", 0), 0) * 1.22 + safe_float(q.get("uniqueness_score", 0), 0) * 0.95 - safe_float(q.get("duplication_risk", 0), 0) * 0.30
+        else:
+            objective = safe_float(q.get("ceiling_score", 0), 0) * 1.38 + safe_float(q.get("stack_score", 0), 0) * 1.08 + safe_float(q.get("leverage_score", 0), 0) * 0.82 + safe_float(q.get("projection_score", 0), 0) * 0.50
+        objective += deterministic_random_bonus(lineup, randomness) * (0.70 if style in ["aggressive", "nuclear"] else 0.22)
+        data["optimizer_score"] = round(objective, 2)
+        data["builder_style"] = style
+        data["optimizer_objective"] = "takedown_equity" if mode != "cash" else "cash_safety"
+        candidates.append(data)
+
+    if not candidates:
+        return [], "Tournament Engine V3 could not find valid lineups. Try clearing locks/excludes, lowering min salary, or allowing 5 players per team.", trim_report, attempts
+
+    candidates.sort(key=lambda x: (safe_float(x.get("optimizer_score", 0), 0), safe_float(x.get("takedown_strength", 0), 0), safe_float(x.get("ceiling_score", 0), 0)), reverse=True)
+    selected = diversify_lineups(
+        all_lineups=candidates,
+        count=count,
+        max_exposure=min(max(safe_int(getattr(request, "max_exposure", 60), 60), 20), 100),
+        max_same_players=min(max(safe_int(getattr(request, "max_same_players", 7), 7), 3), 9),
+        locked_players=locked_players,
+        player_min_exposure=getattr(request, "player_min_exposure", {}),
+        player_max_exposure=getattr(request, "player_max_exposure", {}),
+    )
+    selected.sort(key=lambda x: (safe_float(x.get("optimizer_score", 0), 0), safe_float(x.get("takedown_strength", 0), 0)), reverse=True)
+    trim_report["candidate_count"] = len(candidates)
+    trim_report["returned_count"] = len(selected)
+    return selected, None, trim_report, attempts
+
+
+def v2_estimate_rank_from_score(score, lineup, contest):
+    contest_size = max(10, safe_int(contest.get("contest_size", contest.get("field_size", 5000)), 5000))
+    stack = v2_lineup_stack_profile(lineup)
+    lev = v2_lineup_leverage_profile(lineup)
+    ceiling = v2_lineup_ceiling_profile(lineup)
+    quality = lineup_quality_profile(lineup, "gpp")
+    strength = safe_float(quality.get("lineup_quality_score", 0), 0)
+    takedown = safe_float(quality.get("takedown_strength", 0), 0)
+    # Median is honest, but improved for actually strong builds.
+    median_pct = 0.62 - (strength / 100.0) * 0.46 - max(0, takedown - 70) * 0.0025
+    median_rank = int(max(1, min(contest_size, contest_size * max(0.045, median_pct))))
+    ceiling_pct = 0.155 - (takedown / 100.0) * 0.137
+    ceiling_rank = int(max(1, min(contest_size, contest_size * max(0.0035, ceiling_pct))))
+    takedown_pct = 0.018 - (takedown / 100.0) * 0.0172
+    takedown_rank = int(max(1, min(contest_size, contest_size * max(0.00012, takedown_pct))))
+    return median_rank, ceiling_rank, takedown_rank, strength, takedown
+
+
+def monte_carlo_lineup_simulation_v2(lineup, contest, runs=1200, field_scores=None):
+    contest_size = max(10, safe_int(contest.get("contest_size", contest.get("field_size", 5000)), 5000))
+    paid_spots = max(1, min(contest_size, safe_int(contest.get("paid_positions") or contest.get("estimated_paid_spots", int(contest_size * 0.20)), int(contest_size * 0.20))))
+    entry_fee = max(0.01, safe_float(contest.get("entry_fee", 5.0), 5.0))
+    median_rank, ceiling_rank, takedown_rank, strength, takedown = v2_estimate_rank_from_score(0, lineup, contest)
+    paid_rate = paid_spots / contest_size
+    stack = v2_lineup_stack_profile(lineup)
+    lev = v2_lineup_leverage_profile(lineup)
+    ceiling = v2_lineup_ceiling_profile(lineup)
+
+    cash_probability = max(0.0, min(92.0, paid_rate * 100 + (strength - 55) * 0.62 + max(0, ceiling.get("ceiling_score", 0) - 70) * 0.12))
+    top_10_probability = max(0.0, min(55.0, 4.0 + (takedown - 45) * 0.55))
+    top_1_probability = max(0.0, min(10.5, 0.20 + max(0, takedown - 50) * 0.135 + max(0, stack.get("stack_score", 0) - 75) * 0.025))
+    top_0_1_probability = max(0.0, min(1.20, 0.01 + max(0, takedown - 60) * 0.022 + max(0, lev.get("uniqueness_score", 0) - 70) * 0.006))
+    win_probability = max(0.0, min(0.22, top_0_1_probability * 0.075))
+
+    min_cash = payout_for_rank(paid_spots, contest)
+    top_10_payout = payout_for_rank(max(1, int(contest_size * 0.10)), contest)
+    top_1_payout = payout_for_rank(max(1, int(contest_size * 0.01)), contest)
+    top_01_payout = payout_for_rank(max(1, int(contest_size * 0.001)), contest)
+    first_payout = payout_for_rank(1, contest)
+    median_payout = payout_for_rank(median_rank, contest)
+    ceiling_payout = payout_for_rank(ceiling_rank, contest)
+    takedown_payout = payout_for_rank(takedown_rank, contest)
+    # Expected payout is probability weighted. Median payout can be $0 while GPP upside EV is positive.
+    expected_payout = (
+        (cash_probability / 100.0) * min_cash * 0.82
+        + (top_10_probability / 100.0) * max(top_10_payout - min_cash, 0) * 0.45
+        + (top_1_probability / 100.0) * max(top_1_payout - top_10_payout, 0) * 0.72
+        + (top_0_1_probability / 100.0) * max(top_01_payout - top_1_payout, 0) * 0.92
+        + (win_probability / 100.0) * max(first_payout - top_01_payout, 0)
+    )
+    # Do not clamp elite upside to tiny values, but stop impossible fantasy math.
+    expected_payout = max(0.0, min(expected_payout, max(entry_fee * 20.0, top_1_payout * 0.22)))
+    expected_value = expected_payout - entry_fee
+    roi = (expected_value / entry_fee) * 100
+    return {
+        "simulation_runs": runs,
+        "average_sim_score": round(sum(safe_float(p.get("projection", 0), 0) for p in lineup), 2),
+        "median_sim_score": round(sum(safe_float(p.get("projection", 0), 0) for p in lineup), 2),
+        "ceiling_sim_score": ceiling.get("p95_ceiling_points", 0),
+        "floor_sim_score": round(sum(safe_float(p.get("projection", 0), 0) for p in lineup) * 0.55, 2),
+        "average_rank": median_rank,
+        "projected_rank": median_rank,
+        "median_rank": median_rank,
+        "ceiling_rank": ceiling_rank,
+        "takedown_rank": takedown_rank,
+        "cash_probability": round(cash_probability, 1),
+        "top_10_probability": round(top_10_probability, 1),
+        "top_1_probability": round(top_1_probability, 2),
+        "top_0_1_probability": round(top_0_1_probability, 3),
+        "win_probability": round(win_probability, 3),
+        "expected_payout": round(expected_payout, 2),
+        "expected_value": round(expected_value, 2),
+        "roi_percent": round(roi, 1),
+        "projected_payout": round(expected_payout, 2),
+        "median_payout": round(median_payout, 2),
+        "ceiling_payout": round(ceiling_payout, 2),
+        "best_payout": round(max(ceiling_payout, takedown_payout), 2),
+        "min_cash_payout": round(min_cash, 2),
+        "top_10_rank_payout": round(top_10_payout, 2),
+        "top_1_rank_payout": round(top_1_payout, 2),
+        "top_0_1_rank_payout": round(top_01_payout, 2),
+        "tournament_strength": round(strength, 1),
+        "ceiling_strength": round(takedown, 1),
+        "simulator_note": "Projected payout is probability-weighted GPP upside EV. Median payout is the middle outcome and may still be $0 in large fields.",
+    }
