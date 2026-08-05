@@ -12,6 +12,7 @@ import re
 import math
 import random
 import os
+import urllib.request
 from datetime import datetime
 
 app = FastAPI(title="DFS Edge MLB API")
@@ -25,7 +26,11 @@ app.add_middleware(
 )
 
 SALARY_CAP = 50000
-ADMIN_PASSWORD = "dfsedge_admin_2026"
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "").strip()
+CENTRAL_AUTH_URL = os.getenv(
+    "CENTRAL_AUTH_URL",
+    "https://dfs-edge-nfl-backend-skwfa.ondigitalocean.app",
+).rstrip("/")
 
 APP_DIR = Path(__file__).parent
 # Persistent data directory for live hosting.
@@ -39,8 +44,7 @@ ACTIVE_SLATE_PATH = BASE_DIR / "active_slate.json"
 SLATE_METADATA_PATH = BASE_DIR / "slate_metadata.json"
 MARKET_STATE_PATH = BASE_DIR / "market_state.json"
 USERS_PATH = BASE_DIR / "users.json"
-ADMIN_EMAIL = "zero2sixtygraphics@gmail.com"
-DEFAULT_ADMIN_PASSWORD = "Zero2SixtyAdmin2026!"
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "zero2sixtygraphics@gmail.com").strip().lower()
 
 ROSTER_SLOTS = ["P", "P", "C", "1B", "2B", "3B", "SS", "OF", "OF", "OF"]
 
@@ -4044,6 +4048,24 @@ def hash_password(password):
     return hashlib.sha256(str(password or "").encode("utf-8")).hexdigest()
 
 
+def central_auth_request(path, payload):
+    try:
+        request = urllib.request.Request(
+            f"{CENTRAL_AUTH_URL}{path}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=12) as response:
+            result = json.loads(response.read().decode("utf-8"))
+            return result if isinstance(result, dict) else {
+                "success": False,
+                "error": "Invalid account service response.",
+            }
+    except Exception:
+        return {"success": False, "error": "Central account service is unavailable."}
+
+
 def make_auth_token(email, password_hash):
     raw = f"{normalize_email(email)}:{password_hash}:dfs_edge_mlb_local_auth"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -4091,29 +4113,8 @@ def user_public_payload(user):
 
 
 def ensure_admin_user():
-    users = load_users()
-    email = ADMIN_EMAIL
-    password_hash = hash_password(DEFAULT_ADMIN_PASSWORD)
-    existing = users.get(email, {})
-
-    # Local MVP rule: admin email is always admin.
-    # If no admin exists yet, create it with DEFAULT_ADMIN_PASSWORD.
-    # If it already exists, keep its existing password unless it has no password hash.
-    if existing.get("password_hash"):
-        password_hash = existing["password_hash"]
-
-    users[email] = {
-        "email": email,
-        "password_hash": password_hash,
-        "token": make_auth_token(email, password_hash),
-        "role": "admin",
-        "subscription_status": "active",
-        "pro_requested": False,
-        "saved_lineups": existing.get("saved_lineups", []) if isinstance(existing.get("saved_lineups", []), list) else [],
-        "created_at": existing.get("created_at", datetime.utcnow().isoformat() + "Z"),
-        "updated_at": datetime.utcnow().isoformat() + "Z",
-    }
-    save_users(users)
+    # Accounts are owned by the central DFS Edge account service.
+    return None
 
 
 def find_user_by_token(token):
@@ -4128,10 +4129,16 @@ def is_admin_token(token):
     if not token:
         return False
     email, user, _ = find_user_by_token(token)
-    if not user:
-        return False
-    role = role_for_email(email, user.get("role", "free"))
-    return role == "admin"
+    if user:
+        role = role_for_email(email, user.get("role", "free"))
+        if role == "admin" and normalize_email(email) == ADMIN_EMAIL:
+            return True
+    session = central_auth_request("/auth/me", {"token": token})
+    central_user = session.get("user", {}) if session.get("success") else {}
+    return (
+        normalize_email(central_user.get("email")) == ADMIN_EMAIL
+        and str(central_user.get("role", "")).lower() == "admin"
+    )
 
 
 def is_admin_authorized(request_or_password=None, token=""):
@@ -4142,76 +4149,28 @@ def is_admin_authorized(request_or_password=None, token=""):
     elif request_or_password is not None:
         password = getattr(request_or_password, "admin_password", "") or ""
         auth_token = getattr(request_or_password, "auth_token", "") or getattr(request_or_password, "admin_token", "") or auth_token
-    return password == ADMIN_PASSWORD or is_admin_token(auth_token)
+    return (bool(ADMIN_PASSWORD) and password == ADMIN_PASSWORD) or is_admin_token(auth_token)
 
 
 @app.post("/auth/register")
 def register_user(request: RegisterRequest):
-    email = normalize_email(request.email)
-    password = str(request.password or "")
-
-    if not email or "@" not in email:
-        return {"success": False, "error": "Enter a valid email address."}
-    if len(password) < 6:
-        return {"success": False, "error": "Password must be at least 6 characters."}
-
-    users = load_users()
-    if email in users:
-        return {"success": False, "error": "An account already exists for this email. Log in instead."}
-
-    password_hash = hash_password(password)
-    role = role_for_email(email)
-    token = make_auth_token(email, password_hash)
-    user = {
-        "email": email,
-        "password_hash": password_hash,
-        "token": token,
-        "role": role,
-        "subscription_status": "active" if role in ["pro", "admin"] else "free",
-        "pro_requested": False,
-        "saved_lineups": [],
-        "created_at": datetime.utcnow().isoformat() + "Z",
-        "updated_at": datetime.utcnow().isoformat() + "Z",
-    }
-    users[email] = user
-    save_users(users)
-
-    return {"success": True, "token": token, "user": user_public_payload(user)}
+    return central_auth_request(
+        "/auth/register",
+        {"email": normalize_email(request.email), "password": str(request.password or "")},
+    )
 
 
 @app.post("/auth/login")
 def login_user(request: LoginRequest):
-    email = normalize_email(request.email)
-    password_hash = hash_password(request.password)
-    users = load_users()
-
-    # Make sure the admin account always exists before login attempts.
-    if email == ADMIN_EMAIL and email not in users:
-        ensure_admin_user()
-        users = load_users()
-
-    user = users.get(email)
-    if not user or user.get("password_hash") != password_hash:
-        return {"success": False, "error": "Invalid email or password."}
-
-    user["role"] = role_for_email(email, user.get("role", "free"))
-    user["token"] = make_auth_token(email, user.get("password_hash", password_hash))
-    user["updated_at"] = datetime.utcnow().isoformat() + "Z"
-    users[email] = user
-    save_users(users)
-
-    return {"success": True, "token": user["token"], "user": user_public_payload(user)}
+    return central_auth_request(
+        "/auth/login",
+        {"email": normalize_email(request.email), "password": str(request.password or "")},
+    )
 
 
 @app.post("/auth/me")
 def auth_me(request: AuthTokenRequest):
-    email, user, users = find_user_by_token(request.token)
-    if not user:
-        return {"success": False, "error": "Session expired. Please log in again."}
-    user["role"] = role_for_email(email, user.get("role", "free"))
-    users[email] = user
-    save_users(users)
-    return {"success": True, "user": user_public_payload(user)}
+    return central_auth_request("/auth/me", {"token": request.token})
 
 
 @app.post("/auth/logout")
@@ -7761,4 +7720,3 @@ def monte_carlo_lineup_simulation_v2(lineup, contest, runs=900, field_scores=Non
         "ceiling_strength": round(takedown, 1),
         "simulator_note": "EV is probability-weighted. Median payout can be $0 while ceiling/takedown payout shows tournament upside.",
     }
-
