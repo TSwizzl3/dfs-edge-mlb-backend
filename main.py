@@ -1,5 +1,5 @@
 
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, Depends, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from itertools import combinations
@@ -4141,6 +4141,28 @@ def is_admin_token(token):
     )
 
 
+def bearer_token(authorization):
+    value = str(authorization or "").strip()
+    return value[7:].strip() if value.lower().startswith("bearer ") else ""
+
+
+def optional_session(authorization: str = Header(default="")):
+    token = bearer_token(authorization)
+    if not token:
+        return None
+    response = central_auth_request("/auth/me", {"token": token})
+    return response.get("user") if response.get("success") else None
+
+
+def require_pro_access(authorization: str = Header(default="")):
+    session = optional_session(authorization)
+    if not session:
+        raise HTTPException(status_code=401, detail="Log in to use this feature.")
+    if str(session.get("role", "free")).lower() not in ["pro", "admin"]:
+        raise HTTPException(status_code=403, detail="DFS Edge Pro is required.")
+    return session
+
+
 def is_admin_authorized(request_or_password=None, token=""):
     password = ""
     auth_token = token or ""
@@ -4539,12 +4561,12 @@ def auto_builder_notes(request, lineups):
 
 
 @app.get("/ai-picks/status")
-def ai_picks_status():
+def ai_picks_status(_: dict = Depends(require_pro_access)):
     return ai_picks_summary()
 
 
 @app.post("/ai-lineup-builder/build")
-def ai_lineup_builder(request: AutoLineupBuilderRequest):
+def ai_lineup_builder(request: AutoLineupBuilderRequest, _: dict = Depends(require_pro_access)):
     tuned = apply_auto_builder_strategy(request)
     selected, error, trim_report, checked = build_fast_multi_lineups_for_pro(tuned, tuned.count)
     if error:
@@ -4844,7 +4866,21 @@ def optimize_lineup(request: OptimizeRequest):
 
 
 @app.post("/optimize-multiple")
-def optimize_multiple_lineups(request: MultiOptimizeRequest):
+def optimize_multiple_lineups(
+    request: MultiOptimizeRequest,
+    session: dict | None = Depends(optional_session),
+):
+    if not session or str(session.get("role", "free")).lower() not in ["pro", "admin"]:
+        request.count = 1
+        request.max_exposure = 100
+        request.max_same_players = 9
+        request.min_salary = 0
+        request.max_players_per_team = 9
+        request.force_team_stack = False
+        request.avoid_pitcher_vs_hitter = False
+        request.randomness = 0
+        request.player_min_exposure = {}
+        request.player_max_exposure = {}
     count = request.count if request.count in [1, 5, 10, 20] else 1
 
     # Always use the fast builder for this endpoint.
@@ -4875,7 +4911,7 @@ def optimize_multiple_lineups(request: MultiOptimizeRequest):
     }
 
 @app.post("/export-lineups-csv")
-def export_lineups_csv(request: MultiOptimizeRequest):
+def export_lineups_csv(request: MultiOptimizeRequest, _: dict = Depends(require_pro_access)):
     count = request.count if request.count in [1, 5, 10, 20] else 1
     max_exposure = min(max(request.max_exposure, 20), 100)
     max_same_players = min(max(request.max_same_players, 3), 9)
@@ -5456,7 +5492,7 @@ def slate_intelligence_summary():
 
 
 @app.get("/market-intelligence/status")
-def market_intelligence_status():
+def market_intelligence_status(_: dict = Depends(require_pro_access)):
     return market_intelligence_summary(persist_snapshot=False)
 
 
@@ -5469,7 +5505,7 @@ def market_intelligence_refresh(request: AdminPasswordRequest):
     return summary
 
 @app.get("/slate-intelligence/status")
-def slate_intelligence_status():
+def slate_intelligence_status(_: dict = Depends(require_pro_access)):
     return slate_intelligence_summary()
 
 
@@ -5487,7 +5523,7 @@ def slate_intelligence_refresh(request: AdminPasswordRequest):
 
 
 @app.post("/slate-intelligence/lineup-health")
-def slate_intelligence_lineup_health(request: LineupAlertsRequest):
+def slate_intelligence_lineup_health(request: LineupAlertsRequest, _: dict = Depends(require_pro_access)):
     results = []
     for index, lineup in enumerate(request.lineups or []):
         health = calculate_lineup_health_profile(lineup)
@@ -5505,7 +5541,7 @@ def slate_intelligence_lineup_health(request: LineupAlertsRequest):
     }
 
 @app.post("/lineup-alerts")
-def lineup_alerts(request: LineupAlertsRequest):
+def lineup_alerts(request: LineupAlertsRequest, _: dict = Depends(require_pro_access)):
     results = []
     for index, lineup in enumerate(request.lineups or []):
         results.append({
@@ -5520,7 +5556,7 @@ def lineup_alerts(request: LineupAlertsRequest):
 
 
 @app.post("/late-swap/fix")
-def late_swap_fix(request: LateSwapRequest):
+def late_swap_fix(request: LateSwapRequest, _: dict = Depends(require_pro_access)):
     fixed, error = build_late_swap_repair(request)
     if error:
         return {"success": False, "error": error, "fixed_lineup": None}
@@ -5533,21 +5569,21 @@ def late_swap_fix(request: LateSwapRequest):
 
 
 @app.post("/lineup-fixer")
-def lineup_fixer(request: LateSwapRequest):
-    return late_swap_fix(request)
+def lineup_fixer(request: LateSwapRequest, session: dict = Depends(require_pro_access)):
+    return late_swap_fix(request, session)
 
 @app.post("/simulate-contest")
-def simulate_contest(request: ContestSimulationRequest):
+def simulate_contest(request: ContestSimulationRequest, _: dict = Depends(require_pro_access)):
     return simulate_contest_payload(request)
 
 
 @app.post("/contest-simulator")
-def contest_simulator(request: ContestSimulationRequest):
+def contest_simulator(request: ContestSimulationRequest, _: dict = Depends(require_pro_access)):
     return simulate_contest_payload(request)
 
 
 @app.post("/simulate")
-def simulate(request: ContestSimulationRequest):
+def simulate(request: ContestSimulationRequest, _: dict = Depends(require_pro_access)):
     return simulate_contest_payload(request)
 
 
