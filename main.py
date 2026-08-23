@@ -12,8 +12,9 @@ import re
 import math
 import random
 import os
+import statistics
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 
 app = FastAPI(title="DFS Edge MLB API")
 
@@ -44,6 +45,10 @@ ACTIVE_SLATE_PATH = BASE_DIR / "active_slate.json"
 SLATE_METADATA_PATH = BASE_DIR / "slate_metadata.json"
 MARKET_STATE_PATH = BASE_DIR / "market_state.json"
 USERS_PATH = BASE_DIR / "users.json"
+PAYOUT_TABLE_PATH = BASE_DIR / "mlb_payout_table.json"
+PROJECTION_SNAPSHOT_PATH = BASE_DIR / "mlb_projection_snapshot.json"
+BACKTEST_LATEST_PATH = BASE_DIR / "mlb_backtest_latest.json"
+BACKTEST_HISTORY_PATH = BASE_DIR / "mlb_backtest_history.json"
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "zero2sixtygraphics@gmail.com").strip().lower()
 
 ROSTER_SLOTS = ["P", "P", "C", "1B", "2B", "3B", "SS", "OF", "OF", "OF"]
@@ -364,6 +369,163 @@ def extract_id_from_name_plus_id(value):
     raw = str(value or "").strip()
     match = re.search(r"\((\d+)\)\s*$", raw)
     return match.group(1) if match else ""
+
+
+def normalized_player_name(value):
+    return re.sub(r"[^a-z0-9]", "", str(value or "").strip().lower())
+
+
+def parse_projection_csv(csv_text):
+    reader = csv.DictReader(io.StringIO(csv_text))
+    projections = []
+    for raw_row in reader:
+        row = clean_csv_row(raw_row)
+        name = find_column(row, ["Name", "Player", "Player Name", "Nickname"])
+        projection = find_column(row, ["Projection", "Projected Points", "Proj", "FPTS", "Median"])
+        ceiling = find_column(row, ["Ceiling", "Projected Ceiling", "Ceiling Points", "Upside"])
+        floor = find_column(row, ["Floor", "Projected Floor", "Floor Points"])
+        ownership = find_column(row, ["Ownership", "Projected Ownership", "Own", "Own%", "Ownership %"])
+        if not name or safe_float(projection, -1) < 0:
+            continue
+        item = {
+            "name": extract_name_from_name_plus_id(name),
+            "projection": round(safe_float(projection), 3),
+            "ownership": round(max(0.0, min(100.0, safe_float(ownership, 0))), 3),
+        }
+        if safe_float(ceiling, 0) > 0:
+            item["ceiling"] = round(safe_float(ceiling), 3)
+        if safe_float(floor, -1) >= 0:
+            item["floor"] = round(safe_float(floor), 3)
+        projections.append(item)
+    return projections
+
+
+def parse_actual_results_csv(csv_text):
+    reader = csv.DictReader(io.StringIO(csv_text))
+    actuals = []
+    for raw_row in reader:
+        row = clean_csv_row(raw_row)
+        name = find_column(row, ["Name", "Player", "Player Name", "Nickname"])
+        points_value = find_column(
+            row,
+            ["Actual Points", "Fantasy Points", "FPTS", "DK Points", "Points"],
+        )
+        points = safe_float(points_value, -1)
+        if name and points >= 0:
+            actuals.append({
+                "name": extract_name_from_name_plus_id(name),
+                "actual_points": round(points, 3),
+            })
+    return actuals
+
+
+def projection_backtest(players, actual_rows):
+    actual_by_name = {
+        normalized_player_name(item.get("name")): safe_float(item.get("actual_points"), 0)
+        for item in actual_rows
+    }
+    matched = []
+    for player in players:
+        key = normalized_player_name(player.get("name"))
+        if key not in actual_by_name:
+            continue
+        actual = actual_by_name[key]
+        projection = safe_float(player.get("projection"), 0)
+        floor = safe_float(player.get("floor"), max(0, projection * 0.35))
+        ceiling = safe_float(player.get("ceiling"), projection * (1.65 if normalize_position(player.get("position")) == "P" else 2.2))
+        matched.append({
+            "name": player.get("name"),
+            "position": normalize_position(player.get("position")),
+            "projection": projection,
+            "floor": floor,
+            "ceiling": ceiling,
+            "actual": actual,
+            "error": projection - actual,
+            "model_version": player.get("projection_model_version", "unknown"),
+        })
+
+    def metrics(rows):
+        if not rows:
+            return {"sample_size": 0}
+        errors = [item["error"] for item in rows]
+        projections = [item["projection"] for item in rows]
+        actuals = [item["actual"] for item in rows]
+        mean_projection = statistics.fmean(projections)
+        mean_actual = statistics.fmean(actuals)
+        covariance = sum(
+            (projection - mean_projection) * (actual - mean_actual)
+            for projection, actual in zip(projections, actuals)
+        )
+        denominator = math.sqrt(
+            sum((projection - mean_projection) ** 2 for projection in projections)
+            * sum((actual - mean_actual) ** 2 for actual in actuals)
+        )
+        return {
+            "sample_size": len(rows),
+            "mae": round(statistics.fmean(abs(error) for error in errors), 3),
+            "rmse": round(math.sqrt(statistics.fmean(error * error for error in errors)), 3),
+            "bias": round(statistics.fmean(errors), 3),
+            "correlation": round(covariance / denominator, 3) if denominator else 0,
+            "within_3_points_percent": round(100 * sum(abs(error) <= 3 for error in errors) / len(rows), 1),
+            "within_5_points_percent": round(100 * sum(abs(error) <= 5 for error in errors) / len(rows), 1),
+            "floor_coverage_percent": round(100 * sum(item["actual"] >= item["floor"] for item in rows) / len(rows), 1),
+            "ceiling_coverage_percent": round(100 * sum(item["actual"] <= item["ceiling"] for item in rows) / len(rows), 1),
+        }
+
+    positions = ["P", "C", "1B", "2B", "3B", "SS", "OF"]
+    return {
+        "overall": metrics(matched),
+        "by_position": {
+            position: metrics([item for item in matched if item["position"] == position])
+            for position in positions
+        },
+        "matched_players": len(matched),
+        "unmatched_results": max(0, len(actual_rows) - len(matched)),
+        "model_versions": sorted({item["model_version"] for item in matched}),
+    }
+
+
+def parse_rank_range(value):
+    numbers = [safe_int(part) for part in re.findall(r"[\d,]+", str(value or "").replace(",", ""))]
+    numbers = [number for number in numbers if number > 0]
+    if not numbers:
+        return None
+    return min(numbers), max(numbers)
+
+
+def parse_payout_csv(csv_text):
+    reader = csv.DictReader(io.StringIO(csv_text))
+    tiers = []
+    for raw_row in reader:
+        row = clean_csv_row(raw_row)
+        rank_value = find_column(row, ["Rank", "Place", "Position", "Finishing Position", "Places", "Rank Range"])
+        payout_value = find_column(row, ["Payout", "Prize", "Amount", "Winnings", "Cash"])
+        rank_range = parse_rank_range(rank_value)
+        payout = safe_float(payout_value, -1)
+        if not rank_range or payout < 0:
+            continue
+        tiers.append({"start_rank": rank_range[0], "end_rank": rank_range[1], "payout": round(payout, 2)})
+    tiers.sort(key=lambda tier: (tier["start_rank"], tier["end_rank"]))
+    return tiers
+
+
+def read_json_file(path, default):
+    if not path.exists():
+        return default
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return payload
+    except Exception:
+        return default
+
+
+def write_json_file(path, payload):
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def load_payout_table():
+    payload = read_json_file(PAYOUT_TABLE_PATH, [])
+    return payload if isinstance(payload, list) else []
 
 
 def extract_opponent_from_game_info(game_info, team):
@@ -2997,6 +3159,13 @@ def normalize_contest_request(request: ContestSimulationRequest):
         payout_rate = max(0.01, min(payout_rate, 0.80))
         paid_positions = max(1, min(contest_size, round(contest_size * payout_rate)))
 
+    payout_table = load_payout_table()
+    if payout_table:
+        exact_paid_positions = max(safe_int(tier.get("end_rank"), 0) for tier in payout_table)
+        if 0 < exact_paid_positions <= contest_size:
+            paid_positions = exact_paid_positions
+            payout_rate = paid_positions / contest_size
+
     return {
         "contest_size": contest_size,
         "field_size": contest_size,
@@ -3009,6 +3178,8 @@ def normalize_contest_request(request: ContestSimulationRequest):
         "max_entries": max_entries,
         "single_entry": single_entry,
         "total_entry_cost": round(entry_fee * max_entries, 2),
+        "payout_table": payout_table,
+        "payout_source": "uploaded_exact_table" if payout_table else "estimated_curve",
     }
 
 
@@ -4733,6 +4904,182 @@ async def upload_dk_csv(
     }
 
 
+@app.post("/admin/upload-projections-csv")
+async def upload_projections_csv(
+    admin_password: str = Form(""),
+    admin_token: str = Form(""),
+    file: UploadFile = File(...),
+):
+    if not is_admin_authorized(admin_password, admin_token):
+        return {"success": False, "error": "Admin session expired. Log in as admin again."}
+    if not file.filename.lower().endswith(".csv"):
+        return {"success": False, "error": "Please upload a projection CSV file."}
+
+    csv_text = (await file.read()).decode("utf-8-sig", errors="replace")
+    imported = parse_projection_csv(csv_text)
+    if not imported:
+        return {
+            "success": False,
+            "error": "No projections were found. Include Name and Projection columns; Ownership, Ceiling, and Floor are optional.",
+        }
+
+    players = load_players()
+    imported_by_name = {normalized_player_name(item["name"]): item for item in imported}
+    matched = 0
+    ownership_count = 0
+    ceiling_count = 0
+    unmatched_names = set(imported_by_name)
+    for player in players:
+        key = normalized_player_name(player.get("name"))
+        item = imported_by_name.get(key)
+        if not item:
+            continue
+        unmatched_names.discard(key)
+        matched += 1
+        player["projection"] = item["projection"]
+        player["projection_source"] = "admin_projection_csv"
+        player["projection_model_version"] = "imported_projection_blend_v1"
+        if item.get("ownership", 0) > 0:
+            player["ownership"] = item["ownership"]
+            player["ownership_source"] = "admin_projection_csv"
+            ownership_count += 1
+        if item.get("ceiling", 0) > 0:
+            player["ceiling"] = item["ceiling"]
+            player["ceiling_source"] = "admin_projection_csv"
+            ceiling_count += 1
+        if "floor" in item:
+            player["floor"] = item["floor"]
+            player["floor_source"] = "admin_projection_csv"
+        player["value"] = player_value(player)
+
+    if matched == 0:
+        return {"success": False, "error": "Projection names did not match any player on the active MLB slate."}
+
+    save_active_slate(players)
+    write_json_file(PROJECTION_SNAPSHOT_PATH, players)
+    return {
+        "success": True,
+        "message": "MLB projections, ownership, floor, and ceiling data imported successfully.",
+        "rows_imported": len(imported),
+        "players_matched": matched,
+        "ownership_matched": ownership_count,
+        "ceiling_matched": ceiling_count,
+        "unmatched_count": len(unmatched_names),
+        "projection_snapshot_saved": True,
+    }
+
+
+@app.post("/admin/upload-payout-csv")
+async def upload_payout_csv(
+    admin_password: str = Form(""),
+    admin_token: str = Form(""),
+    file: UploadFile = File(...),
+):
+    if not is_admin_authorized(admin_password, admin_token):
+        return {"success": False, "error": "Admin session expired. Log in as admin again."}
+    if not file.filename.lower().endswith(".csv"):
+        return {"success": False, "error": "Please upload a payout CSV file."}
+
+    csv_text = (await file.read()).decode("utf-8-sig", errors="replace")
+    tiers = parse_payout_csv(csv_text)
+    if not tiers:
+        return {
+            "success": False,
+            "error": "No payout tiers were found. Include Rank or Place and Payout or Prize columns.",
+        }
+    write_json_file(PAYOUT_TABLE_PATH, tiers)
+    return {
+        "success": True,
+        "message": "Exact MLB contest payout table imported and connected to the simulator.",
+        "tier_count": len(tiers),
+        "first_place_payout": tiers[0]["payout"],
+        "last_paid_rank": max(tier["end_rank"] for tier in tiers),
+    }
+
+
+@app.get("/payout-table/status")
+def payout_table_status():
+    tiers = load_payout_table()
+    return {
+        "success": True,
+        "configured": bool(tiers),
+        "payout_source": "uploaded_exact_table" if tiers else "estimated_curve",
+        "tier_count": len(tiers),
+        "last_paid_rank": max((tier["end_rank"] for tier in tiers), default=0),
+    }
+
+
+@app.post("/admin/upload-actual-results-csv")
+async def upload_actual_results_csv(
+    admin_password: str = Form(""),
+    admin_token: str = Form(""),
+    slate_key: str = Form(""),
+    file: UploadFile = File(...),
+):
+    if not is_admin_authorized(admin_password, admin_token):
+        return {"success": False, "error": "Admin session expired. Log in as admin again."}
+    if not file.filename.lower().endswith(".csv"):
+        return {"success": False, "error": "Please upload an actual-results CSV file."}
+
+    csv_text = (await file.read()).decode("utf-8-sig", errors="replace")
+    actual_rows = parse_actual_results_csv(csv_text)
+    if not actual_rows:
+        return {
+            "success": False,
+            "error": "No results found. Include Name or Player and Actual Points, Fantasy Points, FPTS, DK Points, or Points.",
+        }
+    snapshot = read_json_file(PROJECTION_SNAPSHOT_PATH, [])
+    players = snapshot if isinstance(snapshot, list) and len(snapshot) >= 10 else load_players()
+    result = projection_backtest(players, actual_rows)
+    if result["matched_players"] < 10:
+        return {
+            "success": False,
+            "error": "Fewer than 10 result names matched the saved MLB projection snapshot.",
+            **result,
+        }
+
+    metadata = load_slate_metadata()
+    resolved_slate_key = (
+        slate_key.strip()
+        or metadata.get("slate_date")
+        or metadata.get("slate_name")
+        or datetime.now(timezone.utc).date().isoformat()
+    )
+    payload = {
+        "success": True,
+        "sport": "MLB",
+        "slate_key": resolved_slate_key,
+        "evaluated_at": datetime.now(timezone.utc).isoformat(),
+        **result,
+    }
+    history = read_json_file(BACKTEST_HISTORY_PATH, [])
+    history = history if isinstance(history, list) else []
+    history = [item for item in history if item.get("slate_key") != resolved_slate_key]
+    history.append(payload)
+    history = history[-365:]
+    write_json_file(BACKTEST_LATEST_PATH, payload)
+    write_json_file(BACKTEST_HISTORY_PATH, history)
+    return {
+        **payload,
+        "message": f"MLB backtest saved for {resolved_slate_key} with {result['matched_players']} matched players.",
+        "history_slate_count": len(history),
+    }
+
+
+@app.get("/model/backtest/status")
+def model_backtest_status():
+    latest = read_json_file(BACKTEST_LATEST_PATH, {})
+    history = read_json_file(BACKTEST_HISTORY_PATH, [])
+    return {
+        "success": True,
+        "configured": bool(latest),
+        "latest": latest if isinstance(latest, dict) else {},
+        "history_slate_count": len(history) if isinstance(history, list) else 0,
+        "minimum_calibration_slates": 10,
+        "calibration_ready": isinstance(history, list) and len(history) >= 10,
+    }
+
+
 @app.post("/admin/use-sample")
 def use_sample_slate(request: AdminPasswordRequest):
     if not is_admin_authorized(request):
@@ -6267,6 +6614,15 @@ def payout_for_rank(rank, contest):
     paid = max(1, min(contest_size, safe_int(contest.get("estimated_paid_spots") or contest.get("paid_positions") or 1, 1)))
     prize_pool = max(0.0, safe_float(contest.get("prize_pool", 0), 0))
     entry_fee = max(0.01, safe_float(contest.get("entry_fee", 5.0), 5.0))
+    rank = max(1, safe_int(rank, 1))
+    payout_table = contest.get("payout_table")
+    if not isinstance(payout_table, list):
+        payout_table = load_payout_table()
+    for tier in payout_table:
+        if safe_int(tier.get("start_rank"), 0) <= rank <= safe_int(tier.get("end_rank"), 0):
+            return round(max(0.0, safe_float(tier.get("payout"), 0)), 2)
+    if payout_table and rank > max(safe_int(tier.get("end_rank"), 0) for tier in payout_table):
+        return 0.0
     top_prize = safe_float(contest.get("top_prize", 0), 0)
     if top_prize <= 0:
         # Realistic top-heavy estimate: big fields pay 10-18% to first, small fields 8-12%.
@@ -6274,7 +6630,6 @@ def payout_for_rank(rank, contest):
     min_cash = max(round(entry_fee * 1.8, 2), round(prize_pool * 0.00018, 2))
     if safe_int(rank, contest_size) > paid:
         return 0.0
-    rank = max(1, safe_int(rank, 1))
     if rank == 1:
         return round(top_prize, 2)
     pct = rank / max(1, paid)
