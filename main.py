@@ -4516,6 +4516,7 @@ def data_engine_status():
         "starter_eligible_count": len(starter_eligible),
         "confirmed_hitter_count": len([p for p in starter_eligible if p.get("starter_source") == "mlb_stats_confirmed_lineup"]),
         "probable_pitcher_count": len([p for p in starter_eligible if p.get("starter_source") == "mlb_stats_probable_pitcher"]),
+        "official_roster_filter": "mlb_40_man_active_status",
         "starter_refresh": starter_state,
         "review_count": len(review_players),
         "inactive_recommendation_count": len(inactive_recommended),
