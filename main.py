@@ -14,6 +14,8 @@ import random
 import os
 import statistics
 import urllib.request
+import urllib.parse
+import unicodedata
 from datetime import datetime, timezone
 
 app = FastAPI(title="DFS Edge MLB API")
@@ -49,7 +51,11 @@ PAYOUT_TABLE_PATH = BASE_DIR / "mlb_payout_table.json"
 PROJECTION_SNAPSHOT_PATH = BASE_DIR / "mlb_projection_snapshot.json"
 BACKTEST_LATEST_PATH = BASE_DIR / "mlb_backtest_latest.json"
 BACKTEST_HISTORY_PATH = BASE_DIR / "mlb_backtest_history.json"
+MLB_STARTER_STATE_PATH = BASE_DIR / "mlb_starter_state.json"
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "zero2sixtygraphics@gmail.com").strip().lower()
+
+MLB_STATS_API_BASE_URL = "https://statsapi.mlb.com/api/v1"
+ALLOW_SAMPLE_SLATE = os.getenv("ALLOW_SAMPLE_SLATE", "false").strip().lower() in {"1", "true", "yes"}
 
 ROSTER_SLOTS = ["P", "P", "C", "1B", "2B", "3B", "SS", "OF", "OF", "OF"]
 
@@ -302,6 +308,11 @@ def safe_int(value, default=0):
 def normalize_team(value):
     team = str(value or "UNK").upper().strip()
     team = team.replace("@", "").replace("VS", "").replace(" ", "")
+    team = {
+        "ATH": "OAK", "AZ": "ARI", "CHW": "CWS", "KC": "KC",
+        "KCR": "KC", "SDP": "SD", "SFG": "SF", "TBR": "TB",
+        "WAS": "WSH",
+    }.get(team, team)
     return team if team else "UNK"
 
 
@@ -376,7 +387,9 @@ def extract_id_from_name_plus_id(value):
 
 
 def normalized_player_name(value):
-    return re.sub(r"[^a-z0-9]", "", str(value or "").strip().lower())
+    normalized = unicodedata.normalize("NFKD", str(value or "").strip().lower())
+    ascii_name = "".join(char for char in normalized if not unicodedata.combining(char))
+    return re.sub(r"[^a-z0-9]", "", ascii_name)
 
 
 def parse_projection_csv(csv_text):
@@ -948,6 +961,9 @@ def convert_dk_csv_to_players(csv_text):
             "ownership_estimated": False,
             "active": True,
             "inactive_reason": "",
+            "game_info": str(game_info or "").strip(),
+            "dk_slate_eligible": True,
+            "slate_source": "draftkings_csv",
         }
 
         if player_id:
@@ -986,10 +1002,29 @@ def load_players():
         try:
             with open(ACTIVE_SLATE_PATH, "r", encoding="utf-8") as f:
                 active_players = json.load(f)
-            if isinstance(active_players, list) and len(active_players) >= 10:
-                return ensure_minimum_position_players(active_players)
+            if isinstance(active_players, list):
+                # An imported DraftKings slate is authoritative. Never replace it
+                # with sample data or reactivate trimmed/bench players.
+                if "apply_slate_starter_likelihood" in globals() and any(
+                    not str(player.get("starter_source", "")).strip()
+                    for player in active_players
+                    if isinstance(player, dict)
+                ):
+                    migrated = []
+                    for player in active_players:
+                        migrated_player = dict(player)
+                        migrated_player.setdefault("dk_slate_eligible", True)
+                        migrated_player.setdefault("slate_source", "draftkings_csv")
+                        migrated.append(migrated_player)
+                    return apply_slate_starter_likelihood(migrated)
+                return active_players
         except Exception:
-            pass
+            # Fail closed when an imported slate is corrupt. Sample players must
+            # never leak into a real contest slate.
+            return []
+
+    if not ALLOW_SAMPLE_SLATE:
+        return []
 
     ensure_sample_players_file()
 
@@ -1020,9 +1055,9 @@ def default_slate_metadata():
             "updated_by": "system",
         }
     return {
-        "slate_name": "MLB Sample Slate",
+        "slate_name": "MLB Sample Slate" if ALLOW_SAMPLE_SLATE else "No MLB Slate Loaded",
         "slate_date": today,
-        "slate_source": "sample_players",
+        "slate_source": "sample_players" if ALLOW_SAMPLE_SLATE else "no_slate_loaded",
         "updated_at": datetime.utcnow().isoformat() + "Z",
         "updated_by": "system",
     }
@@ -1042,7 +1077,7 @@ def load_slate_metadata():
     # Keep source truthful even if a slate was cleared or uploaded.
     meta["slate_source"] = current_slate_source() if "current_slate_source" in globals() else ("imported_or_edited_slate" if ACTIVE_SLATE_PATH.exists() else "sample_players")
     if not str(meta.get("slate_name", "")).strip():
-        meta["slate_name"] = "DraftKings MLB Slate" if ACTIVE_SLATE_PATH.exists() else "MLB Sample Slate"
+        meta["slate_name"] = "DraftKings MLB Slate" if ACTIVE_SLATE_PATH.exists() else ("MLB Sample Slate" if ALLOW_SAMPLE_SLATE else "No MLB Slate Loaded")
     if not str(meta.get("slate_date", "")).strip():
         meta["slate_date"] = datetime.now().strftime("%Y-%m-%d")
     return meta
@@ -1067,48 +1102,16 @@ def save_slate_metadata(slate_name=None, slate_date=None, updated_by="admin"):
 
 
 def ensure_minimum_position_players(players):
-    required_minimums = {
-        "P": 2,
-        "C": 1,
-        "1B": 1,
-        "2B": 1,
-        "3B": 1,
-        "SS": 1,
-        "OF": 3,
-    }
-
-    position_counts = {}
-
-    for p in players:
-        pos = normalize_position(p.get("position", ""))
-        if not p.get("active", True):
-            continue
-        position_counts[pos] = position_counts.get(pos, 0) + 1
-
-    failed = any(position_counts.get(pos, 0) < minimum for pos, minimum in required_minimums.items())
-
-    if failed:
-        repaired = []
-
-        for p in players:
-            if (
-                safe_int(p.get("salary", 0), 0) > 0
-                and normalize_position(p.get("position", "")) in ["P", "C", "1B", "2B", "3B", "SS", "OF"]
-            ):
-                p["active"] = True
-                if str(p.get("inactive_reason", "")).startswith("auto_"):
-                    p["inactive_reason"] = ""
-                repaired.append(p)
-
-        return repaired
-
+    # Retained for compatibility with older callers. The previous behavior
+    # reactivated every DK row when a position was thin, which could put bench
+    # bats and relief pitchers into generated lineups.
     return players
 
 
 def current_slate_source():
     if ACTIVE_SLATE_PATH.exists():
         return "imported_or_edited_slate"
-    return "sample_players"
+    return "sample_players" if ALLOW_SAMPLE_SLATE else "no_slate_loaded"
 
 
 @app.on_event("startup")
@@ -1131,8 +1134,8 @@ DATA_ENGINE_VERSION = "mlb_data_engine_v1_api_ready"
 DATA_ENGINE_SOURCES = {
     "mlb_stats_api": {
         "enabled": True,
-        "status": "fallback_ready",
-        "purpose": "schedule, probable pitchers, game logs, player history, parks",
+        "status": "connected",
+        "purpose": "official schedule, probable pitchers, and announced batting orders",
         "env_key": "MLB_STATS_API_KEY_NOT_REQUIRED",
     },
     "odds_api": {
@@ -1296,6 +1299,289 @@ def estimated_starter_status(player):
     return "unknown"
 
 
+def starter_probability_for_player(player):
+    explicit = player.get("starter_probability")
+    if explicit not in [None, ""]:
+        return max(0.0, min(1.0, safe_float(explicit, 0)))
+
+    status = str(player.get("starter_status", "")).strip().lower()
+    return {
+        "confirmed_starter": 1.0,
+        "confirmed_lineup": 1.0,
+        "probable_pitcher": 0.96,
+        "projected_probable_pitcher": 0.78,
+        "projected_starter": 0.72,
+        "likely_starter": 0.72,
+        "starter_risk": 0.48,
+        "pitcher_pool": 0.42,
+        "unknown": 0.35,
+        "bench_risk": 0.20,
+        "long_relief_risk": 0.12,
+        "confirmed_not_starting": 0.0,
+        "out": 0.0,
+    }.get(status, 0.35)
+
+
+def optimizer_starter_eligible(player):
+    """Only allow players from the DK slate who are confirmed or safely projected to start."""
+    if not bool(player.get("active", True)):
+        return False
+    if bool(player.get("manual_status_override", False)):
+        return True
+    if not ACTIVE_SLATE_PATH.exists():
+        # Keep the clearly labeled sample slate usable for local demos only.
+        return True
+    if player.get("dk_slate_eligible") is False:
+        return False
+
+    status = str(player.get("starter_status", "")).strip().lower()
+    source = str(player.get("starter_source", "")).strip().lower()
+    trusted_sources = {
+        "mlb_stats_confirmed_lineup",
+        "mlb_stats_probable_pitcher",
+        "dk_slate_likelihood",
+        "admin_confirmed",
+        "admin_override",
+    }
+    if source not in trusted_sources:
+        return False
+
+    probability = starter_probability_for_player(player)
+    position = normalize_position(player.get("position", ""))
+    if position == "P":
+        return status in {"probable_pitcher", "projected_probable_pitcher", "confirmed_starter"} and probability >= 0.65
+    return status in {"confirmed_starter", "confirmed_lineup", "projected_starter", "likely_starter"} and probability >= 0.65
+
+
+def _starter_likelihood_score(player):
+    projection = safe_float(player.get("projection", 0), 0)
+    salary = safe_int(player.get("salary", 0), 0)
+    ownership = safe_float(player.get("ownership", 0), 0)
+    return projection * 6.0 + salary / 180.0 + ownership * 0.35
+
+
+def apply_slate_starter_likelihood(players):
+    """
+    Conservative no-key fallback used immediately after a DK upload.
+    One pitcher and a likely nine-man batting order per team remain eligible.
+    Official probable pitchers/announced orders override this when refreshed.
+    """
+    prepared = [dict(player) for player in players]
+    by_team = {}
+    for player in prepared:
+        team = normalize_team(player.get("team", ""))
+        if team and team != "UNK":
+            by_team.setdefault(team, []).append(player)
+
+    for team_players in by_team.values():
+        pitchers = [p for p in team_players if normalize_position(p.get("position", "")) == "P"]
+        hitters = [p for p in team_players if normalize_position(p.get("position", "")) != "P"]
+
+        trusted_pitchers = [
+            p for p in pitchers
+            if str(p.get("starter_source", "")).startswith(("mlb_stats_", "admin_"))
+            and starter_probability_for_player(p) >= 0.65
+        ]
+        likely_pitchers = trusted_pitchers or sorted(pitchers, key=_starter_likelihood_score, reverse=True)[:1]
+        likely_pitcher_names = {p.get("name") for p in likely_pitchers}
+
+        for pitcher in pitchers:
+            if bool(pitcher.get("manual_status_override", False)):
+                pitcher["starter_source"] = "admin_override"
+                pitcher["starter_probability"] = 1.0 if pitcher.get("active", True) else 0.0
+                continue
+            if pitcher.get("name") in likely_pitcher_names:
+                if not str(pitcher.get("starter_source", "")).startswith(("mlb_stats_", "admin_")):
+                    pitcher["starter_status"] = "projected_probable_pitcher"
+                    pitcher["starter_source"] = "dk_slate_likelihood"
+                    pitcher["starter_probability"] = 0.78
+                pitcher["active"] = True
+                pitcher["inactive_reason"] = ""
+            else:
+                pitcher["starter_status"] = "long_relief_risk"
+                pitcher["starter_source"] = "dk_slate_likelihood"
+                pitcher["starter_probability"] = 0.12
+                pitcher["active"] = False
+                pitcher["inactive_reason"] = "not_probable_starting_pitcher"
+
+        confirmed_hitters = [
+            p for p in hitters
+            if str(p.get("starter_source", "")) in {"mlb_stats_confirmed_lineup", "admin_confirmed"}
+            and starter_probability_for_player(p) >= 0.65
+        ]
+        if confirmed_hitters:
+            likely_hitters = confirmed_hitters
+        else:
+            eligible_hitters = [
+                p for p in hitters
+                if str(p.get("injury_status", "")).lower() not in {"il", "out", "confirmed_out"}
+            ]
+            ranked = sorted(eligible_hitters, key=_starter_likelihood_score, reverse=True)
+            catchers = [p for p in ranked if normalize_position(p.get("position", "")) == "C"]
+            likely_hitters = catchers[:1]
+            likely_hitters += [p for p in ranked if p not in likely_hitters][: max(0, 9 - len(likely_hitters))]
+
+        likely_hitter_names = {p.get("name") for p in likely_hitters}
+        for rank, hitter in enumerate(sorted(likely_hitters, key=_starter_likelihood_score, reverse=True), start=1):
+            if bool(hitter.get("manual_status_override", False)):
+                hitter["starter_source"] = "admin_override"
+                hitter["starter_probability"] = 1.0 if hitter.get("active", True) else 0.0
+                continue
+            if not str(hitter.get("starter_source", "")).startswith(("mlb_stats_", "admin_")):
+                hitter["starter_status"] = "projected_starter"
+                hitter["starter_source"] = "dk_slate_likelihood"
+                hitter["starter_probability"] = round(max(0.68, 0.78 - (rank - 1) * 0.012), 3)
+            hitter["active"] = True
+            hitter["inactive_reason"] = ""
+
+        for hitter in hitters:
+            if hitter.get("name") in likely_hitter_names or bool(hitter.get("manual_status_override", False)):
+                continue
+            hitter["starter_status"] = "bench_risk"
+            hitter["starter_source"] = "dk_slate_likelihood"
+            hitter["starter_probability"] = 0.20
+            hitter["active"] = False
+            hitter["inactive_reason"] = "not_in_likely_starting_nine"
+
+    return prepared
+
+
+def fetch_mlb_stats_json(path, params=None, timeout=20):
+    query = urllib.parse.urlencode(params or {})
+    url = f"{MLB_STATS_API_BASE_URL}/{str(path).lstrip('/')}"
+    if query:
+        url = f"{url}?{query}"
+    request = urllib.request.Request(url, headers={"User-Agent": "DFS-Edge/1.0"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def load_mlb_starter_state():
+    try:
+        with open(MLB_STARTER_STATE_PATH, "r", encoding="utf-8") as file:
+            state = json.load(file)
+        return state if isinstance(state, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_mlb_starter_state(state):
+    with open(MLB_STARTER_STATE_PATH, "w", encoding="utf-8") as file:
+        json.dump(state, file, indent=2)
+
+
+def refresh_mlb_starters(players, slate_date):
+    refreshed = apply_slate_starter_likelihood(players)
+    slate_teams = {
+        normalize_team(player.get("team", ""))
+        for player in refreshed
+        if normalize_team(player.get("team", "")) != "UNK"
+    }
+    probable_by_team = {}
+    confirmed_by_team = {}
+    games_checked = 0
+    error = ""
+
+    try:
+        schedule = fetch_mlb_stats_json(
+            "schedule",
+            {"sportId": 1, "date": slate_date, "hydrate": "probablePitcher,team"},
+        )
+        games = [game for date in schedule.get("dates", []) for game in date.get("games", [])]
+        for game in games:
+            game_teams = {}
+            for side in ["away", "home"]:
+                side_data = game.get("teams", {}).get(side, {})
+                team_code = normalize_team(side_data.get("team", {}).get("abbreviation", ""))
+                game_teams[side] = team_code
+                probable_name = side_data.get("probablePitcher", {}).get("fullName", "")
+                if team_code in slate_teams and probable_name:
+                    probable_by_team.setdefault(team_code, set()).add(normalized_player_name(probable_name))
+
+            if not set(game_teams.values()).intersection(slate_teams):
+                continue
+            game_pk = game.get("gamePk")
+            if not game_pk:
+                continue
+            games_checked += 1
+            try:
+                boxscore = fetch_mlb_stats_json(f"game/{game_pk}/boxscore", timeout=12)
+            except Exception:
+                continue
+            for side in ["away", "home"]:
+                team_code = game_teams.get(side, "UNK")
+                side_box = boxscore.get("teams", {}).get(side, {})
+                batting_order = side_box.get("battingOrder", []) or []
+                if team_code not in slate_teams or not batting_order:
+                    continue
+                player_records = side_box.get("players", {}) or {}
+                order = {}
+                for spot, player_id in enumerate(batting_order[:9], start=1):
+                    record = player_records.get(f"ID{player_id}", {})
+                    full_name = record.get("person", {}).get("fullName", "")
+                    if full_name:
+                        order[normalized_player_name(full_name)] = spot
+                if order:
+                    confirmed_by_team[team_code] = order
+    except Exception as exc:
+        error = f"MLB starter service unavailable: {exc.__class__.__name__}"
+
+    probable_matches = 0
+    confirmed_matches = 0
+    for player in refreshed:
+        if bool(player.get("manual_status_override", False)):
+            continue
+        team = normalize_team(player.get("team", ""))
+        name_key = normalized_player_name(player.get("name", ""))
+        position = normalize_position(player.get("position", ""))
+        if position == "P" and team in probable_by_team:
+            if name_key in probable_by_team[team]:
+                player["starter_status"] = "probable_pitcher"
+                player["starter_source"] = "mlb_stats_probable_pitcher"
+                player["starter_probability"] = 0.98
+                player["active"] = True
+                player["inactive_reason"] = ""
+                probable_matches += 1
+            else:
+                player["starter_status"] = "confirmed_not_starting"
+                player["starter_source"] = "mlb_stats_probable_pitcher"
+                player["starter_probability"] = 0.0
+                player["active"] = False
+                player["inactive_reason"] = "not_listed_as_probable_pitcher"
+        elif position != "P" and team in confirmed_by_team:
+            spot = confirmed_by_team[team].get(name_key)
+            if spot:
+                player["starter_status"] = "confirmed_starter"
+                player["starter_source"] = "mlb_stats_confirmed_lineup"
+                player["starter_probability"] = 1.0
+                player["lineup_spot"] = spot
+                player["lineup_source"] = "mlb_stats_confirmed_lineup"
+                player["avg_at_bats"] = 4.5 if spot <= 2 else 4.2 if spot <= 5 else 3.8 if spot <= 7 else 3.4
+                player["active"] = True
+                player["inactive_reason"] = ""
+                confirmed_matches += 1
+            else:
+                player["starter_status"] = "confirmed_not_starting"
+                player["starter_source"] = "mlb_stats_confirmed_lineup"
+                player["starter_probability"] = 0.0
+                player["active"] = False
+                player["inactive_reason"] = "not_in_announced_batting_order"
+
+    state = {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "slate_date": slate_date,
+        "games_checked": games_checked,
+        "probable_pitcher_matches": probable_matches,
+        "confirmed_hitter_matches": confirmed_matches,
+        "teams_with_probable_pitchers": len(probable_by_team),
+        "teams_with_confirmed_lineups": len(confirmed_by_team),
+        "eligible_player_count": len([p for p in refreshed if optimizer_starter_eligible(p)]),
+        "error": error,
+    }
+    save_mlb_starter_state(state)
+    return refreshed, state
+
+
 def estimated_injury_status(player):
     bucket = stable_bucket_for_player(player, "injury", 100)
     if bucket >= 98:
@@ -1382,7 +1668,12 @@ def data_engine_for_player(player):
     position = normalize_position(player.get("position", ""))
     starter_status = player.get("starter_status") or estimated_starter_status(player)
     injury_status = player.get("injury_status") or estimated_injury_status(player)
-    line_abs = estimated_lineup_spot_and_abs(player)
+    estimated_line_abs = estimated_lineup_spot_and_abs(player)
+    line_abs = {
+        "lineup_spot": player.get("lineup_spot") if player.get("lineup_spot") not in [None, ""] else estimated_line_abs.get("lineup_spot"),
+        "avg_at_bats": player.get("avg_at_bats") if player.get("avg_at_bats") not in [None, ""] else estimated_line_abs.get("avg_at_bats"),
+        "projected_innings": player.get("projected_innings") if player.get("projected_innings") not in [None, ""] else estimated_line_abs.get("projected_innings"),
+    }
     park = data_engine_park_info(player)
     weather = estimated_weather_risk(player)
     bvp = estimated_bvp_rating(player)
@@ -1469,8 +1760,11 @@ def data_engine_for_player(player):
         "data_engine_version": DATA_ENGINE_VERSION,
         "data_confidence": confidence,
         "starter_status": starter_status,
+        "starter_probability": starter_probability_for_player({**player, "starter_status": starter_status}),
+        "starter_source": player.get("starter_source", "estimated_model"),
         "injury_status": injury_status,
         "lineup_spot": line_abs.get("lineup_spot"),
+        "lineup_source": player.get("lineup_source", "estimated_model"),
         "avg_at_bats": line_abs.get("avg_at_bats"),
         "projected_innings": line_abs.get("projected_innings"),
         "pull_risk": pull_risk,
@@ -1487,7 +1781,7 @@ def data_engine_for_player(player):
         "data_engine_reasons": reasons[:6],
         "auto_active_recommendation": auto_active_recommendation,
         "source_notes": [
-            "MVP estimates active. Plug SportsDataIO/Sportradar for confirmed injury/lineup data.",
+            "MLB Stats API supplies probable pitchers and announced batting orders when available.",
             "Odds/OpenWeather env keys can replace simulated totals/weather later.",
         ],
     }
@@ -1838,58 +2132,31 @@ def valid_optimizer_player(player):
     return (
         safe_int(player.get("salary", 0), 0) > 0
         and normalize_position(player.get("position", "")) in ["P", "C", "1B", "2B", "3B", "SS", "OF"]
+        and bool(player.get("active", True))
+        and optimizer_starter_eligible(player)
     )
 
 
 def build_optimizer_pool_with_fallback(players, locked_players=None, excluded_players=None):
     """
-    Production-safe pool builder.
-
-    1. Try the cleaned ACTIVE slate first.
-    2. If auto cleanup trimmed too hard and a position is missing, fall back to
-       the full uploaded DraftKings slate.
-    3. Still respect manual admin inactive/excluded players.
-
-    This fixes the recurring live error:
-    "Not enough players at each MLB position" after today's CSV upload.
+    Build only from active, starter-eligible players in the uploaded DK slate.
+    It intentionally fails closed if a position is thin; bench and relief
+    players are never reintroduced as an emergency fallback.
     """
     locked_players = locked_players or []
     excluded_players = excluded_players or []
     excluded_set = set(excluded_players)
 
-    all_valid = [
+    active_valid = [
         p for p in players
         if p.get("name") not in excluded_set
         and valid_optimizer_player(p)
-        and not is_manual_inactive_player(p)
     ]
-
-    active_valid = [p for p in all_valid if bool(p.get("active", True))]
-
-    # First attempt: cleaned active slate.
     optimized_pool, trim_report = trim_player_pool(active_valid, locked_players)
     trim_report["fallback_used"] = False
-    trim_report["pool_source"] = "active_cleaned_slate"
-
-    if has_required_mlb_positions(optimized_pool):
-        return optimized_pool, trim_report
-
-    # Second attempt: all valid uploaded DK rows, including auto-trimmed players.
-    fallback_pool, fallback_report = trim_player_pool(all_valid, locked_players)
-    fallback_report["fallback_used"] = True
-    fallback_report["pool_source"] = "full_uploaded_slate_after_auto_cleanup_fallback"
-    fallback_report["active_cleaned_pool_count"] = len(active_valid)
-    fallback_report["full_valid_pool_count"] = len(all_valid)
-
-    if has_required_mlb_positions(fallback_pool):
-        return fallback_pool, fallback_report
-
-    # Final attempt: do not trim at all. This is slower but prevents a dead slate.
-    all_valid_sorted = list(all_valid)
-    all_valid_sorted.sort(key=player_grade, reverse=True)
-    fallback_report["pool_source"] = "full_uploaded_slate_untrimmed_emergency_fallback"
-    fallback_report["untrimmed_count"] = len(all_valid_sorted)
-    return all_valid_sorted, fallback_report
+    trim_report["pool_source"] = "dk_slate_confirmed_or_likely_starters"
+    trim_report["starter_eligible_count"] = len(active_valid)
+    return optimized_pool, trim_report
 
 def validate_locks(players, locked_players, excluded_players):
     names = set(p["name"] for p in players)
@@ -1905,6 +2172,11 @@ def validate_locks(players, locked_players, excluded_players):
         return f"Player cannot be both locked and excluded: {', '.join(both)}"
     if len(locked_players) > 10:
         return "You cannot lock more than 10 players."
+
+    by_name = {p.get("name"): p for p in players}
+    ineligible_locked = [name for name in locked_players if name in by_name and not optimizer_starter_eligible(by_name[name])]
+    if ineligible_locked:
+        return f"Locked player is not confirmed or likely to start: {', '.join(ineligible_locked)}"
 
     return None
 
@@ -1973,6 +2245,12 @@ def pitcher_vs_hitter_conflict(lineup):
             return True
 
     return False
+
+
+def same_team_pitcher_conflict(lineup):
+    pitcher_teams = [normalize_team(player.get("team", "")) for player in get_pitchers(lineup)]
+    pitcher_teams = [team for team in pitcher_teams if team and team != "UNK"]
+    return len(pitcher_teams) != len(set(pitcher_teams))
 
 
 def stack_bonus_for_lineup(lineup, mode):
@@ -2141,6 +2419,12 @@ def lineup_passes_advanced_rules(
     max_players_per_team = min(max(max_players_per_team, 1), 8)
 
     if min_salary > 0 and salary < min_salary:
+        return False
+
+    if any(not optimizer_starter_eligible(player) for player in lineup):
+        return False
+
+    if same_team_pitcher_conflict(lineup):
         return False
 
     hitter_team_counts = count_team_players(lineup, hitters_only=True)
@@ -4153,8 +4437,10 @@ def simulate_contest_payload(request: ContestSimulationRequest):
 def data_engine_status():
     players = add_values(load_players())
     active_players = [p for p in players if bool(p.get("active", True))]
+    starter_eligible = [p for p in players if optimizer_starter_eligible(p)]
     review_players = [p for p in active_players if p.get("auto_active_recommendation") == "review"]
     inactive_recommended = [p for p in active_players if p.get("auto_active_recommendation") == "inactive"]
+    starter_state = load_mlb_starter_state()
 
     return {
         "success": True,
@@ -4162,10 +4448,16 @@ def data_engine_status():
         "sources": DATA_ENGINE_SOURCES,
         "player_count": len(players),
         "active_player_count": len(active_players),
+        "starter_eligible_count": len(starter_eligible),
+        "confirmed_hitter_count": len([p for p in starter_eligible if p.get("starter_source") == "mlb_stats_confirmed_lineup"]),
+        "probable_pitcher_count": len([p for p in starter_eligible if p.get("starter_source") == "mlb_stats_probable_pitcher"]),
+        "starter_refresh": starter_state,
         "review_count": len(review_players),
         "inactive_recommendation_count": len(inactive_recommended),
         "fields_added": [
             "starter_status",
+            "starter_probability",
+            "starter_source",
             "injury_status",
             "lineup_spot",
             "avg_at_bats",
@@ -4178,7 +4470,7 @@ def data_engine_status():
             "data_engine_boost",
             "auto_active_recommendation",
         ],
-        "note": "Currently uses deterministic MVP estimates unless paid/odds/weather API keys are connected.",
+        "note": "Optimizer eligibility uses only the uploaded DK slate plus confirmed MLB starters or conservative likely starters.",
     }
 
 
@@ -4187,15 +4479,28 @@ def enrich_active_slate(request: AdminPasswordRequest):
     if not is_admin_authorized(request):
         return {"success": False, "error": "Admin session expired. Log in as admin again."}
 
-    enriched_players, cleanup_stats = apply_auto_slate_cleanup(load_players(), respect_manual_overrides=True)
+    if not ACTIVE_SLATE_PATH.exists():
+        return {"success": False, "error": "Upload the DraftKings MLB contest slate before refreshing starters."}
+
+    enriched_players, _ = apply_auto_slate_cleanup(load_players(), respect_manual_overrides=True)
+    enriched_players = apply_slate_starter_likelihood(enriched_players)
+    slate_date = load_slate_metadata().get("slate_date") or datetime.now().strftime("%Y-%m-%d")
+    enriched_players, starter_state = refresh_mlb_starters(enriched_players, slate_date)
     save_active_slate(enriched_players)
+
+    cleanup_stats = {
+        "original_count": len(enriched_players),
+        "active_count": len([p for p in enriched_players if bool(p.get("active", True))]),
+        "inactive_count": len([p for p in enriched_players if not bool(p.get("active", True))]),
+        "starter_eligible_count": len([p for p in enriched_players if optimizer_starter_eligible(p)]),
+    }
 
     review_count = len([p for p in enriched_players if p.get("auto_active_recommendation") == "review"])
     inactive_recommendation_count = len([p for p in enriched_players if p.get("auto_active_recommendation") == "inactive"])
 
     return {
         "success": True,
-        "message": "Slate enriched and auto-cleaned with MLB Data Engine fields.",
+        "message": "MLB starters refreshed. Announced batting orders and probable pitchers are now applied where available.",
         "player_count": len(enriched_players),
         "active_player_count": cleanup_stats["active_count"],
         "inactive_player_count": cleanup_stats["inactive_count"],
@@ -4203,6 +4508,8 @@ def enrich_active_slate(request: AdminPasswordRequest):
         "review_count": review_count,
         "inactive_recommendation_count": inactive_recommendation_count,
         "version": DATA_ENGINE_VERSION,
+        "starter_refresh": starter_state,
+        "warning": starter_state.get("error", ""),
     }
 
 
@@ -4218,8 +4525,11 @@ def data_engine_player(player_name: str):
                 "player": player,
                 "data_engine": {
                     "starter_status": player.get("starter_status"),
+                    "starter_probability": player.get("starter_probability"),
+                    "starter_source": player.get("starter_source"),
                     "injury_status": player.get("injury_status"),
                     "lineup_spot": player.get("lineup_spot"),
+                    "lineup_source": player.get("lineup_source"),
                     "avg_at_bats": player.get("avg_at_bats"),
                     "projected_innings": player.get("projected_innings"),
                     "pull_risk": player.get("pull_risk"),
@@ -4907,7 +5217,8 @@ async def upload_dk_csv(
             "player_count": len(players),
         }
 
-    cleaned_players, cleanup_stats = apply_auto_slate_cleanup(players, respect_manual_overrides=False)
+    cleaned_players, _ = apply_auto_slate_cleanup(players, respect_manual_overrides=False)
+    cleaned_players = apply_slate_starter_likelihood(cleaned_players)
     save_active_slate(cleaned_players)
     current_meta = save_slate_metadata(
         slate_name=f"DraftKings MLB Slate - {datetime.now().strftime('%b %d')}",
@@ -4915,9 +5226,16 @@ async def upload_dk_csv(
         updated_by=ADMIN_EMAIL if is_admin_token(admin_token) else "admin",
     )
 
+    cleanup_stats = {
+        "original_count": len(players),
+        "active_count": len([p for p in cleaned_players if bool(p.get("active", True))]),
+        "inactive_count": len([p for p in cleaned_players if not bool(p.get("active", True))]),
+        "starter_eligible_count": len([p for p in cleaned_players if optimizer_starter_eligible(p)]),
+    }
+
     return {
         "success": True,
-        "message": "DraftKings MLB CSV uploaded, enriched, and auto-cleaned successfully.",
+        "message": "DraftKings MLB contest slate uploaded. Only conservative likely starters are eligible until the live starter refresh confirms them.",
         "player_count": len(cleaned_players),
         "slate_name": current_meta.get("slate_name", "DraftKings MLB Slate"),
         "slate_date": current_meta.get("slate_date", ""),
@@ -4926,7 +5244,7 @@ async def upload_dk_csv(
         "inactive_player_count": cleanup_stats["inactive_count"],
         "cleanup_stats": cleanup_stats,
         "ownership": "Estimated ownership applied when CSV ownership was missing.",
-        "auto_cleanup": "Auto cleanup applied safely. Risky players are reviewed, not hard-removed unless invalid/out.",
+        "auto_cleanup": "Bench-risk hitters and non-probable pitchers are excluded. Use Refresh MLB feeds near lock for announced lineups.",
     }
 
 
@@ -5248,9 +5566,9 @@ def optimize_multiple_lineups(
         request.max_exposure = 100
         request.max_same_players = 9
         request.min_salary = 0
-        request.max_players_per_team = 9
+        request.max_players_per_team = 5
         request.force_team_stack = False
-        request.avoid_pitcher_vs_hitter = False
+        request.avoid_pitcher_vs_hitter = True
         request.randomness = 0
         request.player_min_exposure = {}
         request.player_max_exposure = {}
@@ -5383,6 +5701,16 @@ def lineup_late_swap_alerts(lineup_data):
             "message": "This lineup includes a pitcher facing one of your hitters.",
             "players": [],
             "action": "review_correlation",
+        })
+
+    if same_team_pitcher_conflict(players):
+        alerts.append({
+            "severity": "high",
+            "type": "same_team_pitchers",
+            "title": "Two pitchers from the same team",
+            "message": "Only one probable starting pitcher per MLB team is allowed in DFS Edge lineups.",
+            "players": [p.get("name") for p in get_pitchers(players)],
+            "action": "repair_required",
         })
 
     total_salary = sum(safe_int(p.get("salary", 0)) for p in players)
@@ -6401,6 +6729,8 @@ def v2_lineup_position_valid(lineup):
         and v2_same_position_count(lineup, "3B") == 1
         and v2_same_position_count(lineup, "SS") == 1
         and v2_same_position_count(lineup, "OF") == 3
+        and not same_team_pitcher_conflict(lineup)
+        and all(optimizer_starter_eligible(player) for player in lineup)
     )
 
 
@@ -6415,6 +6745,14 @@ def v2_attempt_lineup(groups, stack_team=None, stack_size=4, secondary_team=None
             return False
         pos = normalize_position(p.get("position", ""))
         if v2_same_position_count(lineup, pos) >= v2_required_position_count(pos):
+            return False
+        if not optimizer_starter_eligible(p):
+            return False
+        if pos == "P" and any(
+            normalize_position(existing.get("position", "")) == "P"
+            and normalize_team(existing.get("team", "")) == normalize_team(p.get("team", ""))
+            for existing in lineup
+        ):
             return False
         lineup.append(p)
         used.add(p.get("name"))
@@ -7491,6 +7829,14 @@ def v4_can_add(lineup, player, max_players_per_team=5, avoid_pitcher_vs_hitter=T
     counts = v4_lineup_counts(lineup)
     if pos not in V4_REQUIRED_COUNTS or counts.get(pos, 0) >= V4_REQUIRED_COUNTS[pos]:
         return False
+    if not optimizer_starter_eligible(player):
+        return False
+    if pos == "P" and any(
+        normalize_position(existing.get("position", "")) == "P"
+        and normalize_team(existing.get("team", "")) == normalize_team(player.get("team", ""))
+        for existing in lineup
+    ):
+        return False
     team_counts = count_team_players(lineup, hitters_only=False)
     team = normalize_team(player.get("team", ""))
     if team_counts.get(team, 0) >= max_players_per_team:
@@ -7740,7 +8086,7 @@ def build_fast_multi_lineups_for_pro(request, count):
     pool, trim_report = build_optimizer_pool_with_fallback(raw_players, locked_players, excluded_players)
     pool = [p for p in add_values(pool) if p.get("name") not in excluded_names and valid_optimizer_player(p) and not is_manual_inactive_player(p)]
     if not has_required_mlb_positions(pool):
-        return [], "Not enough valid MLB players at each roster position after locks/excludes. Upload a full DK slate or relax exclusions.", trim_report, 0
+        return [], "Not enough confirmed or likely MLB starters at every roster position. Refresh MLB starters closer to lock, then try again.", trim_report, 0
 
     groups = {pos: [] for pos in V4_REQUIRED_COUNTS}
     for p in pool:
@@ -7830,7 +8176,7 @@ def build_fast_multi_lineups_for_pro(request, count):
                     candidates.append(data)
                     break
         if not candidates:
-            return [], "V4 optimizer could not build a valid lineup quickly. Clear locks/excludes, allow 4-5 players per team, or lower min salary.", {**trim_report, "builder_style": style, "v4_attempts": attempts}, attempts
+            return [], "The optimizer could not build a legal lineup from confirmed or likely starters. Refresh MLB starters, clear risky locks/excludes, or lower minimum salary.", {**trim_report, "builder_style": style, "v4_attempts": attempts}, attempts
 
     candidates.sort(key=lambda x: (safe_float(x.get("optimizer_score", 0), 0), safe_float(x.get("takedown_strength", 0), 0), safe_float(x.get("ceiling_score", 0), 0)), reverse=True)
     max_exposure = min(max(safe_int(getattr(request, "max_exposure", 65), 65), 20), 100)

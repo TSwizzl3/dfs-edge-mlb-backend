@@ -1,5 +1,7 @@
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import main
@@ -20,6 +22,103 @@ class FakeResponse:
 
 
 class AdminIngestionTests(unittest.TestCase):
+    def test_player_name_matching_ignores_accents(self):
+        self.assertEqual(
+            main.normalized_player_name("Cristopher Sánchez"),
+            main.normalized_player_name("Cristopher Sanchez"),
+        )
+
+    def test_imported_slate_never_falls_back_to_samples(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            active_path = Path(temp_dir) / "active.json"
+            sample_path = Path(temp_dir) / "sample.json"
+            active_path.write_text(json.dumps([{"name": "Only Slate Player"}]), encoding="utf-8")
+            sample_path.write_text(json.dumps([{"name": "Wrong Sample Player"}] * 10), encoding="utf-8")
+            with patch.object(main, "ACTIVE_SLATE_PATH", active_path), patch.object(main, "SAMPLE_PLAYERS_PATH", sample_path):
+                loaded = main.load_players()
+                self.assertEqual(len(loaded), 1)
+                self.assertEqual(loaded[0]["name"], "Only Slate Player")
+                self.assertNotEqual(loaded[0]["name"], "Wrong Sample Player")
+
+    def test_likely_starter_filter_keeps_one_pitcher_per_team(self):
+        players = [
+            {"name": "Likely Starter", "position": "P", "team": "PHI", "salary": 9500, "projection": 22, "active": True},
+            {"name": "Reliever", "position": "P", "team": "PHI", "salary": 4500, "projection": 6, "active": True},
+            {"name": "Other Starter", "position": "P", "team": "ATL", "salary": 9000, "projection": 20, "active": True},
+        ]
+        filtered = main.apply_slate_starter_likelihood(players)
+        active_pitchers = [p for p in filtered if p["active"]]
+        self.assertEqual({p["name"] for p in active_pitchers}, {"Likely Starter", "Other Starter"})
+        self.assertEqual(next(p for p in filtered if p["name"] == "Reliever")["inactive_reason"], "not_probable_starting_pitcher")
+
+    def test_optimizer_pool_never_reintroduces_inactive_bench_player(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            active_path = Path(temp_dir) / "active.json"
+            active_path.write_text("[]", encoding="utf-8")
+            players = [
+                {
+                    "name": "Confirmed Bat", "position": "OF", "team": "PHI", "salary": 5000,
+                    "active": True, "starter_status": "confirmed_starter", "starter_source": "mlb_stats_confirmed_lineup",
+                    "starter_probability": 1.0,
+                },
+                {
+                    "name": "Bench Bat", "position": "OF", "team": "PHI", "salary": 4000,
+                    "active": False, "starter_status": "bench_risk", "starter_source": "dk_slate_likelihood",
+                    "starter_probability": 0.2,
+                },
+            ]
+            with patch.object(main, "ACTIVE_SLATE_PATH", active_path):
+                pool, report = main.build_optimizer_pool_with_fallback(players)
+            self.assertEqual([p["name"] for p in pool], ["Confirmed Bat"])
+            self.assertFalse(report["fallback_used"])
+
+    def test_same_team_pitchers_are_rejected(self):
+        lineup = [
+            {"name": "P1", "position": "P", "team": "PHI"},
+            {"name": "P2", "position": "P", "team": "PHI"},
+        ]
+        self.assertTrue(main.same_team_pitcher_conflict(lineup))
+
+    def test_live_refresh_applies_probable_pitcher_and_confirmed_order(self):
+        schedule = {
+            "dates": [{"games": [{
+                "gamePk": 123,
+                "teams": {
+                    "away": {"team": {"abbreviation": "PHI"}, "probablePitcher": {"fullName": "Cristopher Sánchez"}},
+                    "home": {"team": {"abbreviation": "ATL"}, "probablePitcher": {"fullName": "Spencer Strider"}},
+                },
+            }]}]
+        }
+        boxscore = {
+            "teams": {
+                "away": {"battingOrder": [10], "players": {"ID10": {"person": {"fullName": "Trea Turner"}}}},
+                "home": {"battingOrder": [], "players": {}},
+            }
+        }
+        players = [
+            {"name": "Cristopher Sanchez", "position": "P", "team": "PHI", "salary": 9500, "projection": 21, "active": True},
+            {"name": "PHI Relief", "position": "P", "team": "PHI", "salary": 5000, "projection": 5, "active": True},
+            {"name": "Trea Turner", "position": "SS", "team": "PHI", "salary": 6000, "projection": 11, "active": True},
+            {"name": "Bench Bat", "position": "OF", "team": "PHI", "salary": 3000, "projection": 4, "active": True},
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            active_path = Path(temp_dir) / "active.json"
+            state_path = Path(temp_dir) / "state.json"
+            active_path.write_text("[]", encoding="utf-8")
+            with patch.object(main, "ACTIVE_SLATE_PATH", active_path), patch.object(main, "MLB_STARTER_STATE_PATH", state_path), patch.object(
+                main, "fetch_mlb_stats_json", side_effect=[schedule, boxscore]
+            ):
+                refreshed, state = main.refresh_mlb_starters(players, "2026-08-23")
+
+        by_name = {p["name"]: p for p in refreshed}
+        self.assertTrue(by_name["Cristopher Sanchez"]["active"])
+        self.assertEqual(by_name["Cristopher Sanchez"]["starter_source"], "mlb_stats_probable_pitcher")
+        self.assertFalse(by_name["PHI Relief"]["active"])
+        self.assertEqual(by_name["Trea Turner"]["lineup_spot"], 1)
+        self.assertFalse(by_name["Bench Bat"]["active"])
+        self.assertEqual(state["probable_pitcher_matches"], 1)
+        self.assertEqual(state["confirmed_hitter_matches"], 1)
+
     def test_central_admin_token_is_authorized(self):
         payload = {
             "success": True,
