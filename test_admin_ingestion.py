@@ -62,6 +62,30 @@ class AdminIngestionTests(unittest.TestCase):
             self.assertEqual(main.payout_for_rank(5, contest), 50.0)
             self.assertEqual(main.payout_for_rank(11, contest), 0.0)
 
+    def test_contest_library_payouts_override_legacy_table(self):
+        tiers = [
+            {"start_rank": 1, "end_rank": 1, "payout": 50000.0},
+            {"start_rank": 2, "end_rank": 100, "payout": 75.0},
+        ]
+        request = main.ContestSimulationRequest(
+            contest_profile_id="shared-mlb-contest",
+            contest_profile_name="MLB Featured GPP",
+            contest_size=5000,
+            paid_positions=1000,
+            payout_tiers=tiers,
+        )
+        with patch.object(main, "load_payout_table", return_value=[]):
+            contest = main.normalize_contest_request(request)
+        self.assertEqual(contest["payout_source"], "contest_library_exact_table")
+        self.assertEqual(contest["paid_positions"], 100)
+        self.assertEqual(contest["contest_profile_name"], "MLB Featured GPP")
+
+    def test_contest_ownership_overrides_are_applied(self):
+        lineup = {"lineup": [{"name": "Shohei Ohtani", "ownership": 15.0}]}
+        main.apply_contest_ownership_overrides([lineup], {"Shohei Ohtani": 31.2})
+        self.assertEqual(lineup["lineup"][0]["ownership"], 31.2)
+        self.assertEqual(lineup["lineup"][0]["ownership_source"], "contest_library")
+
     def test_real_results_produce_position_backtest(self):
         players = [
             {

@@ -223,6 +223,10 @@ class ContestSimulationRequest(BaseModel):
     payout_percent: float = 20.0
     max_entries: int = 1
     single_entry: bool = False
+    contest_profile_id: str = ""
+    contest_profile_name: str = ""
+    payout_tiers: list[dict] = Field(default_factory=list)
+    ownership_overrides: dict[str, float] = Field(default_factory=dict)
 
     count: int = 1
     locked_players: list[str] = Field(default_factory=list)
@@ -3159,7 +3163,7 @@ def normalize_contest_request(request: ContestSimulationRequest):
         payout_rate = max(0.01, min(payout_rate, 0.80))
         paid_positions = max(1, min(contest_size, round(contest_size * payout_rate)))
 
-    payout_table = load_payout_table()
+    payout_table = request.payout_tiers if isinstance(request.payout_tiers, list) and request.payout_tiers else load_payout_table()
     if payout_table:
         exact_paid_positions = max(safe_int(tier.get("end_rank"), 0) for tier in payout_table)
         if 0 < exact_paid_positions <= contest_size:
@@ -3179,8 +3183,28 @@ def normalize_contest_request(request: ContestSimulationRequest):
         "single_entry": single_entry,
         "total_entry_cost": round(entry_fee * max_entries, 2),
         "payout_table": payout_table,
-        "payout_source": "uploaded_exact_table" if payout_table else "estimated_curve",
+        "payout_source": "contest_library_exact_table" if request.payout_tiers else ("uploaded_exact_table" if payout_table else "estimated_curve"),
+        "contest_profile_id": request.contest_profile_id,
+        "contest_profile_name": request.contest_profile_name,
     }
+
+
+def apply_contest_ownership_overrides(lineups, overrides):
+    if not isinstance(overrides, dict) or not overrides:
+        return lineups
+    normalized = {
+        str(name).strip().lower(): min(100.0, max(0.0, safe_float(value, 0)))
+        for name, value in overrides.items()
+        if str(name).strip()
+    }
+    for item in lineups:
+        players = item.get("lineup", []) if isinstance(item, dict) else []
+        for player in players if isinstance(players, list) else []:
+            key = str(player.get("name", "")).strip().lower() if isinstance(player, dict) else ""
+            if key in normalized:
+                player["ownership"] = normalized[key]
+                player["ownership_source"] = "contest_library"
+    return lineups
 
 
 def select_player_from_group(group, used_names, offset=0):
@@ -4052,6 +4076,8 @@ def simulate_contest_payload(request: ContestSimulationRequest):
         lineups, error = build_fast_simulator_portfolio(request)
         if error:
             return {"success": False, "error": error, "results": [], "simulations": []}
+
+    apply_contest_ownership_overrides(lineups, request.ownership_overrides)
 
     contest = normalize_contest_request(request)
 
