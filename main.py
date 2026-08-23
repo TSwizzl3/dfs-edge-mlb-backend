@@ -13,8 +13,10 @@ import math
 import random
 import os
 import statistics
+import time
 import urllib.request
 import urllib.parse
+import urllib.error
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -53,9 +55,17 @@ PROJECTION_SNAPSHOT_PATH = BASE_DIR / "mlb_projection_snapshot.json"
 BACKTEST_LATEST_PATH = BASE_DIR / "mlb_backtest_latest.json"
 BACKTEST_HISTORY_PATH = BASE_DIR / "mlb_backtest_history.json"
 MLB_STARTER_STATE_PATH = BASE_DIR / "mlb_starter_state.json"
+MLB_ODDS_STATE_PATH = BASE_DIR / "mlb_odds_state.json"
+MLB_WEATHER_STATE_PATH = BASE_DIR / "mlb_weather_state.json"
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "zero2sixtygraphics@gmail.com").strip().lower()
 
 MLB_STATS_API_BASE_URL = "https://statsapi.mlb.com/api/v1"
+ODDS_API_BASE_URL = "https://api.the-odds-api.com/v4"
+ODDS_API_KEY = os.getenv("ODDS_API_KEY", "").strip()
+ODDS_API_REGIONS = os.getenv("ODDS_API_REGIONS", "us").strip() or "us"
+ODDS_API_BOOKMAKERS = os.getenv("ODDS_API_BOOKMAKERS", "").strip()
+MLB_WEATHER_CACHE_SECONDS = 30 * 60
+MLB_ODDS_CACHE_SECONDS = 3 * 60 * 60
 ALLOW_SAMPLE_SLATE = os.getenv("ALLOW_SAMPLE_SLATE", "false").strip().lower() in {"1", "true", "yes"}
 
 ROSTER_SLOTS = ["P", "P", "C", "1B", "2B", "3B", "SS", "OF", "OF", "OF"]
@@ -1130,7 +1140,7 @@ def startup_setup():
 # - Later, plug SportsDataIO/Sportradar/Odds/OpenWeather responses into these same fields.
 # - The optimizer reads these fields through add_values() and projection_boost_for_player().
 
-DATA_ENGINE_VERSION = "mlb_data_engine_v1_api_ready"
+DATA_ENGINE_VERSION = "mlb_data_engine_v2_live_odds_weather"
 
 DATA_ENGINE_SOURCES = {
     "mlb_stats_api": {
@@ -1140,16 +1150,16 @@ DATA_ENGINE_SOURCES = {
         "env_key": "MLB_STATS_API_KEY_NOT_REQUIRED",
     },
     "odds_api": {
-        "enabled": bool(os.getenv("ODDS_API_KEY")),
-        "status": "connected" if os.getenv("ODDS_API_KEY") else "not_configured",
+        "enabled": bool(ODDS_API_KEY),
+        "status": "connected" if ODDS_API_KEY else "not_configured",
         "purpose": "odds, game totals, implied team totals",
         "env_key": "ODDS_API_KEY",
     },
-    "openweather": {
-        "enabled": bool(os.getenv("OPENWEATHER_API_KEY")),
-        "status": "connected" if os.getenv("OPENWEATHER_API_KEY") else "not_configured",
-        "purpose": "weather, wind, delay risk",
-        "env_key": "OPENWEATHER_API_KEY",
+    "national_weather_service": {
+        "enabled": True,
+        "status": "connected",
+        "purpose": "free hourly stadium forecasts, wind, precipitation, and delay risk",
+        "env_key": "NO_KEY_REQUIRED",
     },
     "sportsdataio": {
         "enabled": bool(os.getenv("SPORTSDATAIO_API_KEY")),
@@ -1185,6 +1195,53 @@ PARK_FACTOR_OVERRIDES = {
     "SD": {"park_factor": "Neutral", "park_boost": 0.0},
     "MIA": {"park_factor": "Pitcher", "park_boost": -0.25},
     "OAK": {"park_factor": "Pitcher", "park_boost": -0.30},
+}
+
+MLB_TEAM_NAME_TO_CODE = {
+    "Arizona Diamondbacks": "ARI", "Athletics": "OAK", "Oakland Athletics": "OAK",
+    "Atlanta Braves": "ATL", "Baltimore Orioles": "BAL", "Boston Red Sox": "BOS",
+    "Chicago Cubs": "CHC", "Chicago White Sox": "CWS", "Cincinnati Reds": "CIN",
+    "Cleveland Guardians": "CLE", "Colorado Rockies": "COL", "Detroit Tigers": "DET",
+    "Houston Astros": "HOU", "Kansas City Royals": "KC", "Los Angeles Angels": "LAA",
+    "Los Angeles Dodgers": "LAD", "Miami Marlins": "MIA", "Milwaukee Brewers": "MIL",
+    "Minnesota Twins": "MIN", "New York Mets": "NYM", "New York Yankees": "NYY",
+    "Philadelphia Phillies": "PHI", "Pittsburgh Pirates": "PIT", "San Diego Padres": "SD",
+    "San Francisco Giants": "SF", "Seattle Mariners": "SEA", "St. Louis Cardinals": "STL",
+    "Tampa Bay Rays": "TB", "Texas Rangers": "TEX", "Toronto Blue Jays": "TOR",
+    "Washington Nationals": "WSH",
+}
+
+MLB_STADIUMS = {
+    "ARI": {"name": "Chase Field", "lat": 33.4455, "lon": -112.0667, "roof_controlled": True},
+    "ATL": {"name": "Truist Park", "lat": 33.8908, "lon": -84.4677},
+    "BAL": {"name": "Oriole Park", "lat": 39.2839, "lon": -76.6217},
+    "BOS": {"name": "Fenway Park", "lat": 42.3467, "lon": -71.0972},
+    "CHC": {"name": "Wrigley Field", "lat": 41.9484, "lon": -87.6553},
+    "CWS": {"name": "Rate Field", "lat": 41.8300, "lon": -87.6339},
+    "CIN": {"name": "Great American Ball Park", "lat": 39.0979, "lon": -84.5082},
+    "CLE": {"name": "Progressive Field", "lat": 41.4962, "lon": -81.6852},
+    "COL": {"name": "Coors Field", "lat": 39.7559, "lon": -104.9942},
+    "DET": {"name": "Comerica Park", "lat": 42.3390, "lon": -83.0485},
+    "HOU": {"name": "Daikin Park", "lat": 29.7573, "lon": -95.3555, "roof_controlled": True},
+    "KC": {"name": "Kauffman Stadium", "lat": 39.0517, "lon": -94.4803},
+    "LAA": {"name": "Angel Stadium", "lat": 33.8003, "lon": -117.8827},
+    "LAD": {"name": "Dodger Stadium", "lat": 34.0739, "lon": -118.2400},
+    "MIA": {"name": "loanDepot park", "lat": 25.7781, "lon": -80.2197, "roof_controlled": True},
+    "MIL": {"name": "American Family Field", "lat": 43.0280, "lon": -87.9712, "roof_controlled": True},
+    "MIN": {"name": "Target Field", "lat": 44.9817, "lon": -93.2776},
+    "NYM": {"name": "Citi Field", "lat": 40.7571, "lon": -73.8458},
+    "NYY": {"name": "Yankee Stadium", "lat": 40.8296, "lon": -73.9262},
+    "OAK": {"name": "Sutter Health Park", "lat": 38.5802, "lon": -121.5139},
+    "PHI": {"name": "Citizens Bank Park", "lat": 39.9061, "lon": -75.1665},
+    "PIT": {"name": "PNC Park", "lat": 40.4469, "lon": -80.0057},
+    "SD": {"name": "Petco Park", "lat": 32.7073, "lon": -117.1573},
+    "SEA": {"name": "T-Mobile Park", "lat": 47.5914, "lon": -122.3325, "roof_controlled": True},
+    "SF": {"name": "Oracle Park", "lat": 37.7786, "lon": -122.3893},
+    "STL": {"name": "Busch Stadium", "lat": 38.6226, "lon": -90.1928},
+    "TB": {"name": "Steinbrenner Field", "lat": 27.9801, "lon": -82.5068},
+    "TEX": {"name": "Globe Life Field", "lat": 32.7473, "lon": -97.0847, "roof_controlled": True},
+    "TOR": {"name": "Rogers Centre", "lat": 43.6414, "lon": -79.3894, "roof_controlled": True},
+    "WSH": {"name": "Nationals Park", "lat": 38.8730, "lon": -77.0074},
 }
 
 
@@ -1226,8 +1283,13 @@ def vegas_environment_for_player(player):
     position = normalize_position(player.get("position", ""))
     team = normalize_team(player.get("team", ""))
     opponent = normalize_team(player.get("opponent", ""))
-    team_total = estimated_team_total(team)
-    opponent_total = estimated_team_total(opponent) if opponent and opponent != "UNK" else 4.4
+    has_live_odds = bool(player.get("odds_source")) and safe_float(player.get("team_total"), 0) > 0
+    if has_live_odds:
+        team_total = safe_float(player.get("team_total"), 4.4)
+        opponent_total = safe_float(player.get("opponent_total"), 4.4)
+    else:
+        team_total = estimated_team_total(team)
+        opponent_total = estimated_team_total(opponent) if opponent and opponent != "UNK" else 4.4
 
     if position == "P":
         boost = max(-0.85, min(1.25, (4.4 - opponent_total) * 0.65))
@@ -1244,6 +1306,7 @@ def vegas_environment_for_player(player):
         "matchup_rating": matchup_rating,
         "vegas_boost": round(boost, 2),
         "environment_note": environment_note,
+        "vegas_source": player.get("odds_source", "DFS Edge estimate"),
     }
 
 
@@ -1256,7 +1319,9 @@ def lineup_stack_team_total(lineup):
     team = stack.get("team", "")
     if not team:
         return 0.0
-    return estimated_team_total(team)
+    stack_players = [player for player in lineup if normalize_team(player.get("team", "")) == team]
+    live_totals = [safe_float(player.get("team_total"), 0) for player in stack_players if player.get("odds_source")]
+    return round(max(live_totals), 2) if live_totals else estimated_team_total(team)
 
 
 def data_engine_park_info(player):
@@ -1455,6 +1520,319 @@ def fetch_mlb_stats_json(path, params=None, timeout=20):
     request = urllib.request.Request(url, headers={"User-Agent": "DFS-Edge/1.0"})
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def load_mlb_data_state(path):
+    try:
+        with open(path, "r", encoding="utf-8") as file:
+            payload = json.load(file)
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_mlb_data_state(path, payload):
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump(payload, file, indent=2)
+
+
+def odds_api_get(path, params=None, timeout=30):
+    if not ODDS_API_KEY:
+        raise RuntimeError("The Odds API key is not configured on the MLB backend.")
+    query = dict(params or {})
+    query["apiKey"] = ODDS_API_KEY
+    url = f"{ODDS_API_BASE_URL}/{str(path).lstrip('/')}?{urllib.parse.urlencode(query)}"
+    request = urllib.request.Request(url, headers={"User-Agent": "DFS-Edge-MLB/2.0"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+        usage = {
+            "requests_remaining": safe_int(response.headers.get("x-requests-remaining"), -1),
+            "requests_used": safe_int(response.headers.get("x-requests-used"), -1),
+            "last_request_cost": safe_int(response.headers.get("x-requests-last"), -1),
+        }
+    return payload, usage
+
+
+def _median(values, default=None):
+    clean = [safe_float(value, 0) for value in values if value not in [None, ""]]
+    return round(float(statistics.median(clean)), 3) if clean else default
+
+
+def parse_mlb_odds_consensus(events, slate_teams=None):
+    slate_teams = {normalize_team(team) for team in (slate_teams or [])}
+    teams = {}
+    games = []
+    for event in events or []:
+        home_name = str(event.get("home_team", ""))
+        away_name = str(event.get("away_team", ""))
+        home = normalize_team(MLB_TEAM_NAME_TO_CODE.get(home_name, ""))
+        away = normalize_team(MLB_TEAM_NAME_TO_CODE.get(away_name, ""))
+        if home == "UNK" or away == "UNK":
+            continue
+        if slate_teams and not {home, away}.issubset(slate_teams):
+            continue
+
+        totals = []
+        home_spreads = []
+        home_moneylines = []
+        away_moneylines = []
+        books = set()
+        for bookmaker in event.get("bookmakers", []) or []:
+            books.add(str(bookmaker.get("key") or bookmaker.get("title") or "book"))
+            for market in bookmaker.get("markets", []) or []:
+                key = str(market.get("key", ""))
+                outcomes = market.get("outcomes", []) or []
+                if key == "totals":
+                    for outcome in outcomes:
+                        if str(outcome.get("name", "")).lower() == "over" and outcome.get("point") is not None:
+                            totals.append(outcome.get("point"))
+                elif key == "spreads":
+                    for outcome in outcomes:
+                        if str(outcome.get("name", "")) == home_name and outcome.get("point") is not None:
+                            home_spreads.append(outcome.get("point"))
+                elif key == "h2h":
+                    for outcome in outcomes:
+                        if str(outcome.get("name", "")) == home_name:
+                            home_moneylines.append(outcome.get("price"))
+                        elif str(outcome.get("name", "")) == away_name:
+                            away_moneylines.append(outcome.get("price"))
+
+        game_total = _median(totals)
+        home_spread = _median(home_spreads, 0.0)
+        if game_total is None:
+            continue
+        home_total = round(game_total / 2.0 - safe_float(home_spread, 0) / 2.0, 2)
+        away_total = round(game_total - home_total, 2)
+        game = {
+            "event_id": event.get("id"), "commence_time": event.get("commence_time"),
+            "home_team": home, "away_team": away, "game_total": round(game_total, 2),
+            "home_spread": round(safe_float(home_spread, 0), 2),
+            "home_implied_total": home_total, "away_implied_total": away_total,
+            "home_moneyline": _median(home_moneylines), "away_moneyline": _median(away_moneylines),
+            "bookmaker_count": len(books),
+        }
+        games.append(game)
+        teams[home] = {
+            "team_total": home_total, "opponent_total": away_total, "game_total": round(game_total, 2),
+            "spread": round(safe_float(home_spread, 0), 2), "moneyline": game["home_moneyline"],
+            "opponent": away, "home_team": home, "odds_bookmaker_count": len(books),
+        }
+        teams[away] = {
+            "team_total": away_total, "opponent_total": home_total, "game_total": round(game_total, 2),
+            "spread": round(-safe_float(home_spread, 0), 2), "moneyline": game["away_moneyline"],
+            "opponent": home, "home_team": home, "odds_bookmaker_count": len(books),
+        }
+    return teams, games
+
+
+def apply_mlb_odds(players, state):
+    teams = state.get("teams", {}) if isinstance(state, dict) else {}
+    merged = []
+    for raw in players:
+        player = dict(raw)
+        market = teams.get(normalize_team(player.get("team", "")))
+        if market:
+            player.update(market)
+            player["odds_source"] = "The Odds API consensus"
+            player["odds_updated_at"] = state.get("fetched_at")
+        merged.append(player)
+    return merged
+
+
+def refresh_mlb_odds(players, force=False):
+    current = load_mlb_data_state(MLB_ODDS_STATE_PATH)
+    fetched_at_unix = safe_int(current.get("fetched_at_unix"), 0)
+    if not force and current and fetched_at_unix and time.time() - fetched_at_unix < MLB_ODDS_CACHE_SECONDS:
+        return apply_mlb_odds(players, current), {"success": True, "cached": True, **current}
+    if not ODDS_API_KEY:
+        return players, {
+            "success": False, "configured": False,
+            "error": "ODDS_API_KEY is not configured on the MLB backend.",
+        }
+
+    params = {
+        "regions": ODDS_API_REGIONS, "markets": "h2h,spreads,totals",
+        "oddsFormat": "american", "dateFormat": "iso",
+    }
+    if ODDS_API_BOOKMAKERS:
+        params["bookmakers"] = ODDS_API_BOOKMAKERS
+        params.pop("regions", None)
+    events, usage = odds_api_get("sports/baseball_mlb/odds", params)
+    slate_teams = {normalize_team(player.get("team", "")) for player in players}
+    teams, games = parse_mlb_odds_consensus(events, slate_teams)
+    state = {
+        "provider": "The Odds API", "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "fetched_at_unix": int(time.time()), "configured": True,
+        "event_count": len(games), "team_count": len(teams), "teams": teams, "games": games,
+        "usage": usage,
+    }
+    save_mlb_data_state(MLB_ODDS_STATE_PATH, state)
+    return apply_mlb_odds(players, state), {"success": True, "cached": False, **state}
+
+
+def _parse_wind_mph(value):
+    numbers = [int(number) for number in re.findall(r"\d+", str(value or ""))]
+    return max(numbers) if numbers else 0
+
+
+def _mlb_weather_risk(wind_mph, precipitation, forecast):
+    text = str(forecast or "").lower()
+    if wind_mph >= 20 or precipitation >= 65 or any(word in text for word in ["thunder", "hail", "tornado"]):
+        return "High"
+    if wind_mph >= 14 or precipitation >= 35 or any(word in text for word in ["rain", "showers", "storm"]):
+        return "Watch"
+    return "Low"
+
+
+def _fetch_mlb_stadium_forecast(home_team, game_time):
+    stadium = MLB_STADIUMS.get(home_team)
+    if not stadium:
+        return home_team, None
+    if stadium.get("roof_controlled"):
+        return home_team, {
+            "stadium": stadium.get("name"), "venue": "Roof controlled", "forecast": "Roof-controlled park",
+            "temperature_f": 72, "wind_mph": 0, "wind_direction": "None",
+            "precipitation_probability": 0, "weather_risk": "Low", "weather_boost": 0.0,
+            "source": "venue_type", "game_time": game_time,
+        }
+
+    headers = {
+        "User-Agent": "DFS-Edge-MLB/2.0 (https://www.dfsedgeapp.com)",
+        "Accept": "application/geo+json",
+    }
+    point_url = f"https://api.weather.gov/points/{stadium['lat']},{stadium['lon']}"
+    point_request = urllib.request.Request(point_url, headers=headers)
+    with urllib.request.urlopen(point_request, timeout=20) as response:
+        point_data = json.loads(response.read().decode("utf-8"))
+    hourly_url = point_data.get("properties", {}).get("forecastHourly")
+    if not hourly_url:
+        return home_team, None
+    hourly_request = urllib.request.Request(hourly_url, headers=headers)
+    with urllib.request.urlopen(hourly_request, timeout=20) as response:
+        hourly = json.loads(response.read().decode("utf-8"))
+    periods = hourly.get("properties", {}).get("periods", []) or []
+    parsed_periods = []
+    for period in periods:
+        try:
+            parsed_periods.append((datetime.fromisoformat(str(period.get("startTime"))), period))
+        except (TypeError, ValueError):
+            continue
+    try:
+        target_time = datetime.fromisoformat(str(game_time).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        target_time = None
+    if not parsed_periods:
+        return home_team, None
+    if target_time and target_time > max(item[0] for item in parsed_periods):
+        return home_team, {
+            "stadium": stadium.get("name"), "venue": "Outdoor", "forecast": "Forecast available closer to game time",
+            "temperature_f": None, "wind_mph": 0, "wind_direction": None,
+            "precipitation_probability": 0, "weather_risk": "Pending", "weather_boost": 0.0,
+            "source": "National Weather Service", "game_time": game_time,
+        }
+    period = min(parsed_periods, key=lambda item: abs((item[0] - target_time).total_seconds()))[1] if target_time else parsed_periods[0][1]
+    wind_mph = _parse_wind_mph(period.get("windSpeed"))
+    precipitation = safe_int((period.get("probabilityOfPrecipitation") or {}).get("value"), 0)
+    forecast = period.get("shortForecast", "Forecast available")
+    risk = _mlb_weather_risk(wind_mph, precipitation, forecast)
+    temperature = safe_int(period.get("temperature"), 0)
+    boost = -1.10 if risk == "High" else -0.35 if risk == "Watch" else 0.15 if temperature >= 80 and wind_mph < 14 else 0.0
+    return home_team, {
+        "stadium": stadium.get("name"), "venue": "Outdoor", "forecast": forecast,
+        "temperature_f": temperature or None, "wind_mph": wind_mph,
+        "wind_direction": period.get("windDirection"), "precipitation_probability": precipitation,
+        "weather_risk": risk, "weather_boost": boost,
+        "forecast_time": period.get("startTime"), "source": "National Weather Service", "game_time": game_time,
+    }
+
+
+def apply_mlb_weather(players, state):
+    forecasts = state.get("forecasts", {}) if isinstance(state, dict) else {}
+    team_to_home = state.get("team_to_home", {}) if isinstance(state, dict) else {}
+    merged = []
+    for raw in players:
+        player = dict(raw)
+        team = normalize_team(player.get("team", ""))
+        forecast = forecasts.get(team_to_home.get(team, ""))
+        if forecast:
+            player.update({
+                "stadium": forecast.get("stadium"), "venue": forecast.get("venue"),
+                "weather": forecast.get("forecast"), "temperature_f": forecast.get("temperature_f"),
+                "wind_mph": forecast.get("wind_mph", 0), "wind_direction": forecast.get("wind_direction"),
+                "precipitation_probability": forecast.get("precipitation_probability", 0),
+                "weather_risk": forecast.get("weather_risk", "Low"),
+                "weather_boost": forecast.get("weather_boost", 0),
+                "weather_source": forecast.get("source"), "weather_updated_at": state.get("fetched_at"),
+            })
+        merged.append(player)
+    return merged
+
+
+def refresh_mlb_weather(players, slate_date, force=False):
+    current = load_mlb_data_state(MLB_WEATHER_STATE_PATH)
+    fetched_at_unix = safe_int(current.get("fetched_at_unix"), 0)
+    if not force and current.get("slate_date") == slate_date and fetched_at_unix and time.time() - fetched_at_unix < MLB_WEATHER_CACHE_SECONDS:
+        return apply_mlb_weather(players, current), {"success": True, "cached": True, **current}
+
+    schedule = fetch_mlb_stats_json("schedule", {"sportId": 1, "date": slate_date, "hydrate": "team"})
+    slate_teams = {normalize_team(player.get("team", "")) for player in players}
+    game_times = {}
+    team_to_home = {}
+    for date in schedule.get("dates", []) or []:
+        for game in date.get("games", []) or []:
+            home = normalize_team(game.get("teams", {}).get("home", {}).get("team", {}).get("abbreviation", ""))
+            away = normalize_team(game.get("teams", {}).get("away", {}).get("team", {}).get("abbreviation", ""))
+            if not home or home == "UNK" or not {home, away}.intersection(slate_teams):
+                continue
+            game_times[home] = game.get("gameDate")
+            team_to_home[home] = home
+            team_to_home[away] = home
+
+    forecasts = {}
+    errors = {}
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(game_times)))) as executor:
+        futures = {executor.submit(_fetch_mlb_stadium_forecast, home, game_time): home for home, game_time in game_times.items()}
+        for future in as_completed(futures):
+            home = futures[future]
+            try:
+                fetched_home, forecast = future.result()
+                if forecast:
+                    forecasts[fetched_home] = forecast
+            except Exception as exc:
+                errors[home] = exc.__class__.__name__
+
+    state = {
+        "provider": "National Weather Service", "source_url": "https://api.weather.gov",
+        "slate_date": slate_date, "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "fetched_at_unix": int(time.time()), "stadium_count": len(forecasts),
+        "outdoor_count": len([item for item in forecasts.values() if item.get("venue") == "Outdoor"]),
+        "roof_controlled_count": len([item for item in forecasts.values() if item.get("venue") == "Roof controlled"]),
+        "high_risk_count": len([item for item in forecasts.values() if item.get("weather_risk") == "High"]),
+        "watch_count": len([item for item in forecasts.values() if item.get("weather_risk") == "Watch"]),
+        "team_to_home": team_to_home, "forecasts": forecasts, "errors": errors,
+    }
+    save_mlb_data_state(MLB_WEATHER_STATE_PATH, state)
+    return apply_mlb_weather(players, state), {"success": True, "cached": False, **state}
+
+
+def mlb_feed_summary(state, configured=True):
+    state = state if isinstance(state, dict) else {}
+    fetched_at_unix = safe_int(state.get("fetched_at_unix"), 0)
+    age_minutes = round(max(0, time.time() - fetched_at_unix) / 60, 1) if fetched_at_unix else None
+    return {
+        "configured": configured,
+        "status": "connected" if state else ("ready" if configured else "not_configured"),
+        "provider": state.get("provider"),
+        "fetched_at": state.get("fetched_at"),
+        "age_minutes": age_minutes,
+        "event_count": state.get("event_count"),
+        "team_count": state.get("team_count"),
+        "stadium_count": state.get("stadium_count"),
+        "high_risk_count": state.get("high_risk_count"),
+        "watch_count": state.get("watch_count"),
+        "usage": state.get("usage"),
+        "errors": state.get("errors", {}),
+    }
 
 
 def fetch_mlb_roster_statuses(team_ids, slate_date):
@@ -1739,7 +2117,17 @@ def data_engine_for_player(player):
         "projected_innings": player.get("projected_innings") if player.get("projected_innings") not in [None, ""] else estimated_line_abs.get("projected_innings"),
     }
     park = data_engine_park_info(player)
-    weather = estimated_weather_risk(player)
+    if player.get("weather_source"):
+        live_weather_boost = safe_float(player.get("weather_boost"), 0)
+        if position == "P" and live_weather_boost > 0:
+            live_weather_boost *= -1
+        weather = {
+            "weather_risk": player.get("weather_risk", "Low"),
+            "weather_boost": round(live_weather_boost, 2),
+            "weather_note": player.get("weather") or f"Weather risk: {player.get('weather_risk', 'Low')}",
+        }
+    else:
+        weather = estimated_weather_risk(player)
     bvp = estimated_bvp_rating(player)
     trend_score = safe_float(player.get("trend_score", 0), 0)
     if trend_score <= 0:
@@ -1845,8 +2233,9 @@ def data_engine_for_player(player):
         "data_engine_reasons": reasons[:6],
         "auto_active_recommendation": auto_active_recommendation,
         "source_notes": [
-            "MLB Stats API supplies probable pitchers and announced batting orders when available.",
-            "Odds/OpenWeather env keys can replace simulated totals/weather later.",
+            "MLB Stats API supplies official roster status, probable pitchers, and announced batting orders.",
+            "The Odds API supplies consensus game lines and implied team totals when configured.",
+            "The National Weather Service supplies stadium forecasts for outdoor parks.",
         ],
     }
 
@@ -4506,6 +4895,8 @@ def data_engine_status():
     review_players = [p for p in active_players if p.get("auto_active_recommendation") == "review"]
     inactive_recommended = [p for p in active_players if p.get("auto_active_recommendation") == "inactive"]
     starter_state = load_mlb_starter_state()
+    odds_state = load_mlb_data_state(MLB_ODDS_STATE_PATH)
+    weather_state = load_mlb_data_state(MLB_WEATHER_STATE_PATH)
 
     return {
         "success": True,
@@ -4518,6 +4909,8 @@ def data_engine_status():
         "probable_pitcher_count": len([p for p in starter_eligible if p.get("starter_source") == "mlb_stats_probable_pitcher"]),
         "official_roster_filter": "mlb_40_man_active_status",
         "starter_refresh": starter_state,
+        "odds_feed": mlb_feed_summary(odds_state, configured=bool(ODDS_API_KEY)),
+        "weather_feed": mlb_feed_summary(weather_state, configured=True),
         "review_count": len(review_players),
         "inactive_recommendation_count": len(inactive_recommended),
         "fields_added": [
@@ -4531,12 +4924,20 @@ def data_engine_status():
             "pull_risk",
             "park_factor",
             "weather_risk",
+            "temperature_f",
+            "wind_mph",
+            "precipitation_probability",
+            "team_total",
+            "opponent_total",
+            "game_total",
+            "spread",
+            "moneyline",
             "batter_vs_pitcher",
             "trend_score",
             "data_engine_boost",
             "auto_active_recommendation",
         ],
-        "note": "Optimizer eligibility uses only the uploaded DK slate plus confirmed MLB starters or conservative likely starters.",
+        "note": "Optimizer eligibility uses only the uploaded DK slate plus official MLB status. Odds and weather are blended into projections when their feeds are available.",
     }
 
 
@@ -4552,6 +4953,15 @@ def enrich_active_slate(request: AdminPasswordRequest):
     enriched_players = apply_slate_starter_likelihood(enriched_players)
     slate_date = load_slate_metadata().get("slate_date") or datetime.now().strftime("%Y-%m-%d")
     enriched_players, starter_state = refresh_mlb_starters(enriched_players, slate_date)
+    try:
+        enriched_players, odds_state = refresh_mlb_odds(enriched_players, force=True)
+    except Exception as exc:
+        odds_state = {"success": False, "configured": bool(ODDS_API_KEY), "error": f"Odds refresh unavailable: {exc.__class__.__name__}"}
+    try:
+        enriched_players, weather_state = refresh_mlb_weather(enriched_players, slate_date, force=True)
+    except Exception as exc:
+        weather_state = {"success": False, "configured": True, "error": f"Weather refresh unavailable: {exc.__class__.__name__}"}
+    enriched_players = add_values(enriched_players)
     save_active_slate(enriched_players)
 
     cleanup_stats = {
@@ -4566,7 +4976,7 @@ def enrich_active_slate(request: AdminPasswordRequest):
 
     return {
         "success": True,
-        "message": "MLB starters refreshed. Announced batting orders and probable pitchers are now applied where available.",
+        "message": "MLB starters, official roster status, consensus game lines, and stadium weather refreshed where available.",
         "player_count": len(enriched_players),
         "active_player_count": cleanup_stats["active_count"],
         "inactive_player_count": cleanup_stats["inactive_count"],
@@ -4575,7 +4985,9 @@ def enrich_active_slate(request: AdminPasswordRequest):
         "inactive_recommendation_count": inactive_recommendation_count,
         "version": DATA_ENGINE_VERSION,
         "starter_refresh": starter_state,
-        "warning": starter_state.get("error", ""),
+        "odds_refresh": mlb_feed_summary(odds_state if odds_state.get("success") else {}, configured=bool(ODDS_API_KEY)),
+        "weather_refresh": mlb_feed_summary(weather_state if weather_state.get("success") else {}, configured=True),
+        "warnings": [warning for warning in [starter_state.get("error", ""), odds_state.get("error", ""), weather_state.get("error", "")] if warning],
     }
 
 

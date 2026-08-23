@@ -264,6 +264,69 @@ class AdminIngestionTests(unittest.TestCase):
         self.assertEqual(result["by_position"]["P"]["sample_size"], 1)
         self.assertEqual(result["by_position"]["OF"]["sample_size"], 1)
 
+    def test_mlb_odds_consensus_creates_team_totals(self):
+        events = [{
+            "id": "game-1",
+            "home_team": "Philadelphia Phillies",
+            "away_team": "Atlanta Braves",
+            "bookmakers": [{
+                "key": "draftkings",
+                "markets": [
+                    {"key": "totals", "outcomes": [{"name": "Over", "point": 8.5}]},
+                    {"key": "spreads", "outcomes": [{"name": "Philadelphia Phillies", "point": -1.5}]},
+                    {"key": "h2h", "outcomes": [
+                        {"name": "Philadelphia Phillies", "price": -145},
+                        {"name": "Atlanta Braves", "price": 125},
+                    ]},
+                ],
+            }],
+        }]
+        teams, games = main.parse_mlb_odds_consensus(events, {"PHI", "ATL"})
+        self.assertEqual(len(games), 1)
+        self.assertEqual(teams["PHI"]["team_total"], 5.0)
+        self.assertEqual(teams["ATL"]["team_total"], 3.5)
+        self.assertEqual(teams["PHI"]["moneyline"], -145.0)
+
+    def test_live_odds_are_preserved_by_vegas_engine(self):
+        player = {
+            "name": "Live Odds Bat", "position": "OF", "team": "PHI", "opponent": "ATL",
+            "team_total": 5.25, "opponent_total": 3.75, "odds_source": "The Odds API consensus",
+        }
+        result = main.vegas_environment_for_player(player)
+        self.assertEqual(result["team_total"], 5.2)
+        self.assertEqual(result["opponent_total"], 3.8)
+        self.assertEqual(result["vegas_source"], "The Odds API consensus")
+
+    def test_live_weather_is_blended_into_data_engine(self):
+        player = {
+            "name": "Weather Bat", "position": "OF", "team": "PHI", "opponent": "ATL",
+            "salary": 4800, "projection": 9.0, "ownership": 10,
+            "weather_source": "National Weather Service", "weather_risk": "High",
+            "weather_boost": -1.1, "weather": "Thunderstorms likely",
+            "starter_status": "confirmed_starter", "injury_status": "active",
+        }
+        result = main.data_engine_for_player(player)
+        self.assertEqual(result["weather_risk"], "High")
+        self.assertEqual(result["weather_boost"], -1.1)
+        self.assertIn("Thunderstorms likely", result["data_engine_reasons"])
+
+    def test_weather_state_applies_to_both_teams(self):
+        players = [
+            {"name": "Phillies Bat", "team": "PHI"},
+            {"name": "Braves Bat", "team": "ATL"},
+        ]
+        state = {
+            "fetched_at": "2026-08-23T12:00:00+00:00",
+            "team_to_home": {"PHI": "PHI", "ATL": "PHI"},
+            "forecasts": {"PHI": {
+                "stadium": "Citizens Bank Park", "venue": "Outdoor", "forecast": "Rain showers",
+                "weather_risk": "Watch", "weather_boost": -0.35, "source": "National Weather Service",
+            }},
+        }
+        applied = main.apply_mlb_weather(players, state)
+        self.assertTrue(all(player["weather_risk"] == "Watch" for player in applied))
+        self.assertTrue(all(player["weather_source"] == "National Weather Service" for player in applied))
+
 
 if __name__ == "__main__":
     unittest.main()
