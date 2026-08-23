@@ -22,6 +22,15 @@ class FakeResponse:
 
 
 class AdminIngestionTests(unittest.TestCase):
+    def test_named_contest_slates_remain_isolated(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            main, "SLATE_LIBRARY_DIR", Path(directory)
+        ), patch.object(main, "supabase_service_key", return_value=""):
+            main.save_slate_library([{"name": "Early Batter"}], "2026-08-23-early", "Early")
+            main.save_slate_library([{"name": "Main Batter"}], "2026-08-23-main", "Main")
+            self.assertEqual(main.load_slate_record("2026-08-23-early")["players"][0]["name"], "Early Batter")
+            self.assertEqual(main.load_slate_record("2026-08-23-main")["players"][0]["name"], "Main Batter")
+
     def test_every_pro_lineup_count_from_one_through_twenty_is_supported(self):
         self.assertEqual(main.normalize_lineup_count(2), 2)
         self.assertEqual(main.normalize_lineup_count(13), 13)

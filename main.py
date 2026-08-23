@@ -48,6 +48,8 @@ BASE_DIR = DATA_DIR
 SAMPLE_PLAYERS_PATH = BASE_DIR / "sample_players.json"
 ACTIVE_SLATE_PATH = BASE_DIR / "active_slate.json"
 SLATE_METADATA_PATH = BASE_DIR / "slate_metadata.json"
+SLATE_LIBRARY_DIR = BASE_DIR / "slates"
+SLATE_LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
 MARKET_STATE_PATH = BASE_DIR / "market_state.json"
 USERS_PATH = BASE_DIR / "users.json"
 PAYOUT_TABLE_PATH = BASE_DIR / "mlb_payout_table.json"
@@ -58,6 +60,8 @@ MLB_STARTER_STATE_PATH = BASE_DIR / "mlb_starter_state.json"
 MLB_ODDS_STATE_PATH = BASE_DIR / "mlb_odds_state.json"
 MLB_WEATHER_STATE_PATH = BASE_DIR / "mlb_weather_state.json"
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "zero2sixtygraphics@gmail.com").strip().lower()
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://ewrhpkcbfypdwukicqkm.supabase.co").rstrip("/")
+SUPABASE_PUBLISHABLE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY", "sb_publishable_V4WT0FoJzMlliYHXwE5jPA_xFdKrQ3O").strip()
 
 MLB_STATS_API_BASE_URL = "https://statsapi.mlb.com/api/v1"
 ODDS_API_BASE_URL = "https://api.the-odds-api.com/v4"
@@ -138,6 +142,7 @@ BUILT_IN_SAMPLE_PLAYERS = [
 
 
 class OptimizeRequest(BaseModel):
+    slate_key: str = ""
     mode: str = "cash"
     locked_players: list[str] = Field(default_factory=list)
     excluded_players: list[str] = Field(default_factory=list)
@@ -151,6 +156,7 @@ class OptimizeRequest(BaseModel):
 
 
 class MultiOptimizeRequest(BaseModel):
+    slate_key: str = ""
     mode: str = "cash"
     count: int = 1
     max_exposure: int = 60
@@ -187,6 +193,7 @@ class UpdatePlayerStatusRequest(BaseModel):
 class AdminPasswordRequest(BaseModel):
     admin_password: str = ""
     auth_token: str = ""
+    slate_key: str = ""
 
 
 class SlateMetadataRequest(BaseModel):
@@ -223,6 +230,7 @@ class UpdateUserRoleRequest(BaseModel):
 
 
 class ContestSimulationRequest(BaseModel):
+    slate_key: str = ""
     lineups: list[dict] = Field(default_factory=list)
     mode: str = "gpp"
     contest_type: str = "large_gpp"
@@ -258,6 +266,7 @@ class ContestSimulationRequest(BaseModel):
 
 
 class AutoLineupBuilderRequest(BaseModel):
+    slate_key: str = ""
     contest_focus: str = "big_gpp"
     build_style: str = "balanced"
     count: int = 5
@@ -284,6 +293,7 @@ class LineupAlertsRequest(BaseModel):
 
 
 class LateSwapRequest(BaseModel):
+    slate_key: str = ""
     lineup: dict = Field(default_factory=dict)
     started_players: list[str] = Field(default_factory=list)
     locked_players: list[str] = Field(default_factory=list)
@@ -1008,7 +1018,151 @@ def ensure_sample_players_file():
             json.dump(BUILT_IN_SAMPLE_PLAYERS, f, indent=2)
 
 
-def load_players():
+def supabase_service_key():
+    return (
+        os.getenv("SUPABASE_SECRET_KEY", "").strip()
+        or os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+    )
+
+
+def normalize_slate_key(value="", name="", slate_date=""):
+    source = str(value or "").strip() or "-".join(
+        part for part in [str(slate_date or "").strip(), str(name or "").strip()] if part
+    )
+    key = re.sub(r"[^a-z0-9]+", "-", source.lower()).strip("-")
+    return (key or f"mlb-slate-{datetime.now().strftime('%Y%m%d-%H%M%S')}")[:120]
+
+
+def local_slate_record_path(slate_key):
+    digest = hashlib.sha256(str(slate_key).encode("utf-8")).hexdigest()[:24]
+    return SLATE_LIBRARY_DIR / f"{digest}.json"
+
+
+def save_slate_library(players, slate_key, name, slate_date="", slate_type="custom", auth_token=""):
+    resolved_key = normalize_slate_key(slate_key, name, slate_date)
+    record = {
+        "sport": "MLB",
+        "slate_key": resolved_key,
+        "name": str(name or "MLB Slate").strip()[:160],
+        "slate_date": str(slate_date or "").strip()[:10] or None,
+        "slate_type": str(slate_type or "custom").strip().lower(),
+        "players": players,
+        "player_count": len(players),
+        "is_active": True,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if record["slate_type"] not in {"full_day", "early", "afternoon", "main", "late", "showdown", "turbo", "custom"}:
+        record["slate_type"] = "custom"
+    try:
+        local_slate_record_path(resolved_key).write_text(json.dumps(record, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+    service_key = supabase_service_key()
+    bearer_key = service_key or str(auth_token or "").strip()
+    if bearer_key:
+        request = urllib.request.Request(
+            f"{SUPABASE_URL}/rest/v1/dfs_slates?on_conflict=sport,slate_key",
+            data=json.dumps(record).encode("utf-8"),
+            method="POST",
+            headers={
+                "apikey": service_key or SUPABASE_PUBLISHABLE_KEY,
+                "Authorization": f"Bearer {bearer_key}",
+                "Content-Type": "application/json",
+                "Prefer": "resolution=merge-duplicates,return=representation",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=35) as response:
+                rows = json.loads(response.read().decode("utf-8"))
+            if isinstance(rows, list) and rows:
+                record.update({key: value for key, value in rows[0].items() if key != "players"})
+                record["persisted"] = True
+        except Exception as exc:
+            record["persistence_warning"] = f"Supabase slate save unavailable: {exc.__class__.__name__}"
+    else:
+        record["persistence_warning"] = "Supabase service key is not configured; slate is stored on this backend only."
+    return record
+
+
+def load_slate_record(slate_key):
+    resolved_key = normalize_slate_key(slate_key)
+    service_key = supabase_service_key()
+    if service_key:
+        encoded_key = urllib.parse.quote(resolved_key, safe="")
+        request = urllib.request.Request(
+            f"{SUPABASE_URL}/rest/v1/dfs_slates?sport=eq.MLB&slate_key=eq.{encoded_key}&is_active=eq.true&select=*",
+            headers={"apikey": service_key, "Authorization": f"Bearer {service_key}", "Accept": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=25) as response:
+                rows = json.loads(response.read().decode("utf-8"))
+            if isinstance(rows, list) and rows and isinstance(rows[0].get("players"), list):
+                return rows[0]
+        except Exception:
+            pass
+    try:
+        record = json.loads(local_slate_record_path(resolved_key).read_text(encoding="utf-8"))
+        return record if isinstance(record, dict) and isinstance(record.get("players"), list) else None
+    except Exception:
+        return None
+
+
+def list_slate_library():
+    records = {}
+    service_key = supabase_service_key()
+    if service_key:
+        request = urllib.request.Request(
+            f"{SUPABASE_URL}/rest/v1/dfs_slates?sport=eq.MLB&is_active=eq.true&select=id,sport,slate_key,name,slate_date,slate_type,player_count,is_active,updated_at&order=slate_date.desc.nullslast,name.asc",
+            headers={"apikey": service_key, "Authorization": f"Bearer {service_key}", "Accept": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=25) as response:
+                rows = json.loads(response.read().decode("utf-8"))
+            for row in rows if isinstance(rows, list) else []:
+                records[str(row.get("slate_key", ""))] = row
+        except Exception:
+            pass
+    try:
+        for path in SLATE_LIBRARY_DIR.glob("*.json"):
+            row = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(row, dict) and row.get("is_active", True):
+                summary = {key: value for key, value in row.items() if key != "players"}
+                records.setdefault(str(row.get("slate_key", "")), summary)
+    except Exception:
+        pass
+    ordered = sorted(
+        [row for key, row in records.items() if key],
+        key=lambda row: (str(row.get("slate_date") or ""), str(row.get("name") or "")),
+        reverse=True,
+    )
+    if not ordered and ACTIVE_SLATE_PATH.exists():
+        meta = load_slate_metadata()
+        ordered.append({
+            "id": None,
+            "sport": "MLB",
+            "slate_key": "current",
+            "name": meta.get("slate_name", "Current MLB Slate"),
+            "slate_date": meta.get("slate_date", ""),
+            "slate_type": meta.get("slate_type", "custom"),
+            "player_count": len(load_players()),
+            "is_active": True,
+            "updated_at": meta.get("updated_at", ""),
+        })
+    return ordered
+
+
+def load_players(slate_key=""):
+    requested_key = str(slate_key or "").strip()
+    if requested_key and requested_key != "current":
+        record = load_slate_record(requested_key)
+        if not record:
+            return []
+        library_players = record.get("players", [])
+        if isinstance(library_players, list):
+            return library_players
+        return []
+
     if ACTIVE_SLATE_PATH.exists():
         try:
             with open(ACTIVE_SLATE_PATH, "r", encoding="utf-8") as f:
@@ -1094,7 +1248,7 @@ def load_slate_metadata():
     return meta
 
 
-def save_slate_metadata(slate_name=None, slate_date=None, updated_by="admin"):
+def save_slate_metadata(slate_name=None, slate_date=None, updated_by="admin", slate_key=None, slate_type=None):
     meta = load_slate_metadata()
     if slate_name is not None:
         clean_name = str(slate_name).strip()
@@ -1104,6 +1258,12 @@ def save_slate_metadata(slate_name=None, slate_date=None, updated_by="admin"):
         clean_date = str(slate_date).strip()
         if clean_date:
             meta["slate_date"] = clean_date[:40]
+    if slate_key is not None:
+        meta["slate_key"] = normalize_slate_key(slate_key, meta.get("slate_name", ""), meta.get("slate_date", ""))
+    if slate_type is not None:
+        clean_type = str(slate_type).strip().lower()
+        if clean_type in {"full_day", "early", "afternoon", "main", "late", "showdown", "turbo", "custom"}:
+            meta["slate_type"] = clean_type
     meta["slate_source"] = current_slate_source() if "current_slate_source" in globals() else ("imported_or_edited_slate" if ACTIVE_SLATE_PATH.exists() else "sample_players")
     meta["updated_at"] = datetime.utcnow().isoformat() + "Z"
     meta["updated_by"] = updated_by or "admin"
@@ -3097,6 +3257,7 @@ def build_all_lineups(
     force_team_stack=False,
     avoid_pitcher_vs_hitter=True,
     randomness=0,
+    players=None,
 ):
     locked_players = locked_players or []
     excluded_players = excluded_players or []
@@ -3111,7 +3272,7 @@ def build_all_lineups(
     if force_bring_back is not None:
         avoid_pitcher_vs_hitter = bool(force_bring_back)
 
-    players = add_values(load_players())
+    players = add_values(players if players is not None else load_players())
 
     error = validate_locks(players, locked_players, excluded_players)
     if error:
@@ -4880,6 +5041,7 @@ def simulate_contest_payload(request: ContestSimulationRequest):
         "success": True,
         "contest_type": request.contest_type,
         "contest": contest,
+        "slate_key": request.slate_key or "current",
         "summary": summary,
         "results": results,
         "simulations": [item["simulation"] for item in results],
@@ -4946,6 +5108,19 @@ def enrich_active_slate(request: AdminPasswordRequest):
     if not is_admin_authorized(request):
         return {"success": False, "error": "Admin session expired. Log in as admin again."}
 
+    selected_record = load_slate_record(request.slate_key) if request.slate_key and request.slate_key != "current" else None
+    if request.slate_key and request.slate_key != "current" and not selected_record:
+        return {"success": False, "error": "The selected MLB salary slate could not be found."}
+    if selected_record:
+        save_active_slate(selected_record.get("players", []))
+        save_slate_metadata(
+            selected_record.get("name", "MLB Slate"),
+            selected_record.get("slate_date", ""),
+            "admin",
+            selected_record.get("slate_key", request.slate_key),
+            selected_record.get("slate_type", "custom"),
+        )
+
     if not ACTIVE_SLATE_PATH.exists():
         return {"success": False, "error": "Upload the DraftKings MLB contest slate before refreshing starters."}
 
@@ -4963,6 +5138,16 @@ def enrich_active_slate(request: AdminPasswordRequest):
         weather_state = {"success": False, "configured": True, "error": f"Weather refresh unavailable: {exc.__class__.__name__}"}
     enriched_players = add_values(enriched_players)
     save_active_slate(enriched_players)
+    active_meta = load_slate_metadata()
+    active_key = request.slate_key or active_meta.get("slate_key", "")
+    if active_key and active_key != "current":
+        save_slate_library(
+            enriched_players,
+            active_key,
+            active_meta.get("slate_name", "MLB Slate"),
+            active_meta.get("slate_date", slate_date),
+            active_meta.get("slate_type", "custom"),
+        )
 
     cleanup_stats = {
         "original_count": len(enriched_players),
@@ -5625,16 +5810,24 @@ def health():
     }
 
 
+@app.get("/slates")
+def get_slates():
+    slates = list_slate_library()
+    return {"success": True, "sport": "MLB", "slates": slates, "count": len(slates)}
+
+
 @app.get("/slate-status")
-def slate_status():
-    players = add_values(load_players())
+def slate_status(slate_key: str = ""):
+    players = add_values(load_players(slate_key))
     active_count = len([p for p in players if bool(p.get("active", True))])
     inactive_count = len(players) - active_count
-    meta = load_slate_metadata()
-    display_label = f"{meta.get('slate_name', 'MLB Slate')} • {meta.get('slate_date', '')}".strip(" •")
+    record = load_slate_record(slate_key) if slate_key and slate_key != "current" else None
+    meta = record or load_slate_metadata()
+    resolved_name = meta.get("name") or meta.get("slate_name", "MLB Slate")
+    display_label = f"{resolved_name} • {meta.get('slate_date', '')}".strip(" •")
     return {
         "slate_source": current_slate_source(),
-        "slate_name": meta.get("slate_name", "MLB Slate"),
+        "slate_name": resolved_name,
         "slate_date": meta.get("slate_date", ""),
         "slate_display_name": display_label,
         "slate_updated_at": meta.get("updated_at", ""),
@@ -5651,6 +5844,7 @@ def slate_status():
         "auto_cleanup_position_limits": AUTO_CLEANUP_POSITION_LIMITS,
         "data_dir": str(DATA_DIR),
         "daily_slate_persistent": True,
+        "selected_slate_key": slate_key or meta.get("slate_key", "current"),
     }
 
 
@@ -5683,6 +5877,10 @@ def update_slate_metadata(request: SlateMetadataRequest):
 async def upload_dk_csv(
     admin_password: str = Form(""),
     admin_token: str = Form(""),
+    slate_key: str = Form(""),
+    slate_name: str = Form(""),
+    slate_date: str = Form(""),
+    slate_type: str = Form("custom"),
     file: UploadFile = File(...),
 ):
     if not is_admin_authorized(admin_password, admin_token):
@@ -5705,11 +5903,17 @@ async def upload_dk_csv(
     cleaned_players, _ = apply_auto_slate_cleanup(players, respect_manual_overrides=False)
     cleaned_players = apply_slate_starter_likelihood(cleaned_players)
     save_active_slate(cleaned_players)
+    resolved_date = slate_date.strip() or datetime.now().strftime("%Y-%m-%d")
+    resolved_name = slate_name.strip() or f"DraftKings MLB {str(slate_type or 'custom').replace('_', ' ').title()} - {datetime.now().strftime('%b %d')}"
+    resolved_key = normalize_slate_key(slate_key, resolved_name, resolved_date)
     current_meta = save_slate_metadata(
-        slate_name=f"DraftKings MLB Slate - {datetime.now().strftime('%b %d')}",
-        slate_date=datetime.now().strftime("%Y-%m-%d"),
+        slate_name=resolved_name,
+        slate_date=resolved_date,
         updated_by=ADMIN_EMAIL if is_admin_token(admin_token) else "admin",
+        slate_key=resolved_key,
+        slate_type=slate_type,
     )
+    library_record = save_slate_library(cleaned_players, resolved_key, resolved_name, resolved_date, slate_type, admin_token)
 
     cleanup_stats = {
         "original_count": len(players),
@@ -5730,6 +5934,11 @@ async def upload_dk_csv(
         "cleanup_stats": cleanup_stats,
         "ownership": "Estimated ownership applied when CSV ownership was missing.",
         "auto_cleanup": "Bench-risk hitters and non-probable pitchers are excluded. Use Refresh MLB feeds near lock for announced lineups.",
+        "slate_key": resolved_key,
+        "slate_type": library_record.get("slate_type", "custom"),
+        "slate_id": library_record.get("id"),
+        "library_persisted": bool(library_record.get("persisted")),
+        "persistence_warning": library_record.get("persistence_warning", ""),
     }
 
 
@@ -5737,6 +5946,7 @@ async def upload_dk_csv(
 async def upload_projections_csv(
     admin_password: str = Form(""),
     admin_token: str = Form(""),
+    slate_key: str = Form(""),
     file: UploadFile = File(...),
 ):
     if not is_admin_authorized(admin_password, admin_token):
@@ -5752,7 +5962,7 @@ async def upload_projections_csv(
             "error": "No projections were found. Include Name and Projection columns; Ownership, Ceiling, and Floor are optional.",
         }
 
-    players = load_players()
+    players = load_players(slate_key)
     imported_by_name = {normalized_player_name(item["name"]): item for item in imported}
     matched = 0
     ownership_count = 0
@@ -5785,6 +5995,15 @@ async def upload_projections_csv(
         return {"success": False, "error": "Projection names did not match any player on the active MLB slate."}
 
     save_active_slate(players)
+    if slate_key and slate_key != "current":
+        existing_slate = load_slate_record(slate_key) or {}
+        save_slate_library(
+            players,
+            slate_key,
+            existing_slate.get("name", "MLB Slate"),
+            existing_slate.get("slate_date", ""),
+            existing_slate.get("slate_type", "custom"),
+        )
     write_json_file(PROJECTION_SNAPSHOT_PATH, players)
     return {
         "success": True,
@@ -5989,8 +6208,8 @@ def update_player_status(request: UpdatePlayerStatusRequest):
 
 
 @app.get("/players")
-def get_players():
-    players = add_values(load_players())
+def get_players(slate_key: str = ""):
+    players = add_values(load_players(slate_key))
     slot_order = {"P": 0, "C": 1, "1B": 2, "2B": 3, "3B": 4, "SS": 5, "OF": 6}
     players.sort(key=lambda p: (slot_order.get(p["position"], 99), -p["projection"]))
     return {
@@ -5999,22 +6218,25 @@ def get_players():
         "salary_cap": SALARY_CAP,
         "roster_slots": ROSTER_SLOTS,
         "players": players,
+        "slate_key": slate_key or "current",
     }
 
 
 @app.get("/value-plays")
-def get_value_plays():
-    players = [p for p in add_values(load_players()) if bool(p.get("active", True))]
+def get_value_plays(slate_key: str = ""):
+    players = [p for p in add_values(load_players(slate_key)) if bool(p.get("active", True))]
     players.sort(key=lambda p: p["value"], reverse=True)
     return {
         "slate_source": current_slate_source(),
         "sport": "MLB",
         "value_plays": players[:8],
+        "slate_key": slate_key or "current",
     }
 
 
 @app.post("/optimize")
 def optimize_lineup(request: OptimizeRequest):
+    slate_players = load_players(request.slate_key)
     all_lineups, error, trim_report, checked = build_all_lineups(
         mode=request.mode,
         locked_players=request.locked_players,
@@ -6026,6 +6248,7 @@ def optimize_lineup(request: OptimizeRequest):
         force_team_stack=request.force_team_stack,
         avoid_pitcher_vs_hitter=request.avoid_pitcher_vs_hitter,
         randomness=request.randomness,
+        players=slate_players,
     )
 
     if error:
@@ -6038,6 +6261,7 @@ def optimize_lineup(request: OptimizeRequest):
     result["combinations_checked"] = checked
     result["salary_cap"] = SALARY_CAP
     result["roster_slots"] = ROSTER_SLOTS
+    result["slate_key"] = request.slate_key or "current"
     return result
 
 
@@ -6078,6 +6302,7 @@ def optimize_multiple_lineups(
         "slate_source": current_slate_source(),
         "sport": "MLB",
         "salary_cap": SALARY_CAP,
+        "slate_key": request.slate_key or "current",
         "roster_slots": ROSTER_SLOTS,
         "speed_boost": "enabled",
         "trim_report": trim_report,
@@ -8566,7 +8791,7 @@ def build_fast_multi_lineups_for_pro(request, count):
     min_salary = max(0, min(SALARY_CAP, safe_int(getattr(request, "min_salary", 0), 0)))
     avoid_conflict = bool(getattr(request, "avoid_pitcher_vs_hitter", True))
 
-    raw_players = add_values(load_players())
+    raw_players = add_values(load_players(getattr(request, "slate_key", "")))
     error = validate_locks(raw_players, locked_players, excluded_players)
     if error:
         return [], error, {}, 0
