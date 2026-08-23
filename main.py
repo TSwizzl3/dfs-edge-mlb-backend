@@ -5029,6 +5029,13 @@ def normalize_email(email):
     return str(email or "").strip().lower()
 
 
+def normalize_lineup_count(value):
+    try:
+        return min(max(int(value), 1), 20)
+    except (TypeError, ValueError):
+        return 1
+
+
 def hash_password(password):
     return hashlib.sha256(str(password or "").encode("utf-8")).hexdigest()
 
@@ -6039,6 +6046,7 @@ def optimize_multiple_lineups(
     request: MultiOptimizeRequest,
     session: dict | None = Depends(optional_session),
 ):
+    requested_count = normalize_lineup_count(request.count)
     if not session or str(session.get("role", "free")).lower() not in ["pro", "admin"]:
         request.count = 1
         request.max_exposure = 100
@@ -6050,7 +6058,7 @@ def optimize_multiple_lineups(
         request.randomness = 0
         request.player_min_exposure = {}
         request.player_max_exposure = {}
-    count = request.count if request.count in [1, 5, 10, 20] else 1
+    count = 1 if not session or str(session.get("role", "free")).lower() not in ["pro", "admin"] else requested_count
 
     # Always use the fast builder for this endpoint.
     # This fixes Pro mode when count is 1 and prevents full DraftKings CSV slates from timing out.
@@ -6064,7 +6072,8 @@ def optimize_multiple_lineups(
 
     return {
         "mode": request.mode,
-        "requested_count": count,
+        "requested_count": requested_count,
+        "effective_count": count,
         "returned_count": len(selected),
         "slate_source": current_slate_source(),
         "sport": "MLB",
@@ -6081,7 +6090,7 @@ def optimize_multiple_lineups(
 
 @app.post("/export-lineups-csv")
 def export_lineups_csv(request: MultiOptimizeRequest, _: dict = Depends(require_pro_access)):
-    count = request.count if request.count in [1, 5, 10, 20] else 1
+    count = normalize_lineup_count(request.count)
     max_exposure = min(max(request.max_exposure, 20), 100)
     max_same_players = min(max(request.max_same_players, 3), 9)
 

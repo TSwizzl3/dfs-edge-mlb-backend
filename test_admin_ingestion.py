@@ -22,6 +22,23 @@ class FakeResponse:
 
 
 class AdminIngestionTests(unittest.TestCase):
+    def test_every_pro_lineup_count_from_one_through_twenty_is_supported(self):
+        self.assertEqual(main.normalize_lineup_count(2), 2)
+        self.assertEqual(main.normalize_lineup_count(13), 13)
+        self.assertEqual(main.normalize_lineup_count(20), 20)
+        self.assertEqual(main.normalize_lineup_count(21), 20)
+
+    def test_admin_optimizer_keeps_requested_count_of_two(self):
+        request = main.MultiOptimizeRequest(count=2)
+        lineups = [{"lineup": []}, {"lineup": []}]
+        with patch.object(main, "build_fast_multi_lineups_for_pro", return_value=(lineups, None, {}, 2)), patch.object(
+            main, "calculate_exposures", return_value=[]
+        ):
+            result = main.optimize_multiple_lineups(request, {"role": "admin"})
+        self.assertEqual(result["requested_count"], 2)
+        self.assertEqual(result["effective_count"], 2)
+        self.assertEqual(result["returned_count"], 2)
+
     def test_player_name_matching_ignores_accents(self):
         self.assertEqual(
             main.normalized_player_name("Cristopher Sánchez"),
