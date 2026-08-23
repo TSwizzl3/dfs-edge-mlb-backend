@@ -16,6 +16,7 @@ import statistics
 import urllib.request
 import urllib.parse
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 app = FastAPI(title="DFS Edge MLB API")
@@ -1456,6 +1457,43 @@ def fetch_mlb_stats_json(path, params=None, timeout=20):
         return json.loads(response.read().decode("utf-8"))
 
 
+def fetch_mlb_roster_statuses(team_ids, slate_date):
+    """Fetch official 40-man statuses without excluding players solely on a name miss."""
+    team_ids = {normalize_team(team): safe_int(team_id, 0) for team, team_id in (team_ids or {}).items() if safe_int(team_id, 0) > 0}
+    statuses_by_team = {}
+    errors = {}
+
+    def fetch_one(team, team_id):
+        payload = fetch_mlb_stats_json(
+            f"teams/{team_id}/roster",
+            {"rosterType": "40Man", "date": slate_date},
+            timeout=12,
+        )
+        statuses = {}
+        for row in payload.get("roster", []) or []:
+            full_name = row.get("person", {}).get("fullName", "")
+            status = row.get("status", {}).get("description", "") or "Unknown"
+            if full_name:
+                statuses[normalized_player_name(full_name)] = status
+        return team, statuses
+
+    if not team_ids:
+        return statuses_by_team, errors
+
+    with ThreadPoolExecutor(max_workers=min(8, len(team_ids))) as executor:
+        futures = {executor.submit(fetch_one, team, team_id): team for team, team_id in team_ids.items()}
+        for future in as_completed(futures):
+            team = futures[future]
+            try:
+                fetched_team, statuses = future.result()
+                if statuses:
+                    statuses_by_team[fetched_team] = statuses
+            except Exception as exc:
+                errors[team] = exc.__class__.__name__
+
+    return statuses_by_team, errors
+
+
 def load_mlb_starter_state():
     try:
         with open(MLB_STARTER_STATE_PATH, "r", encoding="utf-8") as file:
@@ -1479,6 +1517,7 @@ def refresh_mlb_starters(players, slate_date):
     }
     probable_by_team = {}
     confirmed_by_team = {}
+    team_ids = {}
     games_checked = 0
     error = ""
 
@@ -1494,6 +1533,9 @@ def refresh_mlb_starters(players, slate_date):
                 side_data = game.get("teams", {}).get(side, {})
                 team_code = normalize_team(side_data.get("team", {}).get("abbreviation", ""))
                 game_teams[side] = team_code
+                team_id = safe_int(side_data.get("team", {}).get("id", 0), 0)
+                if team_code in slate_teams and team_id > 0:
+                    team_ids[team_code] = team_id
                 probable_name = side_data.get("probablePitcher", {}).get("fullName", "")
                 if team_code in slate_teams and probable_name:
                     probable_by_team.setdefault(team_code, set()).add(normalized_player_name(probable_name))
@@ -1526,14 +1568,33 @@ def refresh_mlb_starters(players, slate_date):
     except Exception as exc:
         error = f"MLB starter service unavailable: {exc.__class__.__name__}"
 
+    roster_statuses, roster_errors = fetch_mlb_roster_statuses(team_ids, slate_date) if team_ids else ({}, {})
+
     probable_matches = 0
     confirmed_matches = 0
+    unavailable_matches = 0
     for player in refreshed:
         if bool(player.get("manual_status_override", False)):
             continue
         team = normalize_team(player.get("team", ""))
         name_key = normalized_player_name(player.get("name", ""))
         position = normalize_position(player.get("position", ""))
+        official_roster_status = roster_statuses.get(team, {}).get(name_key, "")
+        if official_roster_status and official_roster_status.lower() != "active":
+            status_slug = re.sub(r"[^a-z0-9]+", "_", official_roster_status.lower()).strip("_")
+            player["roster_status"] = official_roster_status
+            player["roster_status_source"] = "mlb_stats_40_man_roster"
+            player["injury_status"] = "il" if "injur" in official_roster_status.lower() else "officially_inactive"
+            player["starter_status"] = "confirmed_not_starting"
+            player["starter_source"] = "mlb_stats_roster_status"
+            player["starter_probability"] = 0.0
+            player["active"] = False
+            player["inactive_reason"] = f"official_mlb_roster_{status_slug or 'inactive'}"
+            unavailable_matches += 1
+            continue
+        if official_roster_status:
+            player["roster_status"] = official_roster_status
+            player["roster_status_source"] = "mlb_stats_40_man_roster"
         if position == "P" and team in probable_by_team:
             if name_key in probable_by_team[team]:
                 player["starter_status"] = "probable_pitcher"
@@ -1575,6 +1636,9 @@ def refresh_mlb_starters(players, slate_date):
         "confirmed_hitter_matches": confirmed_matches,
         "teams_with_probable_pitchers": len(probable_by_team),
         "teams_with_confirmed_lineups": len(confirmed_by_team),
+        "roster_teams_checked": len(roster_statuses),
+        "official_unavailable_matches": unavailable_matches,
+        "roster_errors": roster_errors,
         "eligible_player_count": len([p for p in refreshed if optimizer_starter_eligible(p)]),
         "error": error,
     }
@@ -2428,7 +2492,8 @@ def lineup_passes_advanced_rules(
         return False
 
     hitter_team_counts = count_team_players(lineup, hitters_only=True)
-    if any(count > max_players_per_team for count in hitter_team_counts.values()):
+    legal_hitter_team_max = min(max_players_per_team, 5)
+    if any(count > legal_hitter_team_max for count in hitter_team_counts.values()):
         return False
 
     if force_team_stack and not has_team_stack(lineup, minimum_stack_size=3):
@@ -6845,7 +6910,7 @@ def v2_attempt_lineup(groups, stack_team=None, stack_size=4, secondary_team=None
     salary = sum(safe_int(p.get("salary", 0), 0) for p in lineup)
     if salary > SALARY_CAP or salary < min_salary:
         return None
-    if any(c > max_players_per_team for c in count_team_players(lineup, hitters_only=True).values()):
+    if any(c > min(max_players_per_team, 5) for c in count_team_players(lineup, hitters_only=True).values()):
         return None
     if avoid_pitcher_vs_hitter and pitcher_vs_hitter_conflict(lineup):
         return None
@@ -7488,7 +7553,7 @@ def build_fast_multi_lineups_for_pro(request, count):
     players = [p for p in add_values(load_players()) if bool(p.get("active", True))]
     excluded_names = set(getattr(request, "excluded_players", []) or [])
     locked_players = getattr(request, "locked_players", []) or []
-    max_players_per_team = max(3, min(safe_int(getattr(request, "max_players_per_team", 5), 5), 5 if mode != "cash" else 6))
+    max_players_per_team = max(3, min(safe_int(getattr(request, "max_players_per_team", 5), 5), 5))
     min_salary = safe_int(getattr(request, "min_salary", 0), 0)
     avoid_conflict = bool(getattr(request, "avoid_pitcher_vs_hitter", True))
 
@@ -7841,6 +7906,8 @@ def v4_can_add(lineup, player, max_players_per_team=5, avoid_pitcher_vs_hitter=T
     team = normalize_team(player.get("team", ""))
     if team_counts.get(team, 0) >= max_players_per_team:
         return False
+    if pos != "P" and count_team_players(lineup, hitters_only=True).get(team, 0) >= 5:
+        return False
     if avoid_pitcher_vs_hitter:
         trial = lineup + [player]
         if pitcher_vs_hitter_conflict(trial):
@@ -8071,7 +8138,7 @@ def build_fast_multi_lineups_for_pro(request, count):
     locked_players = getattr(request, "locked_players", []) or []
     excluded_players = getattr(request, "excluded_players", []) or []
     excluded_names = set(excluded_players)
-    max_players_per_team = max(3, min(safe_int(getattr(request, "max_players_per_team", 5), 5), 6))
+    max_players_per_team = max(3, min(safe_int(getattr(request, "max_players_per_team", 5), 5), 5))
     if style in ["aggressive", "nuclear"] and mode != "cash":
         max_players_per_team = max(4, max_players_per_team)
     min_salary = max(0, min(SALARY_CAP, safe_int(getattr(request, "min_salary", 0), 0)))

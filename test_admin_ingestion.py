@@ -107,7 +107,7 @@ class AdminIngestionTests(unittest.TestCase):
             active_path.write_text("[]", encoding="utf-8")
             with patch.object(main, "ACTIVE_SLATE_PATH", active_path), patch.object(main, "MLB_STARTER_STATE_PATH", state_path), patch.object(
                 main, "fetch_mlb_stats_json", side_effect=[schedule, boxscore]
-            ):
+            ), patch.object(main, "fetch_mlb_roster_statuses", return_value=({}, {})):
                 refreshed, state = main.refresh_mlb_starters(players, "2026-08-23")
 
         by_name = {p["name"]: p for p in refreshed}
@@ -118,6 +118,57 @@ class AdminIngestionTests(unittest.TestCase):
         self.assertFalse(by_name["Bench Bat"]["active"])
         self.assertEqual(state["probable_pitcher_matches"], 1)
         self.assertEqual(state["confirmed_hitter_matches"], 1)
+
+    def test_official_il_status_overrides_likely_starter_projection(self):
+        schedule = {
+            "dates": [{"games": [{
+                "gamePk": 321,
+                "teams": {
+                    "away": {"team": {"id": 143, "abbreviation": "PHI"}},
+                    "home": {"team": {"id": 144, "abbreviation": "ATL"}},
+                },
+            }]}]
+        }
+        boxscore = {"teams": {"away": {"battingOrder": [], "players": {}}, "home": {"battingOrder": [], "players": {}}}}
+        players = [
+            {"name": "Injured Star", "position": "OF", "team": "PHI", "salary": 6200, "projection": 13, "active": True},
+            {"name": "Healthy Bat", "position": "OF", "team": "PHI", "salary": 5000, "projection": 10, "active": True},
+        ]
+        roster_statuses = {"PHI": {main.normalized_player_name("Injured Star"): "Injured 10-Day"}}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            active_path = Path(temp_dir) / "active.json"
+            state_path = Path(temp_dir) / "state.json"
+            active_path.write_text("[]", encoding="utf-8")
+            with patch.object(main, "ACTIVE_SLATE_PATH", active_path), patch.object(main, "MLB_STARTER_STATE_PATH", state_path), patch.object(
+                main, "fetch_mlb_stats_json", side_effect=[schedule, boxscore]
+            ), patch.object(main, "fetch_mlb_roster_statuses", return_value=(roster_statuses, {})):
+                refreshed, state = main.refresh_mlb_starters(players, "2026-08-23")
+
+        injured = next(player for player in refreshed if player["name"] == "Injured Star")
+        self.assertFalse(injured["active"])
+        self.assertEqual(injured["injury_status"], "il")
+        self.assertEqual(injured["starter_probability"], 0.0)
+        self.assertEqual(injured["roster_status"], "Injured 10-Day")
+        self.assertEqual(state["official_unavailable_matches"], 1)
+
+    def test_sixth_hitter_from_same_team_is_rejected(self):
+        def hitter(name, position):
+            return {
+                "name": name, "position": position, "team": "PHI", "salary": 4000,
+                "active": True, "starter_status": "confirmed_starter",
+                "starter_source": "mlb_stats_confirmed_lineup", "starter_probability": 1.0,
+            }
+
+        lineup = [
+            hitter("C", "C"), hitter("1B", "1B"), hitter("2B", "2B"),
+            hitter("3B", "3B"), hitter("SS", "SS"),
+        ]
+        candidate = hitter("OF", "OF")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            active_path = Path(temp_dir) / "active.json"
+            active_path.write_text("[]", encoding="utf-8")
+            with patch.object(main, "ACTIVE_SLATE_PATH", active_path):
+                self.assertFalse(main.v4_can_add(lineup, candidate, max_players_per_team=6))
 
     def test_central_admin_token_is_authorized(self):
         payload = {
