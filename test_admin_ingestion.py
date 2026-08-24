@@ -462,6 +462,39 @@ class AdminIngestionTests(unittest.TestCase):
         self.assertEqual(profile["team_total_delta"], 0.0)
         self.assertEqual(profile["market_signal_type"], "neutral")
 
+    def test_slate_metadata_saves_name_key_and_type_to_library(self):
+        request = main.SlateMetadataRequest(
+            auth_token="admin-token",
+            slate_name="Sunday Afternoon",
+            slate_date="2026-08-24",
+            slate_key="2026-08-24-afternoon",
+            slate_type="afternoon",
+        )
+        existing = {"name": "DraftKings MLB Slate", "slate_date": "2026-08-24", "slate_type": "main", "players": [{"name": "Player"}]}
+        saved_meta = {
+            "slate_name": "Sunday Afternoon",
+            "slate_date": "2026-08-24",
+            "slate_key": "2026-08-24-afternoon",
+            "slate_type": "afternoon",
+        }
+        with patch.object(main, "is_admin_authorized", return_value=True), patch.object(
+            main, "is_admin_token", return_value=True
+        ), patch.object(main, "save_slate_metadata", return_value=saved_meta) as save_meta, patch.object(
+            main, "load_slate_record", return_value=existing
+        ), patch.object(main, "save_slate_library", return_value={"persisted": True}) as save_library, patch.object(
+            main, "load_players", return_value=[]
+        ), patch.object(main, "current_slate_source", return_value="imported_or_edited_slate"):
+            result = main.update_slate_metadata(request)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["slate_name"], "Sunday Afternoon")
+        self.assertEqual(result["slate_key"], "2026-08-24-afternoon")
+        self.assertEqual(result["slate_type"], "afternoon")
+        self.assertTrue(result["library_updated"])
+        self.assertEqual(save_meta.call_args.kwargs["slate_type"], "afternoon")
+        self.assertEqual(save_library.call_args.args[2], "Sunday Afternoon")
+        self.assertEqual(save_library.call_args.args[4], "afternoon")
+
     def test_live_weather_is_blended_into_data_engine(self):
         player = {
             "name": "Weather Bat", "position": "OF", "team": "PHI", "opponent": "ATL",

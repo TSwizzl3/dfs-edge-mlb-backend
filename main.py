@@ -211,6 +211,8 @@ class SlateMetadataRequest(BaseModel):
     auth_token: str = ""
     slate_name: str = ""
     slate_date: str = ""
+    slate_key: str = ""
+    slate_type: str = "custom"
 
 
 class RegisterRequest(BaseModel):
@@ -6581,7 +6583,20 @@ def update_slate_metadata(request: SlateMetadataRequest):
         slate_name=request.slate_name,
         slate_date=request.slate_date,
         updated_by=ADMIN_EMAIL if is_admin_token(request.auth_token) else "admin",
+        slate_key=request.slate_key or None,
+        slate_type=request.slate_type or None,
     )
+    resolved_key = str(meta.get("slate_key") or request.slate_key or "").strip()
+    library_record = load_slate_record(resolved_key) if resolved_key else None
+    if library_record and isinstance(library_record.get("players"), list):
+        library_record = save_slate_library(
+            library_record["players"],
+            resolved_key,
+            request.slate_name or library_record.get("name") or "MLB Slate",
+            request.slate_date or library_record.get("slate_date") or "",
+            request.slate_type or library_record.get("slate_type") or "custom",
+            request.auth_token,
+        )
     players = load_players()
     active_count = len([p for p in players if bool(p.get("active", True))])
     return {
@@ -6589,7 +6604,10 @@ def update_slate_metadata(request: SlateMetadataRequest):
         "message": "Slate info saved.",
         "slate_name": meta.get("slate_name", "MLB Slate"),
         "slate_date": meta.get("slate_date", ""),
+        "slate_key": resolved_key or meta.get("slate_key", "current"),
+        "slate_type": meta.get("slate_type", "custom"),
         "slate_display_name": f"{meta.get('slate_name', 'MLB Slate')} • {meta.get('slate_date', '')}".strip(" •"),
+        "library_updated": bool(library_record),
         "player_count": len(players),
         "active_player_count": active_count,
         "inactive_player_count": len(players) - active_count,
