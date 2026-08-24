@@ -6051,12 +6051,52 @@ def bearer_token(authorization):
     return value[7:].strip() if value.lower().startswith("bearer ") else ""
 
 
+def supabase_session_from_token(token):
+    """Validate a Supabase access token directly when the central account service is unavailable."""
+    if not token:
+        return None
+    headers = {
+        "apikey": SUPABASE_PUBLISHABLE_KEY,
+        "Authorization": f"Bearer {token}",
+    }
+    try:
+        user_request = urllib.request.Request(f"{SUPABASE_URL}/auth/v1/user", headers=headers)
+        with urllib.request.urlopen(user_request, timeout=12) as response:
+            user = json.loads(response.read().decode("utf-8"))
+        user_id = str(user.get("id") or "")
+        email = normalize_email(user.get("email"))
+        if not user_id or not email:
+            return None
+        if email == ADMIN_EMAIL:
+            return {"email": email, "role": "admin", "user_id": user_id}
+
+        role = "free"
+        profile_url = (
+            f"{SUPABASE_URL}/rest/v1/profiles?id=eq."
+            f"{urllib.parse.quote(user_id)}&select=role"
+        )
+        try:
+            profile_request = urllib.request.Request(profile_url, headers=headers)
+            with urllib.request.urlopen(profile_request, timeout=12) as response:
+                profiles = json.loads(response.read().decode("utf-8"))
+            role = str(profiles[0].get("role", "free")).lower() if profiles else "free"
+        except Exception:
+            role = "free"
+        if role not in ["free", "pro", "admin"]:
+            role = "free"
+        return {"email": email, "role": role, "user_id": user_id}
+    except Exception:
+        return None
+
+
 def optional_session(authorization: str = Header(default="")):
     token = bearer_token(authorization)
     if not token:
         return None
     response = central_auth_request("/auth/me", {"token": token})
-    return response.get("user") if response.get("success") else None
+    if response.get("success") and response.get("user"):
+        return response.get("user")
+    return supabase_session_from_token(token)
 
 
 def require_pro_access(authorization: str = Header(default="")):

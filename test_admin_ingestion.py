@@ -37,16 +37,25 @@ class AdminIngestionTests(unittest.TestCase):
         self.assertEqual(main.normalize_lineup_count(20), 20)
         self.assertEqual(main.normalize_lineup_count(21), 20)
 
-    def test_admin_optimizer_keeps_requested_count_of_two(self):
-        request = main.MultiOptimizeRequest(count=2)
-        lineups = [{"lineup": []}, {"lineup": []}]
+    def test_admin_optimizer_keeps_requested_count_of_four(self):
+        request = main.MultiOptimizeRequest(count=4)
+        lineups = [{"lineup": [], "projected_points": 100 + index} for index in range(4)]
         with patch.object(main, "build_fast_multi_lineups_for_pro", return_value=(lineups, None, {}, 2)), patch.object(
             main, "calculate_exposures", return_value=[]
         ):
             result = main.optimize_multiple_lineups(request, {"role": "admin"})
-        self.assertEqual(result["requested_count"], 2)
-        self.assertEqual(result["effective_count"], 2)
-        self.assertEqual(result["returned_count"], 2)
+        self.assertEqual(result["requested_count"], 4)
+        self.assertEqual(result["effective_count"], 4)
+        self.assertEqual(result["returned_count"], 4)
+        self.assertEqual(len(result["lineups"]), 4)
+
+    def test_session_falls_back_to_direct_supabase_verification(self):
+        with patch.object(main, "central_auth_request", return_value={"success": False}), patch.object(
+            main, "supabase_session_from_token", return_value={"email": "admin@example.com", "role": "admin"}
+        ) as direct_verification:
+            session = main.optional_session("Bearer valid-supabase-token")
+        direct_verification.assert_called_once_with("valid-supabase-token")
+        self.assertEqual(session["role"], "admin")
 
     def test_live_builder_accepts_two_lineups_not_only_old_presets(self):
         request = main.MultiOptimizeRequest(count=2, mode="gpp")
