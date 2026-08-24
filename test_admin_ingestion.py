@@ -31,6 +31,23 @@ class AdminIngestionTests(unittest.TestCase):
             self.assertEqual(main.load_slate_record("2026-08-23-early")["players"][0]["name"], "Early Batter")
             self.assertEqual(main.load_slate_record("2026-08-23-main")["players"][0]["name"], "Main Batter")
 
+    def test_active_slate_reads_use_publishable_key_when_server_secret_is_missing(self):
+        saved = [{
+            "slate_key": "2026-08-24-main",
+            "name": "MLB Turbo",
+            "is_active": True,
+            "players": [{"name": "Saved Player"}],
+        }]
+        with patch.object(main, "supabase_service_key", return_value=""), patch.object(
+            main.urllib.request, "urlopen", return_value=FakeResponse(saved)
+        ) as request_call:
+            record = main.load_slate_record("2026-08-24-main")
+
+        request = request_call.call_args.args[0]
+        self.assertEqual(record["players"][0]["name"], "Saved Player")
+        self.assertEqual(request.headers.get("Apikey"), main.SUPABASE_PUBLISHABLE_KEY)
+        self.assertNotIn("Authorization", request.headers)
+
     def test_every_pro_lineup_count_from_one_through_twenty_is_supported(self):
         self.assertEqual(main.normalize_lineup_count(2), 2)
         self.assertEqual(main.normalize_lineup_count(13), 13)

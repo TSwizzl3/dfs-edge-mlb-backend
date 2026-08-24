@@ -1121,6 +1121,18 @@ def supabase_service_key():
     )
 
 
+def supabase_slate_read_headers():
+    """Read public active slates even when a deployment has no server secret."""
+    service_key = supabase_service_key()
+    api_key = service_key or SUPABASE_PUBLISHABLE_KEY
+    if not api_key:
+        return {}
+    headers = {"apikey": api_key, "Accept": "application/json"}
+    if service_key:
+        headers["Authorization"] = f"Bearer {service_key}"
+    return headers
+
+
 def normalize_slate_key(value="", name="", slate_date=""):
     source = str(value or "").strip() or "-".join(
         part for part in [str(slate_date or "").strip(), str(name or "").strip()] if part
@@ -1183,12 +1195,12 @@ def save_slate_library(players, slate_key, name, slate_date="", slate_type="cust
 
 def load_slate_record(slate_key):
     resolved_key = normalize_slate_key(slate_key)
-    service_key = supabase_service_key()
-    if service_key:
+    read_headers = supabase_slate_read_headers()
+    if read_headers:
         encoded_key = urllib.parse.quote(resolved_key, safe="")
         request = urllib.request.Request(
             f"{SUPABASE_URL}/rest/v1/dfs_slates?sport=eq.MLB&slate_key=eq.{encoded_key}&is_active=eq.true&select=*",
-            headers={"apikey": service_key, "Authorization": f"Bearer {service_key}", "Accept": "application/json"},
+            headers=read_headers,
         )
         try:
             with urllib.request.urlopen(request, timeout=25) as response:
@@ -1206,11 +1218,11 @@ def load_slate_record(slate_key):
 
 def list_slate_library():
     records = {}
-    service_key = supabase_service_key()
-    if service_key:
+    read_headers = supabase_slate_read_headers()
+    if read_headers:
         request = urllib.request.Request(
             f"{SUPABASE_URL}/rest/v1/dfs_slates?sport=eq.MLB&is_active=eq.true&select=id,sport,slate_key,name,slate_date,slate_type,player_count,is_active,updated_at&order=slate_date.desc.nullslast,name.asc",
-            headers={"apikey": service_key, "Authorization": f"Bearer {service_key}", "Accept": "application/json"},
+            headers=read_headers,
         )
         try:
             with urllib.request.urlopen(request, timeout=25) as response:
@@ -9650,6 +9662,8 @@ def build_fast_multi_lineups_for_pro(request, count):
     avoid_conflict = bool(getattr(request, "avoid_pitcher_vs_hitter", True))
 
     raw_players = add_values(load_players(getattr(request, "slate_key", "")))
+    if not raw_players:
+        return [], "The selected MLB slate could not be loaded by the optimizer. Refresh the slate library and try again; the player pool itself was not rejected for starter eligibility.", {"slate_load_failed": True}, 0
     error = validate_locks(raw_players, locked_players, excluded_players)
     if error:
         return [], error, {}, 0
