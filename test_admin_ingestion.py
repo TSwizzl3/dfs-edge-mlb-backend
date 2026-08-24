@@ -48,6 +48,51 @@ class AdminIngestionTests(unittest.TestCase):
         self.assertEqual(result["effective_count"], 2)
         self.assertEqual(result["returned_count"], 2)
 
+    def test_live_builder_accepts_two_lineups_not_only_old_presets(self):
+        request = main.MultiOptimizeRequest(count=2, mode="gpp")
+
+        def fake_lineup(*args, **kwargs):
+            offset = kwargs.get("offset", 0)
+            return [
+                {"name": f"Player {offset}-{index}", "position": "OF", "team": f"T{index}", "salary": 5000, "projection": 10.0}
+                for index in range(10)
+            ]
+
+        def simple_metadata(data):
+            return {**data, "takedown_strength": 0, "ceiling_score": 0}
+
+        with patch.object(main, "load_players", return_value=[{"name": "Pool"}]), patch.object(
+            main, "validate_locks", return_value=None
+        ), patch.object(main, "build_optimizer_pool_with_fallback", return_value=([{"name": "Pool"}], {})), patch.object(
+            main, "add_values", side_effect=lambda players: players
+        ), patch.object(main, "valid_optimizer_player", return_value=True), patch.object(
+            main, "is_manual_inactive_player", return_value=False
+        ), patch.object(main, "has_required_mlb_positions", return_value=True), patch.object(
+            main, "v4_team_stack_scores", return_value=[("AAA", 1.0), ("BBB", 0.9)]
+        ), patch.object(main, "v4_build_one_lineup", side_effect=fake_lineup), patch.object(
+            main, "add_lineup_metadata", side_effect=simple_metadata
+        ), patch.object(main, "v4_lineup_objective", return_value=1.0), patch.object(
+            main, "deterministic_random_bonus", return_value=0.0
+        ), patch.object(main, "diversify_lineups", side_effect=lambda all_lineups, count, **kwargs: all_lineups[:count]):
+            selected, error, _, _ = main.build_fast_multi_lineups_for_pro(request, 2)
+
+        self.assertIsNone(error)
+        self.assertEqual(len(selected), 2)
+
+    def test_custom_simulation_never_uses_legacy_global_payout_table(self):
+        request = main.ContestSimulationRequest(
+            contest_size=1000,
+            field_size=1000,
+            entry_fee=20,
+            prize_pool=10000,
+            payout_tiers=[],
+        )
+        with patch.object(main, "load_payout_table") as legacy_table:
+            contest = main.normalize_contest_request(request)
+        legacy_table.assert_not_called()
+        self.assertEqual(contest["payout_table"], [])
+        self.assertEqual(contest["payout_source"], "estimated_curve")
+
     def test_player_name_matching_ignores_accents(self):
         self.assertEqual(
             main.normalized_player_name("Cristopher Sánchez"),
@@ -221,7 +266,7 @@ class AdminIngestionTests(unittest.TestCase):
         )
         self.assertEqual(tiers[1], {"start_rank": 2, "end_rank": 5, "payout": 250.0})
 
-    def test_uploaded_payout_table_drives_contest_math(self):
+    def test_exact_contest_payout_table_drives_contest_math(self):
         tiers = [
             {"start_rank": 1, "end_rank": 1, "payout": 1000.0},
             {"start_rank": 2, "end_rank": 10, "payout": 50.0},
@@ -230,13 +275,14 @@ class AdminIngestionTests(unittest.TestCase):
             contest_size=100,
             paid_positions=20,
             payout_rate=0.2,
+            contest_profile_id="exact-contest",
+            payout_tiers=tiers,
         )
-        with patch.object(main, "load_payout_table", return_value=tiers):
-            contest = main.normalize_contest_request(request)
-            self.assertEqual(contest["paid_positions"], 10)
-            self.assertEqual(contest["payout_source"], "uploaded_exact_table")
-            self.assertEqual(main.payout_for_rank(5, contest), 50.0)
-            self.assertEqual(main.payout_for_rank(11, contest), 0.0)
+        contest = main.normalize_contest_request(request)
+        self.assertEqual(contest["paid_positions"], 10)
+        self.assertEqual(contest["payout_source"], "contest_library_exact_table")
+        self.assertEqual(main.payout_for_rank(5, contest), 50.0)
+        self.assertEqual(main.payout_for_rank(11, contest), 0.0)
 
     def test_contest_library_payouts_override_legacy_table(self):
         tiers = [

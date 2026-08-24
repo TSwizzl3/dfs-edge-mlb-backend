@@ -4322,7 +4322,7 @@ def build_fast_multi_lineups_for_pro(request, count):
     locked_players = request.locked_players or []
     excluded_players = request.excluded_players or []
     mode = str(request.mode or "cash").lower()
-    count = count if count in [1, 5, 10, 20] else 1
+    count = normalize_lineup_count(count)
 
     players = add_values(load_players())
     error = validate_locks(players, locked_players, excluded_players)
@@ -4788,7 +4788,9 @@ def normalize_contest_request(request: ContestSimulationRequest):
         payout_rate = max(0.01, min(payout_rate, 0.80))
         paid_positions = max(1, min(contest_size, round(contest_size * payout_rate)))
 
-    payout_table = request.payout_tiers if isinstance(request.payout_tiers, list) and request.payout_tiers else load_payout_table()
+    # Payouts belong to an exact contest profile. Never apply a legacy global
+    # table to an unrelated custom contest or slate.
+    payout_table = request.payout_tiers if isinstance(request.payout_tiers, list) and request.payout_tiers else []
     if payout_table:
         exact_paid_positions = max(safe_int(tier.get("end_rank"), 0) for tier in payout_table)
         if 0 < exact_paid_positions <= contest_size:
@@ -4808,7 +4810,7 @@ def normalize_contest_request(request: ContestSimulationRequest):
         "single_entry": single_entry,
         "total_entry_cost": round(entry_fee * max_entries, 2),
         "payout_table": payout_table,
-        "payout_source": "contest_library_exact_table" if request.payout_tiers else ("uploaded_exact_table" if payout_table else "estimated_curve"),
+        "payout_source": "contest_library_exact_table" if payout_table else "estimated_curve",
         "contest_profile_id": request.contest_profile_id,
         "contest_profile_name": request.contest_profile_name,
     }
@@ -8385,7 +8387,7 @@ def build_fast_multi_lineups_for_pro(request, count):
     excluded_players = request.excluded_players or []
     excluded_names = set(excluded_players)
     mode = str(getattr(request, "mode", "cash") or "cash").lower()
-    count = count if count in [1, 5, 10, 20] else 1
+    count = normalize_lineup_count(count)
     randomness = safe_int(getattr(request, "randomness", 0), 0)
     strategy_mode = str(getattr(request, "strategy_mode", "") or "").lower()
     stack_type = str(getattr(request, "stack_type", "auto") or "auto").lower()
@@ -9597,7 +9599,7 @@ def build_fast_multi_lineups_for_pro(request, count):
     """
     mode = str(getattr(request, "mode", "gpp") or "gpp").lower()
     style = v4_style_from_request(request, mode)
-    count = count if count in [1, 5, 10, 20] else 1
+    count = normalize_lineup_count(count)
     locked_players = getattr(request, "locked_players", []) or []
     excluded_players = getattr(request, "excluded_players", []) or []
     excluded_names = set(excluded_players)
