@@ -59,8 +59,9 @@ PROJECTION_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
 BACKTEST_LATEST_PATH = BASE_DIR / "mlb_backtest_latest.json"
 BACKTEST_HISTORY_PATH = BASE_DIR / "mlb_backtest_history.json"
 CALIBRATION_MODEL_PATH = BASE_DIR / "mlb_calibration_model.json"
-CALIBRATION_MIN_SLATES = 10
-CALIBRATION_MIN_PLAYERS = 500
+CALIBRATION_MIN_SLATES = 2
+CALIBRATION_MIN_PLAYERS = 150
+CALIBRATION_FULL_STRENGTH_SLATES = 8
 CALIBRATION_MAX_SLATES = 90
 CALIBRATION_HALF_LIFE_SLATES = 20.0
 CALIBRATION_CACHE_SECONDS = 5 * 60
@@ -1362,6 +1363,22 @@ def weighted_quantile(values, weights, quantile):
     return ordered[-1][0]
 
 
+def calibration_adjustment_scale(slate_count):
+    """Start cautiously, then earn full adjustment strength with more slates."""
+    count = max(0, safe_int(slate_count, 0))
+    if count < CALIBRATION_MIN_SLATES:
+        return 0.0
+    return round(max(0.25, min(1.0, count / CALIBRATION_FULL_STRENGTH_SLATES)), 4)
+
+
+def calibration_validation_scale(training_slate_count):
+    """Allow a one-slate training fold only when testing it on a different slate."""
+    count = max(0, safe_int(training_slate_count, 0))
+    if count == 0:
+        return 0.0
+    return round(max(0.25, min(1.0, count / CALIBRATION_FULL_STRENGTH_SLATES)), 4)
+
+
 def training_observations(history):
     trainable = [item for item in history if isinstance(item.get("observations"), list) and item.get("observations")]
     observations = []
@@ -1430,6 +1447,7 @@ def validate_calibration(history):
         training = [item for item in trainable if item is not holdout]
         fitted = fit_calibration_parameters(training)
         params = fitted.get("positions", {})
+        adjustment_scale = calibration_validation_scale(fitted.get("training_slate_count", 0))
         for row in holdout.get("observations", []):
             raw_projection = safe_float(row.get("raw_projection"), safe_float(row.get("projection"), -1))
             actual = safe_float(row.get("actual"), -1)
@@ -1437,7 +1455,7 @@ def validate_calibration(history):
                 continue
             position = normalize_position(row.get("position"))
             parameter = params.get(position) or params.get("ALL") or {}
-            calibrated_projection = raw_projection + safe_float(parameter.get("projection_offset"), 0)
+            calibrated_projection = raw_projection + safe_float(parameter.get("projection_offset"), 0) * adjustment_scale
             baseline_error = abs(raw_projection - actual)
             calibrated_error = abs(calibrated_projection - actual)
             baseline_errors.append(baseline_error)
@@ -1494,15 +1512,32 @@ def train_calibration_model(history):
     }, sort_keys=True)
     model_version = f"mlb-cal-{hashlib.sha256(fingerprint.encode('utf-8')).hexdigest()[:12]}"
     status = "active" if validation["passes"] else ("collecting" if not validation["eligible"] else "rejected")
+    adjustment_scale = calibration_adjustment_scale(fitted.get("training_slate_count", 0))
+    training_slate_count = fitted.get("training_slate_count", 0)
+    learning_stage = (
+        "collecting" if training_slate_count < CALIBRATION_MIN_SLATES
+        else "full_strength" if adjustment_scale >= 1.0
+        else "fast_start"
+    )
     return {
         "model_version": model_version,
         "trained_at": datetime.now(timezone.utc).isoformat(),
         "status": status,
         "is_active": status == "active",
-        "training_slate_count": fitted.get("training_slate_count", 0),
+        "training_slate_count": training_slate_count,
         "training_player_count": fitted.get("training_player_count", 0),
+        "learning_stage": learning_stage,
+        "adjustment_scale": adjustment_scale,
+        "full_strength_slates": CALIBRATION_FULL_STRENGTH_SLATES,
         "target_model_versions": fitted.get("model_versions", []),
-        "parameters": {"positions": fitted.get("positions", {})},
+        "parameters": {
+            "positions": fitted.get("positions", {}),
+            "learning": {
+                "stage": learning_stage,
+                "adjustment_scale": adjustment_scale,
+                "full_strength_slates": CALIBRATION_FULL_STRENGTH_SLATES,
+            },
+        },
         "validation": validation,
     }
 
@@ -1518,11 +1553,19 @@ def save_calibration_model(model, auth_token=""):
             auth_token=auth_token,
             prefer="return=minimal",
         )
+    record = {
+        key: model.get(key)
+        for key in (
+            "model_version", "trained_at", "status", "is_active",
+            "training_slate_count", "training_player_count",
+            "target_model_versions", "parameters", "validation",
+        )
+    }
     rows = supabase_data_request(
         "mlb_calibration_models",
         method="POST",
         query="on_conflict=model_version",
-        payload=model,
+        payload=record,
         auth_token=auth_token,
         prefer="resolution=merge-duplicates,return=representation",
     )
@@ -1550,6 +1593,17 @@ def load_active_calibration_model(force=False):
             model = saved if isinstance(saved, dict) and saved.get("is_active") else None
         except Exception:
             model = None
+    if isinstance(model, dict):
+        learning = (model.get("parameters") or {}).get("learning", {})
+        model["learning_stage"] = learning.get("stage") or model.get("learning_stage")
+        model["adjustment_scale"] = safe_float(
+            learning.get("adjustment_scale"),
+            calibration_adjustment_scale(model.get("training_slate_count", 0)),
+        )
+        model["full_strength_slates"] = safe_int(
+            learning.get("full_strength_slates"),
+            CALIBRATION_FULL_STRENGTH_SLATES,
+        )
     _CALIBRATION_CACHE = {"loaded_at": time.time(), "model": model}
     return model
 
@@ -1577,18 +1631,31 @@ def apply_calibration_to_player(player, model=None):
     if not isinstance(parameter, dict):
         calibrated["calibration_skip_reason"] = "position_not_trained"
         return calibrated
-    offset = safe_float(parameter.get("projection_offset"), 0)
+    adjustment_scale = max(0.0, min(1.0, safe_float(
+        model.get("adjustment_scale"),
+        calibration_adjustment_scale(model.get("training_slate_count", 0)),
+    )))
+    offset = safe_float(parameter.get("projection_offset"), 0) * adjustment_scale
     empirical_floor = raw_projection + safe_float(parameter.get("residual_q15"), raw_floor - raw_projection)
     empirical_ceiling = raw_projection + safe_float(parameter.get("residual_q90"), raw_ceiling - raw_projection)
     projection = max(0.0, raw_projection + offset)
-    floor = max(0.0, min(projection, (raw_floor + offset) * 0.70 + empirical_floor * 0.30))
-    ceiling = max(projection, (raw_ceiling + offset) * 0.65 + empirical_ceiling * 0.35)
+    floor_empirical_weight = 0.30 * adjustment_scale
+    ceiling_empirical_weight = 0.35 * adjustment_scale
+    floor = max(0.0, min(
+        projection,
+        (raw_floor + offset) * (1.0 - floor_empirical_weight) + empirical_floor * floor_empirical_weight,
+    ))
+    ceiling = max(
+        projection,
+        (raw_ceiling + offset) * (1.0 - ceiling_empirical_weight) + empirical_ceiling * ceiling_empirical_weight,
+    )
     calibrated.update({
         "projection": round(projection, 3),
         "floor": round(floor, 3),
         "ceiling": round(ceiling, 3),
         "calibration_applied": True,
         "calibration_adjustment": round(offset, 3),
+        "calibration_adjustment_scale": round(adjustment_scale, 3),
         "calibration_confidence": round(safe_float(parameter.get("confidence"), 0), 3),
         "calibration_model_version": model.get("model_version"),
         "calibration_trained_slates": safe_int(model.get("training_slate_count"), 0),
@@ -6576,6 +6643,8 @@ async def upload_actual_results_csv(
         "training_player_count": calibration_model.get("training_player_count", 0),
         "calibration_status": calibration_model.get("status"),
         "calibration_model_version": calibration_model.get("model_version"),
+        "calibration_learning_stage": calibration_model.get("learning_stage"),
+        "calibration_adjustment_scale": calibration_model.get("adjustment_scale", 0),
         "validation": calibration_model.get("validation", {}),
         "backtest_persisted": backtest_persisted,
         "calibration_persisted": calibration_persisted,
@@ -6599,6 +6668,7 @@ def model_backtest_status(authorization: str = Header("")):
         "training_player_count": candidate.get("training_player_count", 0),
         "minimum_calibration_slates": CALIBRATION_MIN_SLATES,
         "minimum_calibration_players": CALIBRATION_MIN_PLAYERS,
+        "full_strength_calibration_slates": CALIBRATION_FULL_STRENGTH_SLATES,
         "calibration_ready": bool(active_model),
         "calibration_status": "active" if active_model else candidate.get("status", "collecting"),
         "candidate_model": candidate,

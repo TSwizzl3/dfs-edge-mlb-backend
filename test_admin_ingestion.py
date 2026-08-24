@@ -312,18 +312,35 @@ class AdminIngestionTests(unittest.TestCase):
             })
         return history
 
-    def test_calibration_stays_in_collecting_mode_before_ten_slates(self):
-        model = main.train_calibration_model(self.calibration_history(9))
+    def test_calibration_stays_in_collecting_mode_after_one_slate(self):
+        model = main.train_calibration_model(self.calibration_history(1))
         self.assertEqual(model["status"], "collecting")
         self.assertFalse(model["is_active"])
-        self.assertEqual(model["training_slate_count"], 9)
+        self.assertEqual(model["training_slate_count"], 1)
+        self.assertEqual(model["adjustment_scale"], 0)
 
     def test_cross_validated_calibration_activates_when_it_beats_baseline(self):
-        model = main.train_calibration_model(self.calibration_history(10))
+        model = main.train_calibration_model(self.calibration_history(3))
         self.assertEqual(model["status"], "active")
         self.assertTrue(model["is_active"])
         self.assertGreater(model["validation"]["improvement_percent"], 0.5)
         self.assertLess(model["parameters"]["positions"]["OF"]["projection_offset"], 0)
+        self.assertEqual(model["learning_stage"], "fast_start")
+        self.assertLess(model["adjustment_scale"], 1)
+
+    def test_fast_start_can_activate_after_two_independent_slates(self):
+        history = self.calibration_history(2)
+        for slate in history:
+            slate["observations"].extend(slate["observations"][:10])
+        model = main.train_calibration_model(history)
+        self.assertEqual(model["status"], "active")
+        self.assertEqual(model["training_slate_count"], 2)
+        self.assertEqual(model["adjustment_scale"], 0.25)
+
+    def test_calibration_reaches_full_strength_after_eight_slates(self):
+        model = main.train_calibration_model(self.calibration_history(8))
+        self.assertEqual(model["adjustment_scale"], 1.0)
+        self.assertEqual(model["learning_stage"], "full_strength")
 
     def test_active_calibration_uses_raw_projection_without_double_applying(self):
         model = {
