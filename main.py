@@ -460,16 +460,24 @@ def parse_actual_results_csv(csv_text):
         )
         points = safe_float(points_value, -1)
         if name and points >= 0:
-            actuals.append({
+            item = {
                 "name": extract_name_from_name_plus_id(name),
                 "actual_points": round(points, 3),
-            })
+            }
+            ownership_value = find_column(
+                row,
+                ["Actual Ownership", "Actual Ownership %", "Ownership", "Ownership %", "Own", "Own%"],
+            )
+            actual_ownership = safe_float(ownership_value, -1)
+            if actual_ownership >= 0:
+                item["actual_ownership"] = round(max(0.0, min(100.0, actual_ownership)), 3)
+            actuals.append(item)
     return actuals
 
 
 def projection_backtest(players, actual_rows):
     actual_by_name = {
-        normalized_player_name(item.get("name")): safe_float(item.get("actual_points"), 0)
+        normalized_player_name(item.get("name")): item
         for item in actual_rows
     }
     matched = []
@@ -477,14 +485,18 @@ def projection_backtest(players, actual_rows):
         key = normalized_player_name(player.get("name"))
         if key not in actual_by_name:
             continue
-        actual = actual_by_name[key]
+        actual_row = actual_by_name[key]
+        actual = safe_float(actual_row.get("actual_points"), 0)
         projection = safe_float(player.get("projection"), 0)
         raw_projection = safe_float(player.get("raw_projection"), projection)
+        raw_ownership = safe_float(player.get("raw_ownership"), safe_float(player.get("ownership"), 0))
+        actual_ownership = actual_row.get("actual_ownership")
         floor = safe_float(player.get("floor"), max(0, projection * 0.35))
         ceiling = safe_float(player.get("ceiling"), projection * (1.65 if normalize_position(player.get("position")) == "P" else 2.2))
-        matched.append({
+        observation = {
             "name": player.get("name"),
             "position": normalize_position(player.get("position")),
+            "team": normalize_team(player.get("team")),
             "projection": projection,
             "raw_projection": raw_projection,
             "floor": floor,
@@ -495,7 +507,20 @@ def projection_backtest(players, actual_rows):
             "model_version": player.get("projection_model_version", "unknown"),
             "calibration_model_version": player.get("calibration_model_version"),
             "calibration_applied": bool(player.get("calibration_applied", False)),
-        })
+            "projected_ownership": round(raw_ownership, 3),
+            "team_total": round(safe_float(player.get("team_total"), 0), 3),
+            "opponent_total": round(safe_float(player.get("opponent_total"), 0), 3),
+            "vegas_boost": round(safe_float(player.get("vegas_boost"), 0), 4),
+            "market_boost": round(safe_float(player.get("market_boost"), 0), 4),
+            "odds_source": player.get("odds_source") or player.get("vegas_source") or "",
+        }
+        if actual_ownership is not None:
+            actual_ownership = max(0.0, min(100.0, safe_float(actual_ownership, 0)))
+            observation.update({
+                "actual_ownership": round(actual_ownership, 3),
+                "ownership_error": round(raw_ownership - actual_ownership, 3),
+            })
+        matched.append(observation)
 
     def metrics(rows, projection_key="projection"):
         if not rows:
@@ -526,6 +551,43 @@ def projection_backtest(players, actual_rows):
         }
 
     positions = ["P", "C", "1B", "2B", "3B", "SS", "OF"]
+    ownership_rows = [item for item in matched if item.get("actual_ownership") is not None]
+
+    def ownership_metrics(rows):
+        if not rows:
+            return {"sample_size": 0}
+        projected = [safe_float(item.get("projected_ownership"), 0) for item in rows]
+        actual = [safe_float(item.get("actual_ownership"), 0) for item in rows]
+        errors = [left - right for left, right in zip(projected, actual)]
+        projected_mean = statistics.fmean(projected)
+        actual_mean = statistics.fmean(actual)
+        covariance = sum((left - projected_mean) * (right - actual_mean) for left, right in zip(projected, actual))
+        denominator = math.sqrt(
+            sum((value - projected_mean) ** 2 for value in projected)
+            * sum((value - actual_mean) ** 2 for value in actual)
+        )
+        return {
+            "sample_size": len(rows),
+            "mae": round(statistics.fmean(abs(error) for error in errors), 3),
+            "rmse": round(math.sqrt(statistics.fmean(error * error for error in errors)), 3),
+            "bias": round(statistics.fmean(errors), 3),
+            "correlation": round(covariance / denominator, 3) if denominator else 0,
+            "within_5_percent_points": round(100 * sum(abs(error) <= 5 for error in errors) / len(rows), 1),
+        }
+
+    live_odds_rows = [item for item in matched if "odds api" in str(item.get("odds_source", "")).lower()]
+    vegas_buckets = {}
+    for label, predicate in (
+        ("positive", lambda item: safe_float(item.get("vegas_boost"), 0) >= 0.2),
+        ("neutral", lambda item: abs(safe_float(item.get("vegas_boost"), 0)) < 0.2),
+        ("negative", lambda item: safe_float(item.get("vegas_boost"), 0) <= -0.2),
+    ):
+        rows = [item for item in live_odds_rows if predicate(item)]
+        vegas_buckets[label] = {
+            "sample_size": len(rows),
+            "mean_projection_error": round(statistics.fmean(item["error"] for item in rows), 3) if rows else 0,
+            "mean_actual_points": round(statistics.fmean(item["actual"] for item in rows), 3) if rows else 0,
+        }
     return {
         "overall": metrics(matched),
         "baseline_overall": metrics(matched, "raw_projection"),
@@ -536,6 +598,17 @@ def projection_backtest(players, actual_rows):
         "baseline_by_position": {
             position: metrics([item for item in matched if item["position"] == position], "raw_projection")
             for position in positions
+        },
+        "ownership": {
+            "overall": ownership_metrics(ownership_rows),
+            "by_position": {
+                position: ownership_metrics([item for item in ownership_rows if item["position"] == position])
+                for position in positions
+            },
+        },
+        "market_evidence": {
+            "live_odds_players": len(live_odds_rows),
+            "buckets": vegas_buckets,
         },
         "matched_players": len(matched),
         "unmatched_results": max(0, len(actual_rows) - len(matched)),
@@ -1295,6 +1368,8 @@ def save_backtest_record(payload, auth_token=""):
         "by_position": {
             "calibrated": payload.get("by_position", {}),
             "baseline": payload.get("baseline_by_position", {}),
+            "ownership": payload.get("ownership", {}),
+            "market_evidence": payload.get("market_evidence", {}),
         },
         "matched_players": safe_int(payload.get("matched_players"), 0),
         "unmatched_results": safe_int(payload.get("unmatched_results"), 0),
@@ -1329,6 +1404,8 @@ def load_backtest_history(auth_token=""):
             "observations": row.get("observations", []),
             "baseline_overall": row.get("baseline_overall", {}),
             "overall": row.get("calibrated_overall", {}),
+            "ownership": by_position.get("ownership", {}),
+            "market_evidence": by_position.get("market_evidence", {}),
             "baseline_by_position": by_position.get("baseline", {}),
             "by_position": by_position.get("calibrated", {}),
             "matched_players": row.get("matched_players", 0),
@@ -1392,7 +1469,7 @@ def training_observations(history):
             actual = safe_float(row.get("actual"), -1)
             if raw_projection < 0 or actual < 0:
                 continue
-            observations.append({
+            observation = {
                 "slate_key": slate_key,
                 "position": normalize_position(row.get("position")),
                 "raw_projection": raw_projection,
@@ -1400,7 +1477,14 @@ def training_observations(history):
                 "residual": actual - raw_projection,
                 "weight": recency_weight,
                 "model_version": str(row.get("model_version") or "unknown"),
-            })
+                "vegas_boost": safe_float(row.get("vegas_boost"), 0),
+                "team_total": safe_float(row.get("team_total"), 0),
+                "odds_source": str(row.get("odds_source") or ""),
+            }
+            if row.get("actual_ownership") is not None:
+                observation["projected_ownership"] = max(0.0, min(100.0, safe_float(row.get("projected_ownership"), 0)))
+                observation["actual_ownership"] = max(0.0, min(100.0, safe_float(row.get("actual_ownership"), 0)))
+            observations.append(observation)
     return trainable, observations
 
 
@@ -1435,6 +1519,103 @@ def fit_calibration_parameters(history):
         "model_versions": model_versions,
         "training_slate_count": len(trainable),
         "training_player_count": len(observations),
+    }
+
+
+def fit_ownership_parameters(history):
+    trainable, observations = training_observations(history)
+    ownership_rows = [row for row in observations if row.get("actual_ownership") is not None]
+    parameters = {}
+    for group in ["ALL", "P", "C", "1B", "2B", "3B", "SS", "OF"]:
+        rows = ownership_rows if group == "ALL" else [row for row in ownership_rows if row["position"] == group]
+        if not rows or (group != "ALL" and len(rows) < 15):
+            continue
+        residuals = [row["actual_ownership"] - row["projected_ownership"] for row in rows]
+        weights = [row["weight"] for row in rows]
+        raw_offset = weighted_mean(residuals, weights)
+        shrinkage = len(rows) / (len(rows) + (100.0 if group == "ALL" else 60.0))
+        offset = max(-10.0, min(10.0, raw_offset * shrinkage))
+        slate_count = len({row["slate_key"] for row in rows})
+        confidence = min(1.0, slate_count / 10.0) * min(1.0, len(rows) / (200.0 if group == "ALL" else 80.0))
+        parameters[group] = {
+            "ownership_offset": round(offset, 4),
+            "raw_residual_mean": round(raw_offset, 4),
+            "residual_q15": round(weighted_quantile(residuals, weights, 0.15), 4),
+            "residual_q85": round(weighted_quantile(residuals, weights, 0.85), 4),
+            "sample_size": len(rows),
+            "slate_count": slate_count,
+            "confidence": round(confidence, 4),
+        }
+    return {
+        "positions": parameters,
+        "training_slate_count": len({row["slate_key"] for row in ownership_rows}),
+        "training_player_count": len(ownership_rows),
+    }
+
+
+def validate_ownership_calibration(history):
+    trainable, observations = training_observations(history)
+    ownership_observations = [row for row in observations if row.get("actual_ownership") is not None]
+    ownership_slates = sorted({row["slate_key"] for row in ownership_observations})
+    baseline_errors = []
+    calibrated_errors = []
+    position_errors = {}
+    for holdout_key in ownership_slates:
+        training = [item for item in trainable if normalize_slate_key(item.get("slate_key")) != holdout_key]
+        fitted = fit_ownership_parameters(training)
+        params = fitted.get("positions", {})
+        adjustment_scale = calibration_validation_scale(fitted.get("training_slate_count", 0))
+        holdout_rows = [row for row in ownership_observations if row["slate_key"] == holdout_key]
+        for row in holdout_rows:
+            position = row["position"]
+            parameter = params.get(position) or params.get("ALL") or {}
+            projected = row["projected_ownership"]
+            actual = row["actual_ownership"]
+            calibrated = max(0.0, min(100.0, projected + safe_float(parameter.get("ownership_offset"), 0) * adjustment_scale))
+            baseline_error = abs(projected - actual)
+            calibrated_error = abs(calibrated - actual)
+            baseline_errors.append(baseline_error)
+            calibrated_errors.append(calibrated_error)
+            bucket = position_errors.setdefault(position, {"baseline": [], "calibrated": []})
+            bucket["baseline"].append(baseline_error)
+            bucket["calibrated"].append(calibrated_error)
+    baseline_mae = statistics.fmean(baseline_errors) if baseline_errors else 0.0
+    calibrated_mae = statistics.fmean(calibrated_errors) if calibrated_errors else 0.0
+    improvement = baseline_mae - calibrated_mae
+    improvement_percent = 100.0 * improvement / baseline_mae if baseline_mae > 0 else 0.0
+    by_position = {}
+    regressions = []
+    for position, values in position_errors.items():
+        if not values["baseline"]:
+            continue
+        position_baseline = statistics.fmean(values["baseline"])
+        position_calibrated = statistics.fmean(values["calibrated"])
+        position_improvement = 100.0 * (position_baseline - position_calibrated) / position_baseline if position_baseline > 0 else 0.0
+        by_position[position] = {
+            "sample_size": len(values["baseline"]),
+            "baseline_mae": round(position_baseline, 4),
+            "calibrated_mae": round(position_calibrated, 4),
+            "improvement_percent": round(position_improvement, 3),
+        }
+        if len(values["baseline"]) >= 15:
+            regressions.append(-position_improvement)
+    eligible = len(ownership_slates) >= CALIBRATION_MIN_SLATES and len(ownership_observations) >= 40
+    worst_position_regression = max([0.0] + regressions)
+    passes = eligible and improvement_percent >= 1.0 and improvement >= 0.05 and worst_position_regression <= 8.0
+    return {
+        "eligible": eligible,
+        "passes": passes,
+        "minimum_slates": CALIBRATION_MIN_SLATES,
+        "minimum_players": 40,
+        "validated_slates": len(ownership_slates),
+        "validated_players": len(baseline_errors),
+        "baseline_mae": round(baseline_mae, 4),
+        "calibrated_mae": round(calibrated_mae, 4),
+        "mae_improvement": round(improvement, 4),
+        "improvement_percent": round(improvement_percent, 3),
+        "worst_position_regression_percent": round(worst_position_regression, 3),
+        "by_position": by_position,
+        "gate": "passed" if passes else ("collecting" if not eligible else "rejected"),
     }
 
 
@@ -1506,12 +1687,17 @@ def validate_calibration(history):
 def train_calibration_model(history):
     fitted = fit_calibration_parameters(history)
     validation = validate_calibration(history)
+    ownership_fitted = fit_ownership_parameters(history)
+    ownership_validation = validate_ownership_calibration(history)
     fingerprint = json.dumps({
         "slates": [normalize_slate_key(item.get("slate_key")) for item in history],
         "parameters": fitted.get("positions", {}),
+        "ownership_parameters": ownership_fitted.get("positions", {}),
     }, sort_keys=True)
     model_version = f"mlb-cal-{hashlib.sha256(fingerprint.encode('utf-8')).hexdigest()[:12]}"
-    status = "active" if validation["passes"] else ("collecting" if not validation["eligible"] else "rejected")
+    any_component_active = validation["passes"] or ownership_validation["passes"]
+    any_component_eligible = validation["eligible"] or ownership_validation["eligible"]
+    status = "active" if any_component_active else ("collecting" if not any_component_eligible else "rejected")
     adjustment_scale = calibration_adjustment_scale(fitted.get("training_slate_count", 0))
     training_slate_count = fitted.get("training_slate_count", 0)
     learning_stage = (
@@ -1526,19 +1712,22 @@ def train_calibration_model(history):
         "is_active": status == "active",
         "training_slate_count": training_slate_count,
         "training_player_count": fitted.get("training_player_count", 0),
+        "ownership_training_slate_count": ownership_fitted.get("training_slate_count", 0),
+        "ownership_training_player_count": ownership_fitted.get("training_player_count", 0),
         "learning_stage": learning_stage,
         "adjustment_scale": adjustment_scale,
         "full_strength_slates": CALIBRATION_FULL_STRENGTH_SLATES,
         "target_model_versions": fitted.get("model_versions", []),
         "parameters": {
             "positions": fitted.get("positions", {}),
+            "ownership_positions": ownership_fitted.get("positions", {}),
             "learning": {
                 "stage": learning_stage,
                 "adjustment_scale": adjustment_scale,
                 "full_strength_slates": CALIBRATION_FULL_STRENGTH_SLATES,
             },
         },
-        "validation": validation,
+        "validation": {**validation, "ownership": ownership_validation},
     }
 
 
@@ -1611,13 +1800,16 @@ def load_active_calibration_model(force=False):
 def apply_calibration_to_player(player, model=None):
     calibrated = dict(player)
     raw_projection = safe_float(calibrated.get("raw_projection"), safe_float(calibrated.get("projection"), 0))
+    raw_ownership = safe_float(calibrated.get("raw_ownership"), safe_float(calibrated.get("ownership"), 0))
     raw_floor = safe_float(calibrated.get("raw_floor"), safe_float(calibrated.get("floor"), max(0.0, raw_projection * 0.35)))
     default_ceiling_multiplier = 1.65 if normalize_position(calibrated.get("position")) == "P" else 2.2
     raw_ceiling = safe_float(calibrated.get("raw_ceiling"), safe_float(calibrated.get("ceiling"), raw_projection * default_ceiling_multiplier))
     calibrated["raw_projection"] = round(raw_projection, 4)
     calibrated["raw_floor"] = round(raw_floor, 4)
     calibrated["raw_ceiling"] = round(raw_ceiling, 4)
+    calibrated["raw_ownership"] = round(raw_ownership, 4)
     calibrated["calibration_applied"] = False
+    calibrated["ownership_calibration_applied"] = False
     if not model or not model.get("is_active"):
         return calibrated
     target_versions = {str(value) for value in model.get("target_model_versions", [])}
@@ -1626,18 +1818,26 @@ def apply_calibration_to_player(player, model=None):
         calibrated["calibration_skip_reason"] = "projection_model_version_not_trained"
         return calibrated
     position = normalize_position(calibrated.get("position"))
-    positions = (model.get("parameters") or {}).get("positions", {})
+    model_parameters = model.get("parameters") or {}
+    positions = model_parameters.get("positions", {})
     parameter = positions.get(position) or positions.get("ALL")
-    if not isinstance(parameter, dict):
+    ownership_positions = model_parameters.get("ownership_positions", {})
+    ownership_parameter = ownership_positions.get(position) or ownership_positions.get("ALL")
+    validation = model.get("validation") if isinstance(model.get("validation"), dict) else {}
+    projection_enabled = bool(validation.get("passes", True))
+    ownership_validation = validation.get("ownership") if isinstance(validation.get("ownership"), dict) else {}
+    ownership_enabled = bool(ownership_validation.get("passes", False))
+    if not isinstance(parameter, dict) and not (ownership_enabled and isinstance(ownership_parameter, dict)):
         calibrated["calibration_skip_reason"] = "position_not_trained"
         return calibrated
     adjustment_scale = max(0.0, min(1.0, safe_float(
         model.get("adjustment_scale"),
         calibration_adjustment_scale(model.get("training_slate_count", 0)),
     )))
-    offset = safe_float(parameter.get("projection_offset"), 0) * adjustment_scale
-    empirical_floor = raw_projection + safe_float(parameter.get("residual_q15"), raw_floor - raw_projection)
-    empirical_ceiling = raw_projection + safe_float(parameter.get("residual_q90"), raw_ceiling - raw_projection)
+    projection_parameter = parameter if projection_enabled and isinstance(parameter, dict) else {}
+    offset = safe_float(projection_parameter.get("projection_offset"), 0) * adjustment_scale
+    empirical_floor = raw_projection + safe_float(projection_parameter.get("residual_q15"), raw_floor - raw_projection)
+    empirical_ceiling = raw_projection + safe_float(projection_parameter.get("residual_q90"), raw_ceiling - raw_projection)
     projection = max(0.0, raw_projection + offset)
     floor_empirical_weight = 0.30 * adjustment_scale
     ceiling_empirical_weight = 0.35 * adjustment_scale
@@ -1653,13 +1853,21 @@ def apply_calibration_to_player(player, model=None):
         "projection": round(projection, 3),
         "floor": round(floor, 3),
         "ceiling": round(ceiling, 3),
-        "calibration_applied": True,
+        "calibration_applied": bool(projection_enabled and projection_parameter),
         "calibration_adjustment": round(offset, 3),
         "calibration_adjustment_scale": round(adjustment_scale, 3),
-        "calibration_confidence": round(safe_float(parameter.get("confidence"), 0), 3),
+        "calibration_confidence": round(safe_float(projection_parameter.get("confidence"), 0), 3),
         "calibration_model_version": model.get("model_version"),
         "calibration_trained_slates": safe_int(model.get("training_slate_count"), 0),
     })
+    if ownership_enabled and isinstance(ownership_parameter, dict):
+        ownership_offset = safe_float(ownership_parameter.get("ownership_offset"), 0) * adjustment_scale
+        calibrated.update({
+            "ownership": round(max(0.0, min(100.0, raw_ownership + ownership_offset)), 3),
+            "ownership_calibration_applied": True,
+            "ownership_calibration_adjustment": round(ownership_offset, 3),
+            "ownership_calibration_confidence": round(safe_float(ownership_parameter.get("confidence"), 0), 3),
+        })
     return calibrated
 
 
@@ -6634,10 +6842,12 @@ async def upload_actual_results_csv(
     history = load_backtest_history(admin_token)
     calibration_model = train_calibration_model(history)
     calibration_persisted = save_calibration_model(calibration_model, admin_token)
+    ownership_sample_size = safe_int(((result.get("ownership") or {}).get("overall") or {}).get("sample_size"), 0)
+    ownership_status = ((calibration_model.get("validation") or {}).get("ownership") or {}).get("gate", "collecting")
     response_payload = {key: value for key, value in payload.items() if key != "observations"}
     return {
         **response_payload,
-        "message": f"MLB backtest saved for {resolved_slate_key} with {result['matched_players']} matched players. Rolling calibration is {calibration_model['status']}.",
+        "message": f"MLB backtest saved for {resolved_slate_key} with {result['matched_players']} matched players. Projection calibration is {calibration_model['status']}; ownership calibration is {ownership_status} with {ownership_sample_size} actual ownership values from this slate.",
         "history_slate_count": len(history),
         "training_slate_count": calibration_model.get("training_slate_count", 0),
         "training_player_count": calibration_model.get("training_player_count", 0),
@@ -6645,6 +6855,9 @@ async def upload_actual_results_csv(
         "calibration_model_version": calibration_model.get("model_version"),
         "calibration_learning_stage": calibration_model.get("learning_stage"),
         "calibration_adjustment_scale": calibration_model.get("adjustment_scale", 0),
+        "ownership_training_slate_count": calibration_model.get("ownership_training_slate_count", 0),
+        "ownership_training_player_count": calibration_model.get("ownership_training_player_count", 0),
+        "ownership_validation": (calibration_model.get("validation") or {}).get("ownership", {}),
         "validation": calibration_model.get("validation", {}),
         "backtest_persisted": backtest_persisted,
         "calibration_persisted": calibration_persisted,
@@ -6659,6 +6872,46 @@ def model_backtest_status(authorization: str = Header("")):
     history = load_backtest_history(admin_token)
     candidate = train_calibration_model(history)
     active_model = load_active_calibration_model()
+    _, observations = training_observations(history)
+    ownership_rows = [row for row in observations if row.get("actual_ownership") is not None]
+    live_odds_rows = [row for row in observations if "odds api" in str(row.get("odds_source", "")).lower()]
+    ownership_validation = (candidate.get("validation") or {}).get("ownership", {})
+    active_validation = (active_model or {}).get("validation", {}) if isinstance(active_model, dict) else {}
+    active_ownership_validation = active_validation.get("ownership", {}) if isinstance(active_validation, dict) else {}
+    learning_components = {
+        "projections": {
+            "status": "active" if active_model and active_validation.get("passes", True) else candidate.get("validation", {}).get("gate", "collecting"),
+            "slates": candidate.get("training_slate_count", 0),
+            "players": candidate.get("training_player_count", 0),
+            "adjusts_live_model": bool(active_model and active_validation.get("passes", True)),
+        },
+        "ownership": {
+            "status": "active" if active_ownership_validation.get("passes") else ownership_validation.get("gate", "collecting"),
+            "slates": len({row["slate_key"] for row in ownership_rows}),
+            "players": len(ownership_rows),
+            "adjusts_live_model": bool(active_ownership_validation.get("passes")),
+            "required_csv_column": "Actual Ownership",
+        },
+        "vegas": {
+            "status": "evidence_ready" if len({row["slate_key"] for row in live_odds_rows}) >= CALIBRATION_MIN_SLATES and len(live_odds_rows) >= 40 else "collecting",
+            "slates": len({row["slate_key"] for row in live_odds_rows}),
+            "players": len(live_odds_rows),
+            "source": "The Odds API consensus",
+            "adjusts_live_model": False,
+        },
+        "simulator": {
+            "status": "needs_contest_standings",
+            "slates": 0,
+            "players": 0,
+            "adjusts_live_model": False,
+        },
+        "lineup_strategy": {
+            "status": "needs_lineup_tracking",
+            "slates": 0,
+            "players": 0,
+            "adjusts_live_model": False,
+        },
+    }
     return {
         "success": True,
         "configured": bool(latest) or bool(history),
@@ -6673,6 +6926,7 @@ def model_backtest_status(authorization: str = Header("")):
         "calibration_status": "active" if active_model else candidate.get("status", "collecting"),
         "candidate_model": candidate,
         "active_model": active_model or {},
+        "learning_components": learning_components,
     }
 
 
@@ -7095,10 +7349,8 @@ def deterministic_market_drift(player, salt, spread=6):
 
 def market_movement_profile(player, state=None):
     """
-    MVP market model.
-    Uses saved snapshots when available; otherwise creates deterministic prior values
-    so the UI can show ownership drift and Vegas movement before paid APIs are connected.
-    Later this function becomes the integration point for real ownership feeds and odds APIs.
+    Compares current ownership and Vegas values with the previous real snapshot.
+    A first observation stays flat rather than inventing movement that did not occur.
     """
     state = state or load_market_state()
     player_key = market_player_key(player)
@@ -7113,14 +7365,12 @@ def market_movement_profile(player, state=None):
     if prior_player:
         previous_ownership = round(safe_float(prior_player.get("ownership", current_ownership), current_ownership), 1)
     else:
-        simulated_delta = deterministic_market_drift(player, "ownership_prior", spread=5) * 0.7
-        previous_ownership = round(max(0.5, min(45.0, current_ownership - simulated_delta)), 1)
+        previous_ownership = current_ownership
 
     if prior_team:
         previous_team_total = round(safe_float(prior_team.get("team_total", current_team_total), current_team_total), 1)
     else:
-        simulated_total_delta = deterministic_market_drift(player, "team_total_prior", spread=4) * 0.1
-        previous_team_total = round(max(2.5, min(7.5, current_team_total - simulated_total_delta)), 1)
+        previous_team_total = current_team_total
 
     ownership_delta = round(current_ownership - previous_ownership, 1)
     team_total_delta = round(current_team_total - previous_team_total, 1)
@@ -7274,8 +7524,8 @@ def market_intelligence_summary(persist_snapshot=False):
         "top_signals": [compact_player(p) for p in top_signals],
         "sharp_plays": [compact_player(p) for p in sorted(sharp, key=lambda p: safe_float(p.get("market_boost", 0), 0), reverse=True)[:10]],
         "bad_chalk": [compact_player(p) for p in sorted(bad_chalk, key=lambda p: safe_float(p.get("ownership_delta", 0), 0), reverse=True)[:10]],
-        "provider_mode": "MVP simulated/API-ready",
-        "provider_note": "Connect ownership projections and odds APIs here. Current version tracks snapshots and deterministic movement when no provider is configured.",
+        "provider_mode": "The Odds API live + ownership snapshots" if ODDS_API_KEY else "Ownership snapshots + estimated Vegas baseline",
+        "provider_note": "Vegas totals use The Odds API consensus and movement appears only after two real snapshots." if ODDS_API_KEY else "Ownership movement appears only after two real snapshots; Vegas remains estimated until the odds feed is configured.",
     }
 
 def player_live_status(player):

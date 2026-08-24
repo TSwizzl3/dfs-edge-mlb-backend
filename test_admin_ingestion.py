@@ -282,13 +282,15 @@ class AdminIngestionTests(unittest.TestCase):
             },
         ]
         actuals = main.parse_actual_results_csv(
-            "Player,DK Points\nPitcher One,23\nHitter One,8\n"
+            "Player,DK Points,Actual Ownership %\nPitcher One,23,18.4%\nHitter One,8,7.2%\n"
         )
         result = main.projection_backtest(players, actuals)
         self.assertEqual(result["matched_players"], 2)
         self.assertEqual(result["overall"]["mae"], 2.5)
         self.assertEqual(result["by_position"]["P"]["sample_size"], 1)
         self.assertEqual(result["by_position"]["OF"]["sample_size"], 1)
+        self.assertEqual(actuals[0]["actual_ownership"], 18.4)
+        self.assertEqual(result["ownership"]["overall"]["sample_size"], 2)
 
     def calibration_history(self, slate_count):
         positions = ["P", "C", "1B", "2B", "3B", "SS", "OF"]
@@ -367,6 +369,25 @@ class AdminIngestionTests(unittest.TestCase):
         self.assertEqual(first["projection"], 9.0)
         self.assertEqual(second["projection"], 9.0)
 
+    def test_actual_ownership_earns_a_separate_validated_adjustment(self):
+        history = self.calibration_history(3)
+        for slate in history:
+            for observation in slate["observations"]:
+                observation["projected_ownership"] = 10.0
+                observation["actual_ownership"] = 15.0
+        model = main.train_calibration_model(history)
+        self.assertTrue(model["validation"]["ownership"]["passes"])
+        self.assertGreater(model["parameters"]["ownership_positions"]["ALL"]["ownership_offset"], 0)
+        player = {
+            "name": "Ownership Test", "position": "OF",
+            "projection": 10.0, "floor": 2.0, "ceiling": 22.0,
+            "ownership": 10.0,
+            "projection_model_version": "imported_projection_blend_v1",
+        }
+        calibrated = main.apply_calibration_to_player(player, model)
+        self.assertTrue(calibrated["ownership_calibration_applied"])
+        self.assertGreater(calibrated["ownership"], 10.0)
+
     def test_backtest_compares_raw_and_calibrated_accuracy(self):
         players = [{
             "name": "Learned Hitter", "position": "OF",
@@ -429,6 +450,17 @@ class AdminIngestionTests(unittest.TestCase):
         self.assertEqual(result["team_total"], 5.2)
         self.assertEqual(result["opponent_total"], 3.8)
         self.assertEqual(result["vegas_source"], "The Odds API consensus")
+
+    def test_first_market_snapshot_does_not_invent_movement(self):
+        player = {
+            "name": "Real Signal", "position": "OF", "team": "PHI",
+            "projection": 10.0, "ownership": 14.0, "team_total": 4.9,
+            "odds_source": "The Odds API consensus",
+        }
+        profile = main.market_movement_profile(player, {"players": {}, "teams": {}})
+        self.assertEqual(profile["ownership_delta"], 0.0)
+        self.assertEqual(profile["team_total_delta"], 0.0)
+        self.assertEqual(profile["market_signal_type"], "neutral")
 
     def test_live_weather_is_blended_into_data_engine(self):
         player = {
