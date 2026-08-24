@@ -290,6 +290,96 @@ class AdminIngestionTests(unittest.TestCase):
         self.assertEqual(result["by_position"]["P"]["sample_size"], 1)
         self.assertEqual(result["by_position"]["OF"]["sample_size"], 1)
 
+    def calibration_history(self, slate_count):
+        positions = ["P", "C", "1B", "2B", "3B", "SS", "OF"]
+        history = []
+        for slate_index in range(slate_count):
+            observations = []
+            for player_index in range(70):
+                projection = 8.0 + (player_index % 8)
+                observations.append({
+                    "name": f"Player {slate_index}-{player_index}",
+                    "position": positions[player_index % len(positions)],
+                    "raw_projection": projection,
+                    "projection": projection,
+                    "actual": projection - 2.0,
+                    "model_version": "imported_projection_blend_v1",
+                })
+            history.append({
+                "slate_key": f"2026-slate-{slate_index}",
+                "evaluated_at": f"2026-08-{slate_index + 1:02d}T23:00:00+00:00",
+                "observations": observations,
+            })
+        return history
+
+    def test_calibration_stays_in_collecting_mode_before_ten_slates(self):
+        model = main.train_calibration_model(self.calibration_history(9))
+        self.assertEqual(model["status"], "collecting")
+        self.assertFalse(model["is_active"])
+        self.assertEqual(model["training_slate_count"], 9)
+
+    def test_cross_validated_calibration_activates_when_it_beats_baseline(self):
+        model = main.train_calibration_model(self.calibration_history(10))
+        self.assertEqual(model["status"], "active")
+        self.assertTrue(model["is_active"])
+        self.assertGreater(model["validation"]["improvement_percent"], 0.5)
+        self.assertLess(model["parameters"]["positions"]["OF"]["projection_offset"], 0)
+
+    def test_active_calibration_uses_raw_projection_without_double_applying(self):
+        model = {
+            "model_version": "mlb-cal-test",
+            "is_active": True,
+            "training_slate_count": 10,
+            "target_model_versions": ["imported_projection_blend_v1"],
+            "parameters": {"positions": {"OF": {
+                "projection_offset": -1.0,
+                "residual_q15": -5.0,
+                "residual_q90": 7.0,
+                "confidence": 0.8,
+            }}},
+        }
+        player = {
+            "name": "Calibrated Hitter", "position": "OF",
+            "raw_projection": 10.0, "projection": 9.0,
+            "raw_floor": 2.0, "floor": 2.0,
+            "raw_ceiling": 22.0, "ceiling": 22.0,
+            "projection_model_version": "imported_projection_blend_v1",
+        }
+        first = main.apply_calibration_to_player(player, model)
+        second = main.apply_calibration_to_player(first, model)
+        self.assertEqual(first["projection"], 9.0)
+        self.assertEqual(second["projection"], 9.0)
+
+    def test_backtest_compares_raw_and_calibrated_accuracy(self):
+        players = [{
+            "name": "Learned Hitter", "position": "OF",
+            "raw_projection": 10.0, "projection": 9.0,
+            "floor": 2.0, "ceiling": 20.0,
+            "projection_model_version": "imported_projection_blend_v1",
+            "calibration_applied": True,
+        }]
+        result = main.projection_backtest(players, [{"name": "Learned Hitter", "actual_points": 9.0}])
+        self.assertEqual(result["baseline_overall"]["mae"], 1.0)
+        self.assertEqual(result["overall"]["mae"], 0.0)
+        self.assertEqual(len(result["observations"]), 1)
+
+    def test_projection_snapshots_remain_isolated_by_slate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot_dir = Path(directory) / "snapshots"
+            snapshot_dir.mkdir()
+            legacy_path = Path(directory) / "latest.json"
+            with patch.object(main, "PROJECTION_SNAPSHOT_DIR", snapshot_dir), patch.object(
+                main, "PROJECTION_SNAPSHOT_PATH", legacy_path
+            ), patch.object(main, "supabase_data_request", return_value=None), patch.object(
+                main, "load_slate_record", return_value={}
+            ), patch.object(main, "load_slate_metadata", return_value={"slate_date": "2026-08-24"}):
+                main.save_projection_snapshot([{"name": "Early Bat"}], "2026-08-24-early")
+                main.save_projection_snapshot([{"name": "Main Bat"}], "2026-08-24-main")
+                early = main.load_projection_snapshot("2026-08-24-early")
+                main_slate = main.load_projection_snapshot("2026-08-24-main")
+        self.assertEqual(early["players"][0]["name"], "Early Bat")
+        self.assertEqual(main_slate["players"][0]["name"], "Main Bat")
+
     def test_mlb_odds_consensus_creates_team_totals(self):
         events = [{
             "id": "game-1",

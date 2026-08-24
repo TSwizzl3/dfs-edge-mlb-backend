@@ -54,8 +54,17 @@ MARKET_STATE_PATH = BASE_DIR / "market_state.json"
 USERS_PATH = BASE_DIR / "users.json"
 PAYOUT_TABLE_PATH = BASE_DIR / "mlb_payout_table.json"
 PROJECTION_SNAPSHOT_PATH = BASE_DIR / "mlb_projection_snapshot.json"
+PROJECTION_SNAPSHOT_DIR = BASE_DIR / "mlb_projection_snapshots"
+PROJECTION_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
 BACKTEST_LATEST_PATH = BASE_DIR / "mlb_backtest_latest.json"
 BACKTEST_HISTORY_PATH = BASE_DIR / "mlb_backtest_history.json"
+CALIBRATION_MODEL_PATH = BASE_DIR / "mlb_calibration_model.json"
+CALIBRATION_MIN_SLATES = 10
+CALIBRATION_MIN_PLAYERS = 500
+CALIBRATION_MAX_SLATES = 90
+CALIBRATION_HALF_LIFE_SLATES = 20.0
+CALIBRATION_CACHE_SECONDS = 5 * 60
+_CALIBRATION_CACHE = {"loaded_at": 0.0, "model": None}
 MLB_STARTER_STATE_PATH = BASE_DIR / "mlb_starter_state.json"
 MLB_ODDS_STATE_PATH = BASE_DIR / "mlb_odds_state.json"
 MLB_WEATHER_STATE_PATH = BASE_DIR / "mlb_weather_state.json"
@@ -469,25 +478,30 @@ def projection_backtest(players, actual_rows):
             continue
         actual = actual_by_name[key]
         projection = safe_float(player.get("projection"), 0)
+        raw_projection = safe_float(player.get("raw_projection"), projection)
         floor = safe_float(player.get("floor"), max(0, projection * 0.35))
         ceiling = safe_float(player.get("ceiling"), projection * (1.65 if normalize_position(player.get("position")) == "P" else 2.2))
         matched.append({
             "name": player.get("name"),
             "position": normalize_position(player.get("position")),
             "projection": projection,
+            "raw_projection": raw_projection,
             "floor": floor,
             "ceiling": ceiling,
             "actual": actual,
             "error": projection - actual,
+            "raw_error": raw_projection - actual,
             "model_version": player.get("projection_model_version", "unknown"),
+            "calibration_model_version": player.get("calibration_model_version"),
+            "calibration_applied": bool(player.get("calibration_applied", False)),
         })
 
-    def metrics(rows):
+    def metrics(rows, projection_key="projection"):
         if not rows:
             return {"sample_size": 0}
-        errors = [item["error"] for item in rows]
-        projections = [item["projection"] for item in rows]
+        projections = [safe_float(item.get(projection_key), 0) for item in rows]
         actuals = [item["actual"] for item in rows]
+        errors = [projection - actual for projection, actual in zip(projections, actuals)]
         mean_projection = statistics.fmean(projections)
         mean_actual = statistics.fmean(actuals)
         covariance = sum(
@@ -513,13 +527,19 @@ def projection_backtest(players, actual_rows):
     positions = ["P", "C", "1B", "2B", "3B", "SS", "OF"]
     return {
         "overall": metrics(matched),
+        "baseline_overall": metrics(matched, "raw_projection"),
         "by_position": {
             position: metrics([item for item in matched if item["position"] == position])
+            for position in positions
+        },
+        "baseline_by_position": {
+            position: metrics([item for item in matched if item["position"] == position], "raw_projection")
             for position in positions
         },
         "matched_players": len(matched),
         "unmatched_results": max(0, len(actual_rows) - len(matched)),
         "model_versions": sorted({item["model_version"] for item in matched}),
+        "observations": matched,
     }
 
 
@@ -1150,6 +1170,435 @@ def list_slate_library():
             "updated_at": meta.get("updated_at", ""),
         })
     return ordered
+
+
+def supabase_data_request(table, method="GET", query="", payload=None, auth_token="", prefer=""):
+    service_key = supabase_service_key()
+    api_key = service_key or SUPABASE_PUBLISHABLE_KEY
+    bearer_key = service_key or str(auth_token or "").strip() or api_key
+    if not api_key or not bearer_key:
+        return None
+    suffix = str(query or "")
+    if suffix and not suffix.startswith("?"):
+        suffix = f"?{suffix}"
+    headers = {
+        "apikey": api_key,
+        "Authorization": f"Bearer {bearer_key}",
+        "Accept": "application/json",
+    }
+    data = None
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    if prefer:
+        headers["Prefer"] = prefer
+    request = urllib.request.Request(
+        f"{SUPABASE_URL}/rest/v1/{table}{suffix}",
+        data=data,
+        method=method,
+        headers=headers,
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=35) as response:
+            body = response.read().decode("utf-8")
+        return json.loads(body) if body else []
+    except Exception:
+        return None
+
+
+def projection_snapshot_path(slate_key):
+    digest = hashlib.sha256(normalize_slate_key(slate_key).encode("utf-8")).hexdigest()[:24]
+    return PROJECTION_SNAPSHOT_DIR / f"{digest}.json"
+
+
+def save_projection_snapshot(players, slate_key, auth_token=""):
+    resolved_key = normalize_slate_key(slate_key)
+    slate_record = load_slate_record(resolved_key) or {}
+    meta = load_slate_metadata()
+    model_versions = sorted({
+        str(player.get("projection_model_version", "unknown"))
+        for player in players if isinstance(player, dict)
+    })
+    calibration_versions = sorted({
+        str(player.get("calibration_model_version"))
+        for player in players
+        if isinstance(player, dict) and player.get("calibration_model_version")
+    })
+    captured_at = datetime.now(timezone.utc).isoformat()
+    record = {
+        "slate_key": resolved_key,
+        "slate_date": slate_record.get("slate_date") or meta.get("slate_date") or None,
+        "captured_at": captured_at,
+        "source": "admin_projection_csv",
+        "model_versions": model_versions,
+        "calibration_model_version": calibration_versions[-1] if calibration_versions else None,
+        "players": players,
+        "player_count": len(players),
+    }
+    try:
+        projection_snapshot_path(resolved_key).write_text(json.dumps(record, indent=2), encoding="utf-8")
+        write_json_file(PROJECTION_SNAPSHOT_PATH, players)
+    except Exception:
+        pass
+    rows = supabase_data_request(
+        "mlb_projection_snapshots",
+        method="POST",
+        query="on_conflict=slate_key",
+        payload=record,
+        auth_token=auth_token,
+        prefer="resolution=merge-duplicates,return=representation",
+    )
+    record["persisted"] = bool(isinstance(rows, list) and rows)
+    return record
+
+
+def load_projection_snapshot(slate_key, auth_token=""):
+    resolved_key = normalize_slate_key(slate_key)
+    encoded_key = urllib.parse.quote(resolved_key, safe="")
+    rows = supabase_data_request(
+        "mlb_projection_snapshots",
+        query=f"slate_key=eq.{encoded_key}&select=*&limit=1",
+        auth_token=auth_token,
+    )
+    if isinstance(rows, list) and rows and isinstance(rows[0].get("players"), list):
+        return rows[0]
+    try:
+        saved = json.loads(projection_snapshot_path(resolved_key).read_text(encoding="utf-8"))
+        if isinstance(saved, dict) and isinstance(saved.get("players"), list):
+            return saved
+    except Exception:
+        pass
+    legacy = read_json_file(PROJECTION_SNAPSHOT_PATH, [])
+    if isinstance(legacy, list) and len(legacy) >= 10:
+        return {"slate_key": resolved_key, "players": legacy, "source": "legacy_latest_snapshot"}
+    return None
+
+
+def save_backtest_record(payload, auth_token=""):
+    slate_key = normalize_slate_key(payload.get("slate_key"))
+    history = read_json_file(BACKTEST_HISTORY_PATH, [])
+    history = history if isinstance(history, list) else []
+    history = [item for item in history if normalize_slate_key(item.get("slate_key")) != slate_key]
+    history.append(payload)
+    history = history[-365:]
+    write_json_file(BACKTEST_LATEST_PATH, payload)
+    write_json_file(BACKTEST_HISTORY_PATH, history)
+    record = {
+        "slate_key": slate_key,
+        "slate_date": payload.get("slate_date") or None,
+        "evaluated_at": payload.get("evaluated_at") or datetime.now(timezone.utc).isoformat(),
+        "model_versions": payload.get("model_versions", []),
+        "observations": payload.get("observations", []),
+        "baseline_overall": payload.get("baseline_overall", {}),
+        "calibrated_overall": payload.get("overall", {}),
+        "by_position": {
+            "calibrated": payload.get("by_position", {}),
+            "baseline": payload.get("baseline_by_position", {}),
+        },
+        "matched_players": safe_int(payload.get("matched_players"), 0),
+        "unmatched_results": safe_int(payload.get("unmatched_results"), 0),
+    }
+    rows = supabase_data_request(
+        "mlb_model_backtests",
+        method="POST",
+        query="on_conflict=slate_key",
+        payload=record,
+        auth_token=auth_token,
+        prefer="resolution=merge-duplicates,return=representation",
+    )
+    return history, bool(isinstance(rows, list) and rows)
+
+
+def load_backtest_history(auth_token=""):
+    records = {}
+    rows = supabase_data_request(
+        "mlb_model_backtests",
+        query=f"select=*&order=evaluated_at.desc&limit={CALIBRATION_MAX_SLATES}",
+        auth_token=auth_token,
+    )
+    for row in rows if isinstance(rows, list) else []:
+        by_position = row.get("by_position") if isinstance(row.get("by_position"), dict) else {}
+        item = {
+            "success": True,
+            "sport": "MLB",
+            "slate_key": row.get("slate_key"),
+            "slate_date": row.get("slate_date"),
+            "evaluated_at": row.get("evaluated_at"),
+            "model_versions": row.get("model_versions", []),
+            "observations": row.get("observations", []),
+            "baseline_overall": row.get("baseline_overall", {}),
+            "overall": row.get("calibrated_overall", {}),
+            "baseline_by_position": by_position.get("baseline", {}),
+            "by_position": by_position.get("calibrated", {}),
+            "matched_players": row.get("matched_players", 0),
+            "unmatched_results": row.get("unmatched_results", 0),
+        }
+        records[normalize_slate_key(item.get("slate_key"))] = item
+    local_history = read_json_file(BACKTEST_HISTORY_PATH, [])
+    for item in local_history if isinstance(local_history, list) else []:
+        key = normalize_slate_key(item.get("slate_key"))
+        records.setdefault(key, item)
+    return sorted(
+        records.values(),
+        key=lambda item: str(item.get("evaluated_at") or item.get("slate_date") or ""),
+    )[-CALIBRATION_MAX_SLATES:]
+
+
+def weighted_mean(values, weights):
+    total_weight = sum(weights)
+    return sum(value * weight for value, weight in zip(values, weights)) / total_weight if total_weight > 0 else 0.0
+
+
+def weighted_quantile(values, weights, quantile):
+    if not values:
+        return 0.0
+    ordered = sorted(zip(values, weights), key=lambda item: item[0])
+    target = max(0.0, min(1.0, quantile)) * sum(weight for _, weight in ordered)
+    running = 0.0
+    for value, weight in ordered:
+        running += weight
+        if running >= target:
+            return value
+    return ordered[-1][0]
+
+
+def training_observations(history):
+    trainable = [item for item in history if isinstance(item.get("observations"), list) and item.get("observations")]
+    observations = []
+    total_slates = len(trainable)
+    for index, backtest in enumerate(trainable):
+        age = max(0, total_slates - index - 1)
+        recency_weight = 0.5 ** (age / CALIBRATION_HALF_LIFE_SLATES)
+        slate_key = normalize_slate_key(backtest.get("slate_key"))
+        for row in backtest.get("observations", []):
+            raw_projection = safe_float(row.get("raw_projection"), safe_float(row.get("projection"), -1))
+            actual = safe_float(row.get("actual"), -1)
+            if raw_projection < 0 or actual < 0:
+                continue
+            observations.append({
+                "slate_key": slate_key,
+                "position": normalize_position(row.get("position")),
+                "raw_projection": raw_projection,
+                "actual": actual,
+                "residual": actual - raw_projection,
+                "weight": recency_weight,
+                "model_version": str(row.get("model_version") or "unknown"),
+            })
+    return trainable, observations
+
+
+def fit_calibration_parameters(history):
+    trainable, observations = training_observations(history)
+    parameters = {}
+    groups = ["ALL", "P", "C", "1B", "2B", "3B", "SS", "OF"]
+    for group in groups:
+        rows = observations if group == "ALL" else [row for row in observations if row["position"] == group]
+        if not rows or (group != "ALL" and len(rows) < 20):
+            continue
+        residuals = [row["residual"] for row in rows]
+        weights = [row["weight"] for row in rows]
+        raw_offset = weighted_mean(residuals, weights)
+        shrinkage = len(rows) / (len(rows) + (120.0 if group == "ALL" else 80.0))
+        limit = 3.0 if group == "P" else 2.5
+        offset = max(-limit, min(limit, raw_offset * shrinkage))
+        slate_count = len({row["slate_key"] for row in rows})
+        confidence = min(1.0, slate_count / 20.0) * min(1.0, len(rows) / (300.0 if group == "ALL" else 120.0))
+        parameters[group] = {
+            "projection_offset": round(offset, 4),
+            "raw_residual_mean": round(raw_offset, 4),
+            "residual_q15": round(weighted_quantile(residuals, weights, 0.15), 4),
+            "residual_q90": round(weighted_quantile(residuals, weights, 0.90), 4),
+            "sample_size": len(rows),
+            "slate_count": slate_count,
+            "confidence": round(confidence, 4),
+        }
+    model_versions = sorted({row["model_version"] for row in observations})
+    return {
+        "positions": parameters,
+        "model_versions": model_versions,
+        "training_slate_count": len(trainable),
+        "training_player_count": len(observations),
+    }
+
+
+def validate_calibration(history):
+    trainable, observations = training_observations(history)
+    baseline_errors = []
+    calibrated_errors = []
+    position_errors = {}
+    for holdout in trainable:
+        training = [item for item in trainable if item is not holdout]
+        fitted = fit_calibration_parameters(training)
+        params = fitted.get("positions", {})
+        for row in holdout.get("observations", []):
+            raw_projection = safe_float(row.get("raw_projection"), safe_float(row.get("projection"), -1))
+            actual = safe_float(row.get("actual"), -1)
+            if raw_projection < 0 or actual < 0:
+                continue
+            position = normalize_position(row.get("position"))
+            parameter = params.get(position) or params.get("ALL") or {}
+            calibrated_projection = raw_projection + safe_float(parameter.get("projection_offset"), 0)
+            baseline_error = abs(raw_projection - actual)
+            calibrated_error = abs(calibrated_projection - actual)
+            baseline_errors.append(baseline_error)
+            calibrated_errors.append(calibrated_error)
+            bucket = position_errors.setdefault(position, {"baseline": [], "calibrated": []})
+            bucket["baseline"].append(baseline_error)
+            bucket["calibrated"].append(calibrated_error)
+    baseline_mae = statistics.fmean(baseline_errors) if baseline_errors else 0.0
+    calibrated_mae = statistics.fmean(calibrated_errors) if calibrated_errors else 0.0
+    improvement = baseline_mae - calibrated_mae
+    improvement_percent = (100.0 * improvement / baseline_mae) if baseline_mae > 0 else 0.0
+    by_position = {}
+    regressions = []
+    for position, values in position_errors.items():
+        if not values["baseline"]:
+            continue
+        position_baseline = statistics.fmean(values["baseline"])
+        position_calibrated = statistics.fmean(values["calibrated"])
+        position_improvement = 100.0 * (position_baseline - position_calibrated) / position_baseline if position_baseline > 0 else 0.0
+        by_position[position] = {
+            "sample_size": len(values["baseline"]),
+            "baseline_mae": round(position_baseline, 4),
+            "calibrated_mae": round(position_calibrated, 4),
+            "improvement_percent": round(position_improvement, 3),
+        }
+        if len(values["baseline"]) >= 20:
+            regressions.append(-position_improvement)
+    eligible = len(trainable) >= CALIBRATION_MIN_SLATES and len(observations) >= CALIBRATION_MIN_PLAYERS
+    worst_position_regression = max([0.0] + regressions)
+    passes = eligible and improvement_percent >= 0.5 and improvement >= 0.02 and worst_position_regression <= 5.0
+    return {
+        "eligible": eligible,
+        "passes": passes,
+        "minimum_slates": CALIBRATION_MIN_SLATES,
+        "minimum_players": CALIBRATION_MIN_PLAYERS,
+        "validated_slates": len(trainable),
+        "validated_players": len(baseline_errors),
+        "baseline_mae": round(baseline_mae, 4),
+        "calibrated_mae": round(calibrated_mae, 4),
+        "mae_improvement": round(improvement, 4),
+        "improvement_percent": round(improvement_percent, 3),
+        "worst_position_regression_percent": round(worst_position_regression, 3),
+        "by_position": by_position,
+        "gate": "passed" if passes else ("collecting" if not eligible else "rejected"),
+    }
+
+
+def train_calibration_model(history):
+    fitted = fit_calibration_parameters(history)
+    validation = validate_calibration(history)
+    fingerprint = json.dumps({
+        "slates": [normalize_slate_key(item.get("slate_key")) for item in history],
+        "parameters": fitted.get("positions", {}),
+    }, sort_keys=True)
+    model_version = f"mlb-cal-{hashlib.sha256(fingerprint.encode('utf-8')).hexdigest()[:12]}"
+    status = "active" if validation["passes"] else ("collecting" if not validation["eligible"] else "rejected")
+    return {
+        "model_version": model_version,
+        "trained_at": datetime.now(timezone.utc).isoformat(),
+        "status": status,
+        "is_active": status == "active",
+        "training_slate_count": fitted.get("training_slate_count", 0),
+        "training_player_count": fitted.get("training_player_count", 0),
+        "target_model_versions": fitted.get("model_versions", []),
+        "parameters": {"positions": fitted.get("positions", {})},
+        "validation": validation,
+    }
+
+
+def save_calibration_model(model, auth_token=""):
+    global _CALIBRATION_CACHE
+    if model.get("is_active"):
+        supabase_data_request(
+            "mlb_calibration_models",
+            method="PATCH",
+            query="is_active=eq.true",
+            payload={"is_active": False, "status": "shadow"},
+            auth_token=auth_token,
+            prefer="return=minimal",
+        )
+    rows = supabase_data_request(
+        "mlb_calibration_models",
+        method="POST",
+        query="on_conflict=model_version",
+        payload=model,
+        auth_token=auth_token,
+        prefer="resolution=merge-duplicates,return=representation",
+    )
+    try:
+        CALIBRATION_MODEL_PATH.write_text(json.dumps(model, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+    if model.get("is_active"):
+        _CALIBRATION_CACHE = {"loaded_at": time.time(), "model": model}
+    return bool(isinstance(rows, list) and rows)
+
+
+def load_active_calibration_model(force=False):
+    global _CALIBRATION_CACHE
+    if not force and time.time() - safe_float(_CALIBRATION_CACHE.get("loaded_at"), 0) < CALIBRATION_CACHE_SECONDS:
+        return _CALIBRATION_CACHE.get("model")
+    rows = supabase_data_request(
+        "mlb_calibration_models",
+        query="is_active=eq.true&select=*&order=trained_at.desc&limit=1",
+    )
+    model = rows[0] if isinstance(rows, list) and rows else None
+    if not model:
+        try:
+            saved = json.loads(CALIBRATION_MODEL_PATH.read_text(encoding="utf-8"))
+            model = saved if isinstance(saved, dict) and saved.get("is_active") else None
+        except Exception:
+            model = None
+    _CALIBRATION_CACHE = {"loaded_at": time.time(), "model": model}
+    return model
+
+
+def apply_calibration_to_player(player, model=None):
+    calibrated = dict(player)
+    raw_projection = safe_float(calibrated.get("raw_projection"), safe_float(calibrated.get("projection"), 0))
+    raw_floor = safe_float(calibrated.get("raw_floor"), safe_float(calibrated.get("floor"), max(0.0, raw_projection * 0.35)))
+    default_ceiling_multiplier = 1.65 if normalize_position(calibrated.get("position")) == "P" else 2.2
+    raw_ceiling = safe_float(calibrated.get("raw_ceiling"), safe_float(calibrated.get("ceiling"), raw_projection * default_ceiling_multiplier))
+    calibrated["raw_projection"] = round(raw_projection, 4)
+    calibrated["raw_floor"] = round(raw_floor, 4)
+    calibrated["raw_ceiling"] = round(raw_ceiling, 4)
+    calibrated["calibration_applied"] = False
+    if not model or not model.get("is_active"):
+        return calibrated
+    target_versions = {str(value) for value in model.get("target_model_versions", [])}
+    current_version = str(calibrated.get("projection_model_version") or "unknown")
+    if target_versions and current_version not in target_versions:
+        calibrated["calibration_skip_reason"] = "projection_model_version_not_trained"
+        return calibrated
+    position = normalize_position(calibrated.get("position"))
+    positions = (model.get("parameters") or {}).get("positions", {})
+    parameter = positions.get(position) or positions.get("ALL")
+    if not isinstance(parameter, dict):
+        calibrated["calibration_skip_reason"] = "position_not_trained"
+        return calibrated
+    offset = safe_float(parameter.get("projection_offset"), 0)
+    empirical_floor = raw_projection + safe_float(parameter.get("residual_q15"), raw_floor - raw_projection)
+    empirical_ceiling = raw_projection + safe_float(parameter.get("residual_q90"), raw_ceiling - raw_projection)
+    projection = max(0.0, raw_projection + offset)
+    floor = max(0.0, min(projection, (raw_floor + offset) * 0.70 + empirical_floor * 0.30))
+    ceiling = max(projection, (raw_ceiling + offset) * 0.65 + empirical_ceiling * 0.35)
+    calibrated.update({
+        "projection": round(projection, 3),
+        "floor": round(floor, 3),
+        "ceiling": round(ceiling, 3),
+        "calibration_applied": True,
+        "calibration_adjustment": round(offset, 3),
+        "calibration_confidence": round(safe_float(parameter.get("confidence"), 0), 3),
+        "calibration_model_version": model.get("model_version"),
+        "calibration_trained_slates": safe_int(model.get("training_slate_count"), 0),
+    })
+    return calibrated
+
+
+def apply_rolling_calibration(players, model=None):
+    active_model = model if model is not None else load_active_calibration_model()
+    return [apply_calibration_to_player(player, active_model) for player in players]
 
 
 def load_players(slate_key=""):
@@ -2501,7 +2950,7 @@ def player_grade(player):
 
 def add_values(players):
     clean_players = []
-    for player in players:
+    for player in apply_rolling_calibration(players):
         clean_player = dict(player)
         clean_player["position"] = normalize_position(clean_player.get("position"))
         clean_player["team"] = normalize_team(clean_player.get("team"))
@@ -5975,6 +6424,7 @@ async def upload_projections_csv(
             continue
         unmatched_names.discard(key)
         matched += 1
+        player["raw_projection"] = item["projection"]
         player["projection"] = item["projection"]
         player["projection_source"] = "admin_projection_csv"
         player["projection_model_version"] = "imported_projection_blend_v1"
@@ -5983,10 +6433,12 @@ async def upload_projections_csv(
             player["ownership_source"] = "admin_projection_csv"
             ownership_count += 1
         if item.get("ceiling", 0) > 0:
+            player["raw_ceiling"] = item["ceiling"]
             player["ceiling"] = item["ceiling"]
             player["ceiling_source"] = "admin_projection_csv"
             ceiling_count += 1
         if "floor" in item:
+            player["raw_floor"] = item["floor"]
             player["floor"] = item["floor"]
             player["floor_source"] = "admin_projection_csv"
         player["value"] = player_value(player)
@@ -5994,6 +6446,8 @@ async def upload_projections_csv(
     if matched == 0:
         return {"success": False, "error": "Projection names did not match any player on the active MLB slate."}
 
+    active_calibration = load_active_calibration_model(force=True)
+    players = apply_rolling_calibration(players, active_calibration)
     save_active_slate(players)
     if slate_key and slate_key != "current":
         existing_slate = load_slate_record(slate_key) or {}
@@ -6003,17 +6457,22 @@ async def upload_projections_csv(
             existing_slate.get("name", "MLB Slate"),
             existing_slate.get("slate_date", ""),
             existing_slate.get("slate_type", "custom"),
+            admin_token,
         )
-    write_json_file(PROJECTION_SNAPSHOT_PATH, players)
+    snapshot = save_projection_snapshot(players, slate_key or "current", admin_token)
+    calibrated_count = len([player for player in players if player.get("calibration_applied")])
     return {
         "success": True,
-        "message": "MLB projections, ownership, floor, and ceiling data imported successfully.",
+        "message": "MLB projections imported and the pre-lock snapshot was saved for rolling calibration.",
         "rows_imported": len(imported),
         "players_matched": matched,
         "ownership_matched": ownership_count,
         "ceiling_matched": ceiling_count,
         "unmatched_count": len(unmatched_names),
         "projection_snapshot_saved": True,
+        "projection_snapshot_persisted": bool(snapshot.get("persisted")),
+        "calibration_applied_players": calibrated_count,
+        "calibration_model_version": active_calibration.get("model_version") if active_calibration else None,
     }
 
 
@@ -6076,8 +6535,18 @@ async def upload_actual_results_csv(
             "success": False,
             "error": "No results found. Include Name or Player and Actual Points, Fantasy Points, FPTS, DK Points, or Points.",
         }
-    snapshot = read_json_file(PROJECTION_SNAPSHOT_PATH, [])
-    players = snapshot if isinstance(snapshot, list) and len(snapshot) >= 10 else load_players()
+    metadata = load_slate_metadata()
+    resolved_slate_key = normalize_slate_key(
+        slate_key.strip()
+        or metadata.get("slate_key")
+        or metadata.get("slate_date")
+        or metadata.get("slate_name")
+        or datetime.now(timezone.utc).date().isoformat()
+    )
+    snapshot = load_projection_snapshot(resolved_slate_key, admin_token)
+    players = snapshot.get("players", []) if isinstance(snapshot, dict) else []
+    if not isinstance(players, list) or len(players) < 10:
+        players = load_players(resolved_slate_key) or load_players()
     result = projection_backtest(players, actual_rows)
     if result["matched_players"] < 10:
         return {
@@ -6086,45 +6555,54 @@ async def upload_actual_results_csv(
             **result,
         }
 
-    metadata = load_slate_metadata()
-    resolved_slate_key = (
-        slate_key.strip()
-        or metadata.get("slate_date")
-        or metadata.get("slate_name")
-        or datetime.now(timezone.utc).date().isoformat()
-    )
     payload = {
         "success": True,
         "sport": "MLB",
         "slate_key": resolved_slate_key,
+        "slate_date": (snapshot or {}).get("slate_date") or metadata.get("slate_date") or None,
         "evaluated_at": datetime.now(timezone.utc).isoformat(),
         **result,
     }
-    history = read_json_file(BACKTEST_HISTORY_PATH, [])
-    history = history if isinstance(history, list) else []
-    history = [item for item in history if item.get("slate_key") != resolved_slate_key]
-    history.append(payload)
-    history = history[-365:]
-    write_json_file(BACKTEST_LATEST_PATH, payload)
-    write_json_file(BACKTEST_HISTORY_PATH, history)
+    _, backtest_persisted = save_backtest_record(payload, admin_token)
+    history = load_backtest_history(admin_token)
+    calibration_model = train_calibration_model(history)
+    calibration_persisted = save_calibration_model(calibration_model, admin_token)
+    response_payload = {key: value for key, value in payload.items() if key != "observations"}
     return {
-        **payload,
-        "message": f"MLB backtest saved for {resolved_slate_key} with {result['matched_players']} matched players.",
+        **response_payload,
+        "message": f"MLB backtest saved for {resolved_slate_key} with {result['matched_players']} matched players. Rolling calibration is {calibration_model['status']}.",
         "history_slate_count": len(history),
+        "training_slate_count": calibration_model.get("training_slate_count", 0),
+        "training_player_count": calibration_model.get("training_player_count", 0),
+        "calibration_status": calibration_model.get("status"),
+        "calibration_model_version": calibration_model.get("model_version"),
+        "validation": calibration_model.get("validation", {}),
+        "backtest_persisted": backtest_persisted,
+        "calibration_persisted": calibration_persisted,
     }
 
 
 @app.get("/model/backtest/status")
-def model_backtest_status():
+def model_backtest_status(authorization: str = Header("")):
+    auth_token = str(authorization or "").removeprefix("Bearer ").strip()
+    admin_token = auth_token if auth_token and is_admin_token(auth_token) else ""
     latest = read_json_file(BACKTEST_LATEST_PATH, {})
-    history = read_json_file(BACKTEST_HISTORY_PATH, [])
+    history = load_backtest_history(admin_token)
+    candidate = train_calibration_model(history)
+    active_model = load_active_calibration_model()
     return {
         "success": True,
-        "configured": bool(latest),
-        "latest": latest if isinstance(latest, dict) else {},
+        "configured": bool(latest) or bool(history),
+        "latest": latest if isinstance(latest, dict) and latest else (history[-1] if history else {}),
         "history_slate_count": len(history) if isinstance(history, list) else 0,
-        "minimum_calibration_slates": 10,
-        "calibration_ready": isinstance(history, list) and len(history) >= 10,
+        "training_slate_count": candidate.get("training_slate_count", 0),
+        "training_player_count": candidate.get("training_player_count", 0),
+        "minimum_calibration_slates": CALIBRATION_MIN_SLATES,
+        "minimum_calibration_players": CALIBRATION_MIN_PLAYERS,
+        "calibration_ready": bool(active_model),
+        "calibration_status": "active" if active_model else candidate.get("status", "collecting"),
+        "candidate_model": candidate,
+        "active_model": active_model or {},
     }
 
 
