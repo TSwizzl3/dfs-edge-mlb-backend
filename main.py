@@ -9333,11 +9333,11 @@ def v4_style_from_request(request, mode="gpp"):
     ).lower()
     r = safe_int(getattr(request, "randomness", 0), 0)
     m = str(mode or "gpp").lower()
-    if "cash" in raw or m == "cash":
+    if "cash" in raw or m in {"cash", "balanced", "safe"}:
         return "safe"
-    if "nuclear" in raw or r >= 72:
+    if "nuclear" in raw or "nucleur" in raw or m in {"nuclear", "nucleur"} or r >= 72:
         return "nuclear"
-    if "aggressive" in raw or "massive" in raw or "big" in raw or "large" in raw or r >= 38:
+    if "aggressive" in raw or "ceiling" in raw or "massive" in raw or "big" in raw or "large" in raw or m in {"ceiling", "aggressive"} or r >= 38:
         return "aggressive"
     if "single" in raw:
         return "single_entry"
@@ -9673,11 +9673,14 @@ def v4_lineup_objective(lineup, mode="gpp", style="balanced"):
     uniq = safe_float(lev.get("uniqueness_score", 0), 0)
     chalk = safe_float(lev.get("duplication_risk", 0), 0)
     core_score = safe_float(core.get("average_core_play_score", 50), 50)
+    primary_stack_size = safe_int(stack.get("primary_stack_size", stack.get("stack_size", 0)), 0)
+    average_ownership = sum(safe_float(player.get("ownership", 12), 12) for player in lineup) / max(1, len(lineup))
+    nuclear_stack_bonus = 90 if primary_stack_size >= 5 else 10 if primary_stack_size == 4 else -80
 
     if str(mode).lower() == "cash" or style == "safe":
         return projection * 1.9 + core_score * 0.18 + salary_score + min(100, stack_score) * 0.08 - chalk * 0.05
     if style == "nuclear":
-        return p99 * 1.65 + p95 * 0.65 + stack_score * 2.10 + lev_score * 1.55 + uniq * 1.25 - chalk * 0.55 + salary_score
+        return p99 * 1.65 + p95 * 0.65 + stack_score * 2.10 + lev_score * 1.55 + uniq * 1.25 - chalk * 0.55 + salary_score + nuclear_stack_bonus + max(0, 12 - average_ownership) * 6.0
     if style == "aggressive":
         return p99 * 1.10 + p95 * 1.05 + stack_score * 1.75 + lev_score * 1.32 + uniq * 0.92 - chalk * 0.38 + salary_score
     if style == "single_entry":

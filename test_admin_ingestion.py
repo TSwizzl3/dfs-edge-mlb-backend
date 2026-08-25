@@ -204,6 +204,29 @@ class AdminIngestionTests(unittest.TestCase):
                 self.assertTrue(main.optimizer_starter_eligible(official))
                 self.assertTrue(main.optimizer_starter_eligible(projection_backed))
 
+    def test_web_strategy_modes_map_to_distinct_optimizer_styles(self):
+        balanced = main.MultiOptimizeRequest(mode="balanced")
+        ceiling = main.MultiOptimizeRequest(mode="ceiling")
+        nuclear = main.MultiOptimizeRequest(mode="nuclear", randomness=18)
+        self.assertEqual(main.v4_style_from_request(balanced, balanced.mode), "safe")
+        self.assertEqual(main.v4_style_from_request(ceiling, ceiling.mode), "aggressive")
+        self.assertEqual(main.v4_style_from_request(nuclear, nuclear.mode), "nuclear")
+
+    def test_nuclear_objective_strongly_prefers_five_player_stack(self):
+        lineup = [
+            {"name": f"Player {index}", "projection": 10, "salary": 5000, "ownership": 8}
+            for index in range(10)
+        ]
+        leverage = {"leverage_score": 60, "uniqueness_score": 60, "duplication_risk": 20}
+        core = {"average_core_play_score": 50}
+        with patch.object(main, "v4_player_dist", return_value={"p95": 20, "p99": 30}), patch.object(main, "v2_lineup_leverage_profile", return_value=leverage), patch.object(main, "lineup_core_profile", return_value=core):
+            with patch.object(main, "v2_lineup_stack_profile", return_value={"stack_score": 90, "primary_stack_size": 5}):
+                five_stack_score = main.v4_lineup_objective(lineup, "nuclear", "nuclear")
+            with patch.object(main, "v2_lineup_stack_profile", return_value={"stack_score": 90, "primary_stack_size": 4}):
+                four_stack_score = main.v4_lineup_objective(lineup, "nuclear", "nuclear")
+        self.assertGreater(five_stack_score, four_stack_score + 60)
+
+
     def test_optimizer_pool_never_reintroduces_inactive_bench_player(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             active_path = Path(temp_dir) / "active.json"
