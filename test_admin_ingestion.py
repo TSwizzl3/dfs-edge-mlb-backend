@@ -148,6 +148,24 @@ class AdminIngestionTests(unittest.TestCase):
         self.assertEqual({p["name"] for p in active_pitchers}, {"Likely Starter", "Other Starter"})
         self.assertEqual(next(p for p in filtered if p["name"] == "Reliever")["inactive_reason"], "not_probable_starting_pitcher")
 
+    def test_optimizer_never_uses_projection_guessed_pitcher(self):
+        guessed = {
+            "name": "Wrong Pitcher", "position": "P", "team": "PHI", "active": True,
+            "starter_status": "projected_probable_pitcher", "starter_source": "dk_slate_likelihood",
+            "starter_probability": 0.99,
+        }
+        official = {
+            "name": "Official Pitcher", "position": "P", "team": "ATL", "active": True,
+            "starter_status": "probable_pitcher", "starter_source": "mlb_stats_probable_pitcher",
+            "starter_probability": 0.98,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            active_path = Path(temp_dir) / "active.json"
+            active_path.write_text("[]", encoding="utf-8")
+            with patch.object(main, "ACTIVE_SLATE_PATH", active_path):
+                self.assertFalse(main.optimizer_starter_eligible(guessed))
+                self.assertTrue(main.optimizer_starter_eligible(official))
+
     def test_optimizer_pool_never_reintroduces_inactive_bench_player(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             active_path = Path(temp_dir) / "active.json"

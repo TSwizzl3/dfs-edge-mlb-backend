@@ -2313,7 +2313,14 @@ def optimizer_starter_eligible(player):
     probability = starter_probability_for_player(player)
     position = normalize_position(player.get("position", ""))
     if position == "P":
-        return status in {"probable_pitcher", "projected_probable_pitcher", "confirmed_starter"} and probability >= 0.65
+        # Never guess MLB pitchers from salary/projection rank. A pitcher can
+        # enter a real build only when MLB lists that player as probable or an
+        # admin explicitly confirms the start for this exact DK slate.
+        return (
+            source in {"mlb_stats_probable_pitcher", "admin_confirmed", "admin_override"}
+            and status in {"probable_pitcher", "confirmed_starter"}
+            and probability >= 0.90
+        )
     return status in {"confirmed_starter", "confirmed_lineup", "projected_starter", "likely_starter"} and probability >= 0.65
 
 
