@@ -9461,11 +9461,9 @@ def v4_can_add(lineup, player, max_players_per_team=5, avoid_pitcher_vs_hitter=T
         for existing in lineup
     ):
         return False
-    team_counts = count_team_players(lineup, hitters_only=False)
     team = normalize_team(player.get("team", ""))
-    if team_counts.get(team, 0) >= max_players_per_team:
-        return False
-    if pos != "P" and count_team_players(lineup, hitters_only=True).get(team, 0) >= 5:
+    hitter_limit = min(max_players_per_team, 5)
+    if pos != "P" and count_team_players(lineup, hitters_only=True).get(team, 0) >= hitter_limit:
         return False
     if avoid_pitcher_vs_hitter:
         trial = lineup + [player]
@@ -9544,7 +9542,7 @@ def v4_upgrade_salary_floor(lineup, groups, min_salary, style, stack_team, max_p
                 new_salary = sum(safe_int(p.get("salary", 0), 0) for p in trial)
                 if new_salary > SALARY_CAP:
                     continue
-                if count_team_players(trial).get(normalize_team(new.get("team", "")), 0) > max_players_per_team:
+                if count_team_players(trial, hitters_only=True).get(normalize_team(new.get("team", "")), 0) > max_players_per_team:
                     continue
                 if avoid_pitcher_vs_hitter and pitcher_vs_hitter_conflict(trial):
                     continue
@@ -9576,7 +9574,7 @@ def v4_repair_salary_cap(lineup, groups, style, stack_team, max_players_per_team
                 trial = [p for p in lineup if p.get("name") != old.get("name")] + [new]
                 if sum(safe_int(p.get("salary", 0), 0) for p in trial) > SALARY_CAP:
                     continue
-                if count_team_players(trial).get(normalize_team(new.get("team", "")), 0) > max_players_per_team:
+                if count_team_players(trial, hitters_only=True).get(normalize_team(new.get("team", "")), 0) > max_players_per_team:
                     continue
                 if avoid_pitcher_vs_hitter and pitcher_vs_hitter_conflict(trial):
                     continue
@@ -9653,10 +9651,12 @@ def v4_build_one_lineup(groups, style, stack_team, secondary_team, stack_target,
         return None
     if avoid_pitcher_vs_hitter and pitcher_vs_hitter_conflict(lineup):
         return None
+    if any(count > max_players_per_team for count in count_team_players(lineup, hitters_only=True).values()):
+        return None
     return lineup
 
 
-def v4_lineup_objective(lineup, mode="gpp", style="balanced"):
+def v4_lineup_objective(lineup, mode="gpp", style="balanced", correlation_enabled=True):
     if not lineup:
         return -99999
     projection = sum(safe_float(p.get("boosted_projection", p.get("projection", 0)), 0) for p in lineup)
@@ -9676,16 +9676,18 @@ def v4_lineup_objective(lineup, mode="gpp", style="balanced"):
     primary_stack_size = safe_int(stack.get("primary_stack_size", stack.get("stack_size", 0)), 0)
     average_ownership = sum(safe_float(player.get("ownership", 12), 12) for player in lineup) / max(1, len(lineup))
     nuclear_stack_bonus = 90 if primary_stack_size >= 5 else 10 if primary_stack_size == 4 else -80
+    stack_weight = 1.0 if correlation_enabled else 0.0
+    nuclear_stack_bonus = nuclear_stack_bonus if correlation_enabled else 0
 
     if str(mode).lower() == "cash" or style == "safe":
-        return projection * 1.9 + core_score * 0.18 + salary_score + min(100, stack_score) * 0.08 - chalk * 0.05
+        return projection * 1.9 + core_score * 0.18 + salary_score + min(100, stack_score) * 0.08 * stack_weight - chalk * 0.05
     if style == "nuclear":
-        return p99 * 1.65 + p95 * 0.65 + stack_score * 2.10 + lev_score * 1.55 + uniq * 1.25 - chalk * 0.55 + salary_score + nuclear_stack_bonus + max(0, 12 - average_ownership) * 6.0
+        return p99 * 1.65 + p95 * 0.65 + stack_score * 2.10 * stack_weight + lev_score * 1.55 + uniq * 1.25 - chalk * 0.55 + salary_score + nuclear_stack_bonus + max(0, 12 - average_ownership) * 6.0
     if style == "aggressive":
-        return p99 * 1.10 + p95 * 1.05 + stack_score * 1.75 + lev_score * 1.32 + uniq * 0.92 - chalk * 0.38 + salary_score
+        return p99 * 1.10 + p95 * 1.05 + stack_score * 1.75 * stack_weight + lev_score * 1.32 + uniq * 0.92 - chalk * 0.38 + salary_score
     if style == "single_entry":
-        return p95 * 1.25 + projection * 0.65 + stack_score * 1.15 + lev_score * 0.88 + core_score * 0.10 - chalk * 0.22 + salary_score
-    return p95 * 1.05 + projection * 0.85 + stack_score * 0.88 + lev_score * 0.60 + salary_score
+        return p95 * 1.25 + projection * 0.65 + stack_score * 1.15 * stack_weight + lev_score * 0.88 + core_score * 0.10 - chalk * 0.22 + salary_score
+    return p95 * 1.05 + projection * 0.85 + stack_score * 0.88 * stack_weight + lev_score * 0.60 + salary_score
 
 
 def build_fast_multi_lineups_for_pro(request, count):
@@ -9700,9 +9702,8 @@ def build_fast_multi_lineups_for_pro(request, count):
     locked_players = getattr(request, "locked_players", []) or []
     excluded_players = getattr(request, "excluded_players", []) or []
     excluded_names = set(excluded_players)
-    max_players_per_team = max(3, min(safe_int(getattr(request, "max_players_per_team", 5), 5), 5))
-    if style in ["aggressive", "nuclear"] and mode != "cash":
-        max_players_per_team = max(4, max_players_per_team)
+    max_players_per_team = max(2, min(safe_int(getattr(request, "max_players_per_team", 5), 5), 5))
+    correlation_enabled = bool(getattr(request, "force_team_stack", False))
     min_salary = max(0, min(SALARY_CAP, safe_int(getattr(request, "min_salary", 0), 0)))
     avoid_conflict = bool(getattr(request, "avoid_pitcher_vs_hitter", True))
 
@@ -9734,7 +9735,7 @@ def build_fast_multi_lineups_for_pro(request, count):
     locked_objects = [p for p in pool if p.get("name") in set(locked_players)]
     hitters = [p for p in pool if normalize_position(p.get("position", "")) != "P"]
     team_scores = v4_team_stack_scores(hitters, style)
-    stack_teams = [x[0] for x in team_scores[:18]] or [""]
+    stack_teams = ([x[0] for x in team_scores[:18]] or [""]) if correlation_enabled else [""]
 
     stack_sizes = [2] if style == "safe" else [4, 3, 5, 4, 3]
     if style == "single_entry":
@@ -9751,7 +9752,7 @@ def build_fast_multi_lineups_for_pro(request, count):
     attempts = min(900, max(220, count * (95 if style in ["aggressive", "nuclear"] else 70)))
     for i in range(attempts):
         stack_team = stack_teams[i % len(stack_teams)] if stack_teams else ""
-        secondary_candidates = [t for t in stack_teams if t and t != stack_team]
+        secondary_candidates = [t for t in stack_teams if correlation_enabled and t and t != stack_team]
         secondary_team = secondary_candidates[(i // max(1, len(stack_teams))) % len(secondary_candidates)] if secondary_candidates else None
         stack_target = stack_sizes[i % len(stack_sizes)]
         lineup = v4_build_one_lineup(
@@ -9782,7 +9783,7 @@ def build_fast_multi_lineups_for_pro(request, count):
             "optimizer_score": 0,
             "lineup": lineup,
         })
-        objective = v4_lineup_objective(lineup, mode, style) + deterministic_random_bonus(lineup, safe_int(getattr(request, "randomness", 0), 0)) * (0.9 if style in ["aggressive", "nuclear"] else 0.25)
+        objective = v4_lineup_objective(lineup, mode, style, correlation_enabled=correlation_enabled) + deterministic_random_bonus(lineup, safe_int(getattr(request, "randomness", 0), 0)) * (0.9 if style in ["aggressive", "nuclear"] else 0.25)
         data["optimizer_score"] = round(objective, 2)
         data["optimizer_objective"] = "v4_tournament_takedown_equity" if mode != "cash" else "v4_cash_safety"
         data["builder_style"] = style
@@ -9805,7 +9806,7 @@ def build_fast_multi_lineups_for_pro(request, count):
                     salary = sum(safe_int(p.get("salary", 0), 0) for p in lineup)
                     projection = sum(safe_float(p.get("projection", 0), 0) for p in lineup)
                     data = add_lineup_metadata({"mode": mode, "total_salary": salary, "projected_points": round(projection, 2), "optimizer_score": 0, "lineup": lineup})
-                    data["optimizer_score"] = round(v4_lineup_objective(lineup, mode, style), 2)
+                    data["optimizer_score"] = round(v4_lineup_objective(lineup, mode, style, correlation_enabled=correlation_enabled), 2)
                     data["builder_style"] = style
                     data["optimizer_warning"] = f"Min salary {original_min} was too restrictive for this slate/settings; returned best valid lineup under cap."
                     candidates.append(data)
@@ -9840,6 +9841,8 @@ def build_fast_multi_lineups_for_pro(request, count):
     report.update({
         "tournament_engine_version": TOURNAMENT_ENGINE_VERSION,
         "builder_style": style,
+        "stack_correlation_enabled": correlation_enabled,
+        "hard_max_hitters_per_team": max_players_per_team,
         "candidate_count": len(candidates),
         "returned_count": len(selected),
         "v4_attempts": attempts,

@@ -224,7 +224,27 @@ class AdminIngestionTests(unittest.TestCase):
                 five_stack_score = main.v4_lineup_objective(lineup, "nuclear", "nuclear")
             with patch.object(main, "v2_lineup_stack_profile", return_value={"stack_score": 90, "primary_stack_size": 4}):
                 four_stack_score = main.v4_lineup_objective(lineup, "nuclear", "nuclear")
+                four_stack_no_correlation = main.v4_lineup_objective(lineup, "nuclear", "nuclear", correlation_enabled=False)
+            with patch.object(main, "v2_lineup_stack_profile", return_value={"stack_score": 90, "primary_stack_size": 5}):
+                five_stack_no_correlation = main.v4_lineup_objective(lineup, "nuclear", "nuclear", correlation_enabled=False)
         self.assertGreater(five_stack_score, four_stack_score + 60)
+        self.assertEqual(five_stack_no_correlation, four_stack_no_correlation)
+
+    def test_hard_hitter_stack_cap_cannot_be_overridden(self):
+        existing = [
+            {"name": "Hitter One", "team": "WSH", "position": "1B"},
+            {"name": "Hitter Two", "team": "WSH", "position": "2B"},
+        ]
+        third_hitter = {"name": "Hitter Three", "team": "WSH", "position": "OF"}
+        with patch.object(main, "optimizer_starter_eligible", return_value=True):
+            self.assertFalse(main.v4_can_add(existing, third_hitter, max_players_per_team=2, avoid_pitcher_vs_hitter=False))
+            self.assertTrue(main.v4_can_add(existing, third_hitter, max_players_per_team=3, avoid_pitcher_vs_hitter=False))
+
+    def test_pitcher_does_not_consume_mlb_hitter_stack_limit(self):
+        existing = [{"name": "Pitcher", "team": "WSH", "position": "P"}, {"name": "Hitter One", "team": "WSH", "position": "1B"}]
+        second_hitter = {"name": "Hitter Two", "team": "WSH", "position": "2B"}
+        with patch.object(main, "optimizer_starter_eligible", return_value=True):
+            self.assertTrue(main.v4_can_add(existing, second_hitter, max_players_per_team=2, avoid_pitcher_vs_hitter=False))
 
 
     def test_optimizer_pool_never_reintroduces_inactive_bench_player(self):
