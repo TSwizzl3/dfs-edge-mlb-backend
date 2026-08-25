@@ -1922,7 +1922,13 @@ def load_players(slate_key=""):
             return []
         library_players = record.get("players", [])
         if isinstance(library_players, list):
-            return library_players
+            migrated = []
+            for player in library_players:
+                migrated_player = dict(player)
+                migrated_player.setdefault("dk_slate_eligible", True)
+                migrated_player.setdefault("slate_source", "draftkings_csv")
+                migrated.append(migrated_player)
+            return apply_slate_starter_likelihood(migrated) if "apply_slate_starter_likelihood" in globals() else migrated
         return []
 
     if ACTIVE_SLATE_PATH.exists():
@@ -2327,6 +2333,7 @@ def optimizer_starter_eligible(player):
     trusted_sources = {
         "mlb_stats_confirmed_lineup",
         "mlb_stats_probable_pitcher",
+        "admin_projection_csv",
         "dk_slate_likelihood",
         "admin_confirmed",
         "admin_override",
@@ -2337,6 +2344,11 @@ def optimizer_starter_eligible(player):
     probability = starter_probability_for_player(player)
     position = normalize_position(player.get("position", ""))
     if position == "P":
+        if source == "admin_projection_csv":
+            return (
+                status == "projected_probable_pitcher"
+                and probability >= 0.88
+            )
         # Never guess MLB pitchers from salary/projection rank. A pitcher can
         # enter a real build only when MLB lists that player as probable or an
         # admin explicitly confirms the start for this exact DK slate.
@@ -2352,7 +2364,9 @@ def _starter_likelihood_score(player):
     projection = safe_float(player.get("projection", 0), 0)
     salary = safe_int(player.get("salary", 0), 0)
     ownership = safe_float(player.get("ownership", 0), 0)
-    return projection * 6.0 + salary / 180.0 + ownership * 0.35
+    projection_source = str(player.get("projection_source", "")).strip().lower()
+    verified_projection_bonus = 100000.0 if projection_source == "admin_projection_csv" and projection > 0 else 0.0
+    return verified_projection_bonus + projection * 6.0 + salary / 180.0 + ownership * 0.35
 
 
 def apply_slate_starter_likelihood(players):
@@ -2387,9 +2401,10 @@ def apply_slate_starter_likelihood(players):
                 continue
             if pitcher.get("name") in likely_pitcher_names:
                 if not str(pitcher.get("starter_source", "")).startswith(("mlb_stats_", "admin_")):
+                    projection_backed = str(pitcher.get("projection_source", "")).lower() == "admin_projection_csv" and safe_float(pitcher.get("projection", 0), 0) >= 3.0
                     pitcher["starter_status"] = "projected_probable_pitcher"
-                    pitcher["starter_source"] = "dk_slate_likelihood"
-                    pitcher["starter_probability"] = 0.78
+                    pitcher["starter_source"] = "admin_projection_csv" if projection_backed else "dk_slate_likelihood"
+                    pitcher["starter_probability"] = 0.92 if projection_backed else 0.78
                 pitcher["active"] = True
                 pitcher["inactive_reason"] = ""
             else:
@@ -2423,9 +2438,10 @@ def apply_slate_starter_likelihood(players):
                 hitter["starter_probability"] = 1.0 if hitter.get("active", True) else 0.0
                 continue
             if not str(hitter.get("starter_source", "")).startswith(("mlb_stats_", "admin_")):
+                projection_backed = str(hitter.get("projection_source", "")).lower() == "admin_projection_csv" and safe_float(hitter.get("projection", 0), 0) > 0
                 hitter["starter_status"] = "projected_starter"
-                hitter["starter_source"] = "dk_slate_likelihood"
-                hitter["starter_probability"] = round(max(0.68, 0.78 - (rank - 1) * 0.012), 3)
+                hitter["starter_source"] = "admin_projection_csv" if projection_backed else "dk_slate_likelihood"
+                hitter["starter_probability"] = 0.90 if projection_backed else round(max(0.68, 0.78 - (rank - 1) * 0.012), 3)
             hitter["active"] = True
             hitter["inactive_reason"] = ""
 
@@ -3478,25 +3494,19 @@ def trim_player_pool(players, locked_players):
 
 
 
+def mlb_position_counts(pool):
+    counts = {position: 0 for position in ["P", "C", "1B", "2B", "3B", "SS", "OF"]}
+    for player in pool:
+        position = normalize_position(player.get("position", ""))
+        if position in counts:
+            counts[position] += 1
+    return counts
+
+
 def has_required_mlb_positions(pool):
-    groups = {
-        "P": [p for p in pool if normalize_position(p.get("position", "")) == "P"],
-        "C": [p for p in pool if normalize_position(p.get("position", "")) == "C"],
-        "1B": [p for p in pool if normalize_position(p.get("position", "")) == "1B"],
-        "2B": [p for p in pool if normalize_position(p.get("position", "")) == "2B"],
-        "3B": [p for p in pool if normalize_position(p.get("position", "")) == "3B"],
-        "SS": [p for p in pool if normalize_position(p.get("position", "")) == "SS"],
-        "OF": [p for p in pool if normalize_position(p.get("position", "")) == "OF"],
-    }
-    return (
-        len(groups["P"]) >= 2
-        and len(groups["C"]) >= 1
-        and len(groups["1B"]) >= 1
-        and len(groups["2B"]) >= 1
-        and len(groups["3B"]) >= 1
-        and len(groups["SS"]) >= 1
-        and len(groups["OF"]) >= 3
-    )
+    required = {"P": 2, "C": 1, "1B": 1, "2B": 1, "3B": 1, "SS": 1, "OF": 3}
+    counts = mlb_position_counts(pool)
+    return all(counts[position] >= minimum for position, minimum in required.items())
 
 
 def is_manual_inactive_player(player):
@@ -6825,6 +6835,7 @@ async def upload_projections_csv(
         return {"success": False, "error": "Projection names did not match any player on the active MLB slate."}
 
     active_calibration = load_active_calibration_model(force=True)
+    players = apply_slate_starter_likelihood(players)
     players = apply_rolling_calibration(players, active_calibration)
     save_active_slate(players)
     if slate_key and slate_key != "current":
@@ -9703,7 +9714,11 @@ def build_fast_multi_lineups_for_pro(request, count):
     pool, trim_report = build_optimizer_pool_with_fallback(raw_players, locked_players, excluded_players)
     pool = [p for p in add_values(pool) if p.get("name") not in excluded_names and valid_optimizer_player(p) and not is_manual_inactive_player(p)]
     if not has_required_mlb_positions(pool):
-        return [], "Not enough confirmed or likely MLB starters at every roster position. Refresh MLB starters closer to lock, then try again.", trim_report, 0
+        required = {"P": 2, "C": 1, "1B": 1, "2B": 1, "3B": 1, "SS": 1, "OF": 3}
+        counts = mlb_position_counts(pool)
+        missing = ", ".join(f"{position} {counts[position]}/{minimum}" for position, minimum in required.items() if counts[position] < minimum)
+        trim_report["starter_eligible_by_position"] = counts
+        return [], f"The selected slate is missing trusted starter evidence at: {missing}. Upload projections for this exact slate or refresh official MLB starters, then try again.", trim_report, 0
 
     groups = {pos: [] for pos in V4_REQUIRED_COUNTS}
     for p in pool:
