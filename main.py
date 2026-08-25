@@ -451,30 +451,54 @@ def parse_projection_csv(csv_text):
 
 
 def parse_actual_results_csv(csv_text):
-    reader = csv.DictReader(io.StringIO(csv_text))
-    actuals = []
-    for raw_row in reader:
-        row = clean_csv_row(raw_row)
-        name = find_column(row, ["Name", "Player", "Player Name", "Nickname"])
-        points_value = find_column(
-            row,
-            ["Actual Points", "Fantasy Points", "FPTS", "DK Points", "Points"],
-        )
-        points = safe_float(points_value, -1)
-        if name and points >= 0:
-            item = {
-                "name": extract_name_from_name_plus_id(name),
-                "actual_points": round(points, 3),
-            }
-            ownership_value = find_column(
+    """Parse DFS Edge result files and DraftKings GameCenter ownership exports."""
+    actual_by_name = {}
+    ownership_columns = [
+        "Actual Ownership", "Actual Ownership %", "Ownership", "Ownership %",
+        "Own", "Own%", "% Drafted", "%Drafted", "Drafted %", "Player Ownership",
+    ]
+
+    def collect_rows(reader):
+        for raw_row in reader:
+            row = clean_csv_row(raw_row)
+            name = find_column(row, ["Name", "Player", "Player Name", "Nickname", "Athlete"])
+            points_value = find_column(
                 row,
-                ["Actual Ownership", "Actual Ownership %", "Ownership", "Ownership %", "Own", "Own%"],
+                ["Actual Points", "Fantasy Points", "FPTS", "DK Points", "Points"],
             )
+            points = safe_float(points_value, -1)
+            if not name or points < 0:
+                continue
+            resolved_name = extract_name_from_name_plus_id(name)
+            key = normalized_player_name(resolved_name)
+            item = actual_by_name.setdefault(key, {
+                "name": resolved_name,
+                "actual_points": round(points, 3),
+            })
+            item["actual_points"] = round(points, 3)
+            ownership_value = find_column(row, ownership_columns)
             actual_ownership = safe_float(ownership_value, -1)
             if actual_ownership >= 0:
                 item["actual_ownership"] = round(max(0.0, min(100.0, actual_ownership)), 3)
-            actuals.append(item)
-    return actuals
+
+    collect_rows(csv.DictReader(io.StringIO(csv_text)))
+
+    # DraftKings GameCenter exports contain entrant standings first and a
+    # separate athlete table later in the same CSV. Locate that second header.
+    lines = csv_text.splitlines()
+    for index, line in enumerate(lines):
+        try:
+            header = [str(value or "").strip().lower() for value in next(csv.reader([line]))]
+        except Exception:
+            continue
+        has_player = any(value in {"player", "player name", "name", "nickname", "athlete"} for value in header)
+        has_points = any(value in {"fpts", "fantasy points", "dk points", "actual points"} for value in header)
+        has_ownership = any(value in {"% drafted", "%drafted", "drafted %", "ownership", "ownership %", "own%"} for value in header)
+        if has_player and has_points and has_ownership:
+            collect_rows(csv.DictReader(io.StringIO("\n".join(lines[index:]))))
+            break
+
+    return list(actual_by_name.values())
 
 
 def projection_backtest(players, actual_rows):

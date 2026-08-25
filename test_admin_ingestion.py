@@ -119,6 +119,22 @@ class AdminIngestionTests(unittest.TestCase):
         self.assertEqual(contest["payout_table"], [])
         self.assertEqual(contest["payout_source"], "estimated_curve")
 
+    def test_draftkings_gamecenter_export_imports_actual_ownership(self):
+        csv_text = (
+            "Rank,EntryId,EntryName,Points,Lineup\n"
+            "1,123,Winner,151.25,SP Player One OF Player Two\n"
+            "\n"
+            "Player,Roster Position,% Drafted,FPTS\n"
+            "Zack Wheeler,P,37.4%,28.65\n"
+            "Bryce Harper,1B,22.1%,14.0\n"
+        )
+        rows = main.parse_actual_results_csv(csv_text)
+        by_name = {row["name"]: row for row in rows}
+        self.assertEqual(by_name["Zack Wheeler"]["actual_points"], 28.65)
+        self.assertEqual(by_name["Zack Wheeler"]["actual_ownership"], 37.4)
+        self.assertEqual(by_name["Bryce Harper"]["actual_ownership"], 22.1)
+
+
     def test_player_name_matching_ignores_accents(self):
         self.assertEqual(
             main.normalized_player_name("Cristopher Sánchez"),
