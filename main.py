@@ -1536,7 +1536,7 @@ def compact_learning_lineups(lineups):
     return compact
 
 
-def record_lineup_learning_run(request, lineups):
+def record_lineup_learning_run(request, lineups, auth_token=""):
     compact = compact_learning_lineups(lineups)
     if not compact:
         return False
@@ -1558,11 +1558,12 @@ def record_lineup_learning_run(request, lineups):
             "lineup_count": len(compact),
         },
         prefer="return=minimal",
+        auth_token=auth_token,
     )
     return rows is not None
 
 
-def evaluate_lineup_learning_runs(slate_key, actual_rows, standings_scores=None):
+def evaluate_lineup_learning_runs(slate_key, actual_rows, standings_scores=None, auth_token=""):
     resolved_key = normalize_slate_key(slate_key)
     actual_by_name = {
         normalized_player_name(item.get("name")): safe_float(item.get("actual_points"), 0)
@@ -1572,6 +1573,7 @@ def evaluate_lineup_learning_runs(slate_key, actual_rows, standings_scores=None)
     runs = supabase_data_request(
         "mlb_lineup_runs",
         query=f"slate_key=eq.{encoded_key}&evaluated_at=is.null&select=id,strategy_mode,lineups,lineup_count&limit=500",
+        auth_token=auth_token,
     )
     if not isinstance(runs, list):
         runs = []
@@ -1620,6 +1622,7 @@ def evaluate_lineup_learning_runs(slate_key, actual_rows, standings_scores=None)
                 query=f"id=eq.{run_id}",
                 payload={"evaluated_at": evaluated_at, "evaluation": evaluation},
                 prefer="return=minimal",
+                auth_token=auth_token,
             )
 
     return {
@@ -6320,8 +6323,13 @@ def optional_session(authorization: str = Header(default="")):
         return None
     response = central_auth_request("/auth/me", {"token": token})
     if response.get("success") and response.get("user"):
-        return response.get("user")
-    return supabase_session_from_token(token)
+        session = dict(response.get("user") or {})
+        session["_access_token"] = token
+        return session
+    session = supabase_session_from_token(token)
+    if session:
+        session["_access_token"] = token
+    return session
 
 
 def require_pro_access(authorization: str = Header(default="")):
@@ -7115,6 +7123,7 @@ async def upload_actual_results_csv(
         resolved_slate_key,
         actual_rows,
         contest_standings.get("scores", []),
+        admin_token,
     )
     if result["matched_players"] < 10:
         return {
@@ -7412,7 +7421,7 @@ def optimize_multiple_lineups(
     if not selected:
         return {"error": "No valid MLB lineups found with your current locks and excludes.", "lineups": [], "exposures": []}
 
-    record_lineup_learning_run(request, selected)
+    record_lineup_learning_run(request, selected, str((session or {}).get("_access_token", "")))
     return {
         "mode": request.mode,
         "requested_count": requested_count,

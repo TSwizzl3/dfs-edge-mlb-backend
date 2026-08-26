@@ -65,7 +65,7 @@ class AdminIngestionTests(unittest.TestCase):
         self.assertEqual(result["effective_count"], 4)
         self.assertEqual(result["returned_count"], 4)
         self.assertEqual(len(result["lineups"]), 4)
-        learning_run.assert_called_once_with(request, lineups)
+        learning_run.assert_called_once_with(request, lineups, "")
 
     def test_session_falls_back_to_direct_supabase_verification(self):
         with patch.object(main, "central_auth_request", return_value={"success": False}), patch.object(
