@@ -316,6 +316,44 @@ class AdminIngestionTests(unittest.TestCase):
         self.assertGreater(five_stack_score, four_stack_score + 60)
         self.assertEqual(five_stack_no_correlation, four_stack_no_correlation)
 
+
+    def test_nuclear_objective_prefers_stars_and_qualified_boom_values(self):
+        def player(name, salary, projection, ownership, p99):
+            return {
+                "name": name, "position": "OF", "team": "SEA", "salary": salary,
+                "projection": projection, "ownership": ownership, "test_p99": p99,
+            }
+
+        barbell = [
+            player("Premium One", 5600, 10, 14, 38), player("Premium Two", 5200, 9.5, 13, 35),
+            player("Boom Value One", 3400, 7, 8, 26), player("Boom Value Two", 3600, 7.5, 10, 27),
+        ] + [player(f"Middle {index}", 4400, 8, 14, 28) for index in range(6)]
+        middle_only = [player(f"Middle Only {index}", 4400, 8, 14, 28) for index in range(10)]
+        leverage = {"leverage_score": 60, "uniqueness_score": 60, "duplication_risk": 20}
+        core = {"average_core_play_score": 50}
+
+        def distribution(p):
+            return {"p75": p["projection"] * 1.3, "p95": p["test_p99"] * 0.78, "p99": p["test_p99"]}
+
+        with patch.object(main, "v4_player_dist", side_effect=distribution), patch.object(main, "v2_lineup_leverage_profile", return_value=leverage), patch.object(main, "lineup_core_profile", return_value=core), patch.object(main, "v2_lineup_stack_profile", return_value={"stack_score": 70, "primary_stack_size": 4}):
+            barbell_score = main.v4_lineup_objective(barbell, "nuclear", "nuclear")
+            middle_score = main.v4_lineup_objective(middle_only, "nuclear", "nuclear")
+            profile = main.v4_nuclear_lineup_profile(barbell)
+
+        self.assertEqual(profile["premium_ceiling_count"], 2)
+        self.assertEqual(profile["boom_value_count"], 2)
+        self.assertGreater(barbell_score, middle_score + 80)
+
+    def test_nuclear_rejects_cheap_player_without_real_boom_ceiling(self):
+        weak_value = {"name": "Weak Punt", "position": "OF", "salary": 3000, "projection": 3.5, "ownership": 4}
+        strong_value = {"name": "Boom Value", "position": "OF", "salary": 3500, "projection": 7.0, "ownership": 9}
+        with patch.object(main, "v4_player_dist", side_effect=[{"p99": 17}, {"p99": 27}]):
+            weak = main.v4_nuclear_player_profile(weak_value)
+            strong = main.v4_nuclear_player_profile(strong_value)
+        self.assertTrue(weak["fragile_punt"])
+        self.assertFalse(weak["boom_value"])
+        self.assertTrue(strong["boom_value"])
+
     def test_hard_hitter_stack_cap_cannot_be_overridden(self):
         existing = [
             {"name": "Hitter One", "team": "WSH", "position": "1B"},

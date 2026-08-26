@@ -9991,7 +9991,7 @@ def monte_carlo_lineup_simulation_v2(lineup, contest, runs=1200, field_scores=No
 #   these global function names at request time.
 # ============================================================
 
-TOURNAMENT_ENGINE_VERSION = "dfs_edge_mlb_tournament_engine_v4_timeout_safe_takedown"
+TOURNAMENT_ENGINE_VERSION = "dfs_edge_mlb_tournament_engine_v5_nuclear_barbell"
 
 V4_REQUIRED_COUNTS = {"P": 2, "C": 1, "1B": 1, "2B": 1, "3B": 1, "SS": 1, "OF": 3}
 
@@ -10051,6 +10051,73 @@ def v4_player_dist(player):
     }
 
 
+def v4_nuclear_player_profile(player):
+    """Classify MLB hitters for a high-variance, tournament-takedown build.
+
+    Nuclear should not mean blindly selecting cheap, low-owned players. A value
+    hitter only qualifies when the player's modeled p99 outcome is strong enough
+    to matter in a GPP. Premium pieces must also carry real top-end ceiling.
+    """
+    pos = normalize_position(player.get("position", ""))
+    salary = safe_int(player.get("salary", 0), 0)
+    projection = safe_float(player.get("boosted_projection", player.get("projection", 0)), 0)
+    ownership = safe_float(player.get("ownership", 12), 12)
+    dist = v4_player_dist(player)
+    p99 = safe_float(dist.get("p99", 0), 0)
+    p99_per_thousand = p99 / max(1.0, salary / 1000.0)
+    is_hitter = pos != "P"
+    premium_ceiling = bool(is_hitter and salary >= 4800 and p99 >= max(27.0, projection * 3.05))
+    boom_value = bool(
+        is_hitter
+        and salary <= 4000
+        and projection >= 5.5
+        and p99 >= 18.0
+        and p99_per_thousand >= 6.4
+        and ownership <= 22.0
+    )
+    fragile_punt = bool(is_hitter and salary <= 4000 and not boom_value)
+    return {
+        "premium_ceiling": premium_ceiling,
+        "boom_value": boom_value,
+        "fragile_punt": fragile_punt,
+        "p99": round(p99, 2),
+        "p99_per_thousand": round(p99_per_thousand, 3),
+    }
+
+
+def v4_nuclear_lineup_profile(lineup):
+    hitters = [player for player in lineup if normalize_position(player.get("position", "")) != "P"]
+    profiles = [v4_nuclear_player_profile(player) for player in hitters]
+    star_count = sum(1 for profile in profiles if profile["premium_ceiling"])
+    boom_value_count = sum(1 for profile in profiles if profile["boom_value"])
+    fragile_punt_count = sum(1 for profile in profiles if profile["fragile_punt"])
+    salaries = [safe_int(player.get("salary", 0), 0) for player in hitters if safe_int(player.get("salary", 0), 0) > 0]
+    salary_spread = max(salaries) - min(salaries) if salaries else 0
+    average_ownership = (
+        sum(safe_float(player.get("ownership", 12), 12) for player in hitters) / len(hitters)
+        if hitters else 0.0
+    )
+    # A true barbell build pairs premium p99 outcomes with qualified cheap boom
+    # paths. Missing either side is penalized, and unqualified punts are costly.
+    barbell_score = (
+        min(star_count, 3) * 18.0
+        + min(boom_value_count, 3) * 22.0
+        + min(30.0, max(0.0, salary_spread - 1200) * 0.012)
+        + min(16.0, max(0.0, 16.0 - average_ownership) * 2.0)
+        - (32.0 if star_count == 0 else 12.0 if star_count == 1 else 0.0)
+        - (38.0 if boom_value_count == 0 else 14.0 if boom_value_count == 1 else 0.0)
+        - fragile_punt_count * 18.0
+    )
+    return {
+        "premium_ceiling_count": star_count,
+        "boom_value_count": boom_value_count,
+        "fragile_punt_count": fragile_punt_count,
+        "salary_spread": salary_spread,
+        "average_ownership": round(average_ownership, 2),
+        "barbell_score": round(barbell_score, 2),
+    }
+
+
 def v4_player_grade(player, style="balanced", stack_team=None):
     pos = normalize_position(player.get("position", ""))
     proj = safe_float(player.get("boosted_projection", player.get("projection", 0)), 0)
@@ -10069,7 +10136,11 @@ def v4_player_grade(player, style="balanced", stack_team=None):
     elif style == "single_entry":
         grade = dist["p90"] * 1.15 + dist["p95"] * 0.65 + proj * 0.45 + lev * 0.20 + core * 0.07 + max(0, total - 4.1) * 4.0 - max(0, own - 26) * 0.18
     elif style == "nuclear":
-        grade = dist["p99"] * 1.50 + dist["p95"] * 0.82 + lev * 0.32 + max(0, 18 - own) * 1.20 + max(0, total - 4.2) * 7.5 - max(0, chalk - 54) * 0.45
+        nuclear = v4_nuclear_player_profile(player)
+        role_bonus = 22.0 if nuclear["boom_value"] else 18.0 if nuclear["premium_ceiling"] else 0.0
+        grade = dist["p99"] * 1.72 + dist["p95"] * 0.48 + lev * 0.40 + max(0, 18 - own) * 1.35 + max(0, total - 4.2) * 8.0 + role_bonus - max(0, chalk - 52) * 0.52
+        if nuclear["fragile_punt"]:
+            grade -= 24.0
     elif style == "aggressive":
         grade = dist["p99"] * 1.05 + dist["p95"] * 1.05 + lev * 0.28 + max(0, 20 - own) * 0.82 + max(0, total - 4.2) * 6.2 - max(0, chalk - 58) * 0.34
     else:
@@ -10103,7 +10174,15 @@ def v4_team_stack_scores(hitters, style="balanced"):
         avg_own = sum(safe_float(p.get("ownership", 12), 12) for p in top) / max(1, len(top))
         total = estimated_team_total(team)
         leverage_bonus = max(0, 18 - avg_own) * (2.2 if style in ["aggressive", "nuclear"] else 1.1)
-        score = p95 * 0.85 + p99 * 0.48 + max(0, total - 4.0) * 14 + leverage_bonus + min(len(ps), 6) * 2.0
+        if style == "nuclear":
+            nuclear_profiles = [v4_nuclear_player_profile(player) for player in top[:5]]
+            boom_paths = sum(1 for profile in nuclear_profiles if profile["boom_value"])
+            premium_paths = sum(1 for profile in nuclear_profiles if profile["premium_ceiling"])
+            score = p99 * 0.86 + p95 * 0.34 + max(0, total - 4.0) * 17 + leverage_bonus * 1.35 + boom_paths * 14 + premium_paths * 9 + min(len(ps), 6) * 2.0
+        elif style == "aggressive":
+            score = p95 * 0.92 + p99 * 0.40 + max(0, total - 4.0) * 14 + leverage_bonus + min(len(ps), 6) * 2.0
+        else:
+            score = p95 * 0.85 + p99 * 0.48 + max(0, total - 4.0) * 14 + leverage_bonus + min(len(ps), 6) * 2.0
         scores.append((team, score, len(ps), round(avg_own, 1), round(total, 1)))
     scores.sort(key=lambda x: x[1], reverse=True)
     return scores
@@ -10167,9 +10246,9 @@ def v4_fill_position(lineup, groups, pos, style, stack_team, max_players_per_tea
     selected_names = set(p.get("name") for p in lineup)
     options = [p for p in groups.get(pos, []) if p.get("name") not in selected_names]
     if prefer_salary == "high":
-        options.sort(key=lambda p: (safe_int(p.get("salary", 0), 0), v4_player_grade(p, style, stack_team)), reverse=True)
+        options.sort(key=lambda p: (bool(v4_nuclear_player_profile(p)["premium_ceiling"]), v4_nuclear_player_profile(p)["p99"], v4_player_grade(p, style, stack_team)), reverse=True)
     elif prefer_salary == "low":
-        options.sort(key=lambda p: (safe_int(p.get("salary", 0), 0), -v4_player_grade(p, style, stack_team)))
+        options.sort(key=lambda p: (bool(v4_nuclear_player_profile(p)["boom_value"]), v4_nuclear_player_profile(p)["p99_per_thousand"], v4_player_grade(p, style, stack_team)), reverse=True)
     else:
         options.sort(key=lambda p: v4_player_grade(p, style, stack_team), reverse=True)
     if seed_offset:
@@ -10309,7 +10388,14 @@ def v4_build_one_lineup(groups, style, stack_team, secondary_team, stack_target,
     # Fill exact roster slots.
     for pos, req in V4_REQUIRED_COUNTS.items():
         while v4_lineup_counts(lineup).get(pos, 0) < req:
-            if not v4_fill_position(lineup, groups, pos, style, stack_team, max_players_per_team, avoid_pitcher_vs_hitter, seed_offset=offset + len(lineup)):
+            salary_preference = None
+            if style == "nuclear" and pos != "P":
+                nuclear_profile = v4_nuclear_lineup_profile(lineup)
+                if nuclear_profile["premium_ceiling_count"] < 2:
+                    salary_preference = "high"
+                elif nuclear_profile["boom_value_count"] < 2:
+                    salary_preference = "low"
+            if not v4_fill_position(lineup, groups, pos, style, stack_team, max_players_per_team, avoid_pitcher_vs_hitter, seed_offset=offset + len(lineup), prefer_salary=salary_preference):
                 return None
 
     lineup = v4_repair_salary_cap(lineup, groups, style, stack_team, max_players_per_team, avoid_pitcher_vs_hitter)
@@ -10355,7 +10441,8 @@ def v4_lineup_objective(lineup, mode="gpp", style="balanced", correlation_enable
     if str(mode).lower() == "cash" or style == "safe":
         return projection * 1.9 + core_score * 0.18 + salary_score + min(100, stack_score) * 0.08 * stack_weight - chalk * 0.05
     if style == "nuclear":
-        return p99 * 1.65 + p95 * 0.65 + stack_score * 2.10 * stack_weight + lev_score * 1.55 + uniq * 1.25 - chalk * 0.55 + salary_score + nuclear_stack_bonus + max(0, 12 - average_ownership) * 6.0
+        nuclear_profile = v4_nuclear_lineup_profile(lineup)
+        return p99 * 1.82 + p95 * 0.35 + projection * 0.12 + stack_score * 2.18 * stack_weight + lev_score * 1.68 + uniq * 1.42 - chalk * 0.62 + salary_score + nuclear_stack_bonus + max(0, 12 - average_ownership) * 6.5 + safe_float(nuclear_profile.get("barbell_score", 0), 0) * 2.10
     if style == "aggressive":
         return p99 * 1.10 + p95 * 1.05 + stack_score * 1.75 * stack_weight + lev_score * 1.32 + uniq * 0.92 - chalk * 0.38 + salary_score
     if style == "single_entry":
@@ -10460,6 +10547,8 @@ def build_fast_multi_lineups_for_pro(request, count):
         data["optimizer_score"] = round(objective, 2)
         data["optimizer_objective"] = "v4_tournament_takedown_equity" if mode != "cash" else "v4_cash_safety"
         data["builder_style"] = style
+        if style == "nuclear":
+            data["nuclear_construction_profile"] = v4_nuclear_lineup_profile(lineup)
         candidates.append(data)
 
     if not candidates:
@@ -10487,7 +10576,24 @@ def build_fast_multi_lineups_for_pro(request, count):
         if not candidates:
             return [], "The optimizer could not build a legal lineup from confirmed or likely starters. Refresh MLB starters, clear risky locks/excludes, or lower minimum salary.", {**trim_report, "builder_style": style, "v4_attempts": attempts}, attempts
 
-    candidates.sort(key=lambda x: (safe_float(x.get("optimizer_score", 0), 0), safe_float(x.get("takedown_strength", 0), 0), safe_float(x.get("ceiling_score", 0), 0)), reverse=True)
+    if style == "nuclear":
+        # Nuclear is the p99/takedown mode. Prefer qualified star-and-boom-value
+        # constructions, then the highest modeled outcome; median projection is
+        # deliberately not the primary ordering signal.
+        candidates.sort(
+            key=lambda x: (
+                safe_int((x.get("nuclear_construction_profile") or {}).get("premium_ceiling_count", 0), 0) >= 2
+                and safe_int((x.get("nuclear_construction_profile") or {}).get("boom_value_count", 0), 0) >= 2
+                and safe_int((x.get("nuclear_construction_profile") or {}).get("fragile_punt_count", 0), 0) == 0,
+                safe_float(x.get("p99_ceiling_points", 0), 0),
+                safe_float((x.get("nuclear_construction_profile") or {}).get("barbell_score", 0), 0),
+                safe_float(x.get("takedown_strength", 0), 0),
+                safe_float(x.get("optimizer_score", 0), 0),
+            ),
+            reverse=True,
+        )
+    else:
+        candidates.sort(key=lambda x: (safe_float(x.get("optimizer_score", 0), 0), safe_float(x.get("takedown_strength", 0), 0), safe_float(x.get("ceiling_score", 0), 0)), reverse=True)
     max_exposure = min(max(safe_int(getattr(request, "max_exposure", 65), 65), 20), 100)
     max_same = min(max(safe_int(getattr(request, "max_same_players", 7), 7), 3), 9)
     selected = diversify_lineups(
