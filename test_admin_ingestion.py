@@ -707,6 +707,86 @@ class AdminIngestionTests(unittest.TestCase):
         self.assertEqual(result["team_total"], 5.2)
         self.assertEqual(result["opponent_total"], 3.8)
         self.assertEqual(result["vegas_source"], "The Odds API consensus")
+    def vegas_history(self, slate_count=3, odds_source="The Odds API consensus"):
+        boosts = [-0.6, -0.3, 0.3, 0.6]
+        history = []
+        for slate_index in range(slate_count):
+            observations = []
+            for player_index in range(70):
+                boost = boosts[player_index % len(boosts)]
+                projection = 10.0
+                observations.append({
+                    "name": f"Vegas Player {slate_index}-{player_index}",
+                    "position": "P" if player_index % 7 == 0 else "OF",
+                    "raw_projection": projection,
+                    "projection": projection,
+                    "actual": projection + boost * 2.0,
+                    "vegas_boost": boost,
+                    "team_total": 4.2 + boost,
+                    "odds_source": odds_source,
+                    "model_version": "imported_projection_blend_v1",
+                })
+            history.append({
+                "slate_key": f"2026-vegas-{slate_index}",
+                "observations": observations,
+            })
+        return history
+
+    def test_verified_vegas_effect_activates_only_after_cross_validation(self):
+        model = main.train_calibration_model(self.vegas_history())
+        vegas_validation = model["validation"]["vegas"]
+        self.assertTrue(vegas_validation["eligible"])
+        self.assertTrue(vegas_validation["passes"])
+        self.assertEqual(vegas_validation["validated_slates"], 3)
+        self.assertGreater(model["parameters"]["vegas"]["groups"]["ALL"]["projection_slope"], 0)
+
+    def test_estimated_team_totals_do_not_train_vegas_calibration(self):
+        model = main.train_calibration_model(self.vegas_history(3, "DFS Edge estimate"))
+        self.assertEqual(model["validation"]["vegas"]["gate"], "collecting")
+        self.assertEqual(model["vegas_training_player_count"], 0)
+
+    def test_earned_vegas_adjustment_requires_verified_odds(self):
+        model = {
+            "model_version": "mlb-cal-vegas-test",
+            "is_active": True,
+            "training_slate_count": 3,
+            "target_model_versions": ["imported_projection_blend_v1"],
+            "parameters": {
+                "positions": {},
+                "ownership_positions": {},
+                "vegas": {
+                    "groups": {"H": {"projection_slope": 1.0, "confidence": 0.8}},
+                    "adjustment_scale": 1.0,
+                },
+            },
+            "validation": {
+                "passes": False,
+                "ownership": {"passes": False},
+                "vegas": {"passes": True},
+            },
+        }
+        player = {
+            "name": "Vegas Test Bat",
+            "position": "OF",
+            "projection": 10.0,
+            "raw_projection": 10.0,
+            "floor": 2.0,
+            "ceiling": 22.0,
+            "vegas_boost": 0.5,
+            "projection_model_version": "imported_projection_blend_v1",
+        }
+        verified = main.apply_calibration_to_player(
+            {**player, "odds_source": "The Odds API consensus"},
+            model,
+        )
+        estimated = main.apply_calibration_to_player(
+            {**player, "odds_source": "DFS Edge estimate"},
+            model,
+        )
+        self.assertTrue(verified["vegas_calibration_applied"])
+        self.assertEqual(verified["projection"], 10.5)
+        self.assertFalse(estimated["vegas_calibration_applied"])
+        self.assertEqual(estimated["projection"], 10.0)
 
     def test_first_market_snapshot_does_not_invent_movement(self):
         player = {

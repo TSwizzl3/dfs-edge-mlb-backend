@@ -62,6 +62,8 @@ CALIBRATION_MODEL_PATH = BASE_DIR / "mlb_calibration_model.json"
 CALIBRATION_MIN_SLATES = 2
 CALIBRATION_MIN_PLAYERS = 150
 CALIBRATION_FULL_STRENGTH_SLATES = 8
+VEGAS_CALIBRATION_MIN_PLAYERS = 40
+VEGAS_CALIBRATION_FULL_STRENGTH_SLATES = 8
 CALIBRATION_MAX_SLATES = 90
 CALIBRATION_HALF_LIFE_SLATES = 20.0
 CALIBRATION_CACHE_SECONDS = 5 * 60
@@ -1389,7 +1391,44 @@ def projection_snapshot_path(slate_key):
     return PROJECTION_SNAPSHOT_DIR / f"{digest}.json"
 
 
-def save_projection_snapshot(players, slate_key, auth_token=""):
+def verified_odds_player_count(players):
+    return len([
+        player for player in players
+        if "odds api" in str(player.get("odds_source") or player.get("vegas_source") or "").lower()
+        and safe_float(player.get("team_total"), 0) > 0
+    ])
+
+
+def projection_snapshot_lock_state(odds_state):
+    """Fail closed when a verified pre-lock time cannot be established."""
+    start_times = []
+    for game in (odds_state or {}).get("games", []) or []:
+        raw_start = str(game.get("commence_time") or "").strip()
+        if not raw_start:
+            continue
+        try:
+            parsed = datetime.fromisoformat(raw_start.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            start_times.append(parsed.astimezone(timezone.utc))
+        except (TypeError, ValueError):
+            continue
+    if not start_times:
+        return {
+            "pre_lock": False,
+            "status": "lock_time_unavailable",
+            "lock_time": None,
+        }
+    lock_time = min(start_times)
+    now = datetime.now(timezone.utc)
+    return {
+        "pre_lock": now < lock_time,
+        "status": "pre_lock" if now < lock_time else "locked",
+        "lock_time": lock_time.isoformat(),
+    }
+
+
+def save_projection_snapshot(players, slate_key, auth_token="", source="admin_projection_csv", metadata=None):
     resolved_key = normalize_slate_key(slate_key)
     slate_record = load_slate_record(resolved_key) or {}
     meta = load_slate_metadata()
@@ -1407,12 +1446,16 @@ def save_projection_snapshot(players, slate_key, auth_token=""):
         "slate_key": resolved_key,
         "slate_date": slate_record.get("slate_date") or meta.get("slate_date") or None,
         "captured_at": captured_at,
-        "source": "admin_projection_csv",
+        "source": source,
         "model_versions": model_versions,
         "calibration_model_version": calibration_versions[-1] if calibration_versions else None,
         "players": players,
         "player_count": len(players),
+        "verified_odds_player_count": verified_odds_player_count(players),
+        "verified_odds_captured": verified_odds_player_count(players) > 0,
     }
+    if isinstance(metadata, dict):
+        record.update(metadata)
     try:
         projection_snapshot_path(resolved_key).write_text(json.dumps(record, indent=2), encoding="utf-8")
         write_json_file(PROJECTION_SNAPSHOT_PATH, players)
@@ -1450,6 +1493,52 @@ def load_projection_snapshot(slate_key, auth_token=""):
     if isinstance(legacy, list) and len(legacy) >= 10:
         return {"slate_key": resolved_key, "players": legacy, "source": "legacy_latest_snapshot"}
     return None
+
+
+def refresh_existing_projection_snapshot(players, slate_key, odds_state, auth_token=""):
+    """Refresh a saved forecast with verified market fields, but never after slate lock."""
+    resolved_key = normalize_slate_key(slate_key)
+    existing = load_projection_snapshot(resolved_key, auth_token)
+    if not existing:
+        return {
+            "updated": False,
+            "status": "waiting_for_projection_snapshot",
+            "message": "Live odds are ready. Upload projections to create the pre-lock learning snapshot.",
+        }
+    lock_state = projection_snapshot_lock_state(odds_state)
+    if not lock_state.get("pre_lock"):
+        return {
+            "updated": False,
+            **lock_state,
+            "message": "The saved pre-lock snapshot was protected and was not changed after contest lock.",
+        }
+    verified_count = verified_odds_player_count(players)
+    if verified_count <= 0:
+        return {
+            "updated": False,
+            "status": "verified_odds_unavailable",
+            "lock_time": lock_state.get("lock_time"),
+            "message": "No verified Odds API team totals matched this exact slate yet.",
+        }
+    snapshot = save_projection_snapshot(
+        players,
+        resolved_key,
+        auth_token,
+        source="auto_verified_odds_refresh",
+        metadata={
+            "lock_time": lock_state.get("lock_time"),
+            "market_snapshot_status": "verified_pre_lock",
+            "odds_fetched_at": (odds_state or {}).get("fetched_at"),
+        },
+    )
+    return {
+        "updated": True,
+        "status": "verified_pre_lock",
+        "lock_time": lock_state.get("lock_time"),
+        "verified_odds_player_count": verified_count,
+        "persisted": bool(snapshot.get("persisted")),
+        "message": f"Verified Vegas data was frozen with {verified_count} players in the pre-lock snapshot.",
+    }
 
 
 def save_backtest_record(payload, auth_token=""):
@@ -1882,6 +1971,147 @@ def fit_ownership_parameters(history):
     }
 
 
+def fit_vegas_parameters(history):
+    _, observations = training_observations(history)
+    live_rows = [
+        row for row in observations
+        if "odds api" in str(row.get("odds_source", "")).lower()
+        and abs(safe_float(row.get("vegas_boost"), 0)) > 0.001
+    ]
+    parameters = {}
+    for group in ["ALL", "P", "H"]:
+        rows = live_rows if group == "ALL" else [
+            row for row in live_rows
+            if ("P" if row["position"] == "P" else "H") == group
+        ]
+        if not rows or (group != "ALL" and len(rows) < 15):
+            continue
+        signals = [safe_float(row.get("vegas_boost"), 0) for row in rows]
+        residuals = [safe_float(row.get("residual"), 0) for row in rows]
+        weights = [safe_float(row.get("weight"), 1) for row in rows]
+        signal_mean = weighted_mean(signals, weights)
+        residual_mean = weighted_mean(residuals, weights)
+        covariance = sum(
+            weight * (signal - signal_mean) * (residual - residual_mean)
+            for signal, residual, weight in zip(signals, residuals, weights)
+        )
+        variance = sum(
+            weight * (signal - signal_mean) ** 2
+            for signal, weight in zip(signals, weights)
+        )
+        raw_slope = covariance / variance if variance > 1e-9 else 0.0
+        shrinkage = len(rows) / (len(rows) + (120.0 if group == "ALL" else 70.0))
+        slope = max(-1.5, min(1.5, raw_slope * shrinkage))
+        slate_count = len({row["slate_key"] for row in rows})
+        confidence = min(1.0, slate_count / 8.0) * min(
+            1.0,
+            len(rows) / (200.0 if group == "ALL" else 80.0),
+        )
+        parameters[group] = {
+            "projection_slope": round(slope, 4),
+            "raw_projection_slope": round(raw_slope, 4),
+            "sample_size": len(rows),
+            "slate_count": slate_count,
+            "confidence": round(confidence, 4),
+        }
+    slate_count = len({row["slate_key"] for row in live_rows})
+    return {
+        "groups": parameters,
+        "training_slate_count": slate_count,
+        "training_player_count": len(live_rows),
+        "adjustment_scale": calibration_adjustment_scale(slate_count),
+    }
+
+
+def validate_vegas_calibration(history):
+    trainable, observations = training_observations(history)
+    live_rows = [
+        row for row in observations
+        if "odds api" in str(row.get("odds_source", "")).lower()
+        and abs(safe_float(row.get("vegas_boost"), 0)) > 0.001
+    ]
+    live_slates = sorted({row["slate_key"] for row in live_rows})
+    baseline_errors = []
+    calibrated_errors = []
+    group_errors = {}
+    for holdout_key in live_slates:
+        training = [
+            item for item in trainable
+            if normalize_slate_key(item.get("slate_key")) != holdout_key
+        ]
+        fitted = fit_vegas_parameters(training)
+        params = fitted.get("groups", {})
+        adjustment_scale = calibration_validation_scale(fitted.get("training_slate_count", 0))
+        holdout_rows = [row for row in live_rows if row["slate_key"] == holdout_key]
+        for row in holdout_rows:
+            group = "P" if row["position"] == "P" else "H"
+            parameter = params.get(group) or params.get("ALL") or {}
+            raw_projection = row["raw_projection"]
+            actual = row["actual"]
+            vegas_adjustment = (
+                safe_float(parameter.get("projection_slope"), 0)
+                * safe_float(row.get("vegas_boost"), 0)
+                * adjustment_scale
+            )
+            calibrated_projection = max(0.0, raw_projection + vegas_adjustment)
+            baseline_error = abs(raw_projection - actual)
+            calibrated_error = abs(calibrated_projection - actual)
+            baseline_errors.append(baseline_error)
+            calibrated_errors.append(calibrated_error)
+            bucket = group_errors.setdefault(group, {"baseline": [], "calibrated": []})
+            bucket["baseline"].append(baseline_error)
+            bucket["calibrated"].append(calibrated_error)
+    baseline_mae = statistics.fmean(baseline_errors) if baseline_errors else 0.0
+    calibrated_mae = statistics.fmean(calibrated_errors) if calibrated_errors else 0.0
+    improvement = baseline_mae - calibrated_mae
+    improvement_percent = 100.0 * improvement / baseline_mae if baseline_mae > 0 else 0.0
+    by_group = {}
+    regressions = []
+    for group, values in group_errors.items():
+        if not values["baseline"]:
+            continue
+        group_baseline = statistics.fmean(values["baseline"])
+        group_calibrated = statistics.fmean(values["calibrated"])
+        group_improvement = (
+            100.0 * (group_baseline - group_calibrated) / group_baseline
+            if group_baseline > 0 else 0.0
+        )
+        by_group[group] = {
+            "sample_size": len(values["baseline"]),
+            "baseline_mae": round(group_baseline, 4),
+            "calibrated_mae": round(group_calibrated, 4),
+            "improvement_percent": round(group_improvement, 3),
+        }
+        if len(values["baseline"]) >= 15:
+            regressions.append(-group_improvement)
+    eligible = (
+        len(live_slates) >= CALIBRATION_MIN_SLATES
+        and len(live_rows) >= VEGAS_CALIBRATION_MIN_PLAYERS
+    )
+    worst_group_regression = max([0.0] + regressions)
+    passes = (
+        eligible
+        and improvement_percent >= 0.5
+        and improvement >= 0.02
+        and worst_group_regression <= 5.0
+    )
+    return {
+        "eligible": eligible,
+        "passes": passes,
+        "minimum_slates": CALIBRATION_MIN_SLATES,
+        "minimum_players": VEGAS_CALIBRATION_MIN_PLAYERS,
+        "validated_slates": len(live_slates),
+        "validated_players": len(baseline_errors),
+        "baseline_mae": round(baseline_mae, 4),
+        "calibrated_mae": round(calibrated_mae, 4),
+        "mae_improvement": round(improvement, 4),
+        "improvement_percent": round(improvement_percent, 3),
+        "worst_group_regression_percent": round(worst_group_regression, 3),
+        "by_group": by_group,
+        "gate": "passed" if passes else ("collecting" if not eligible else "rejected"),
+    }
+
+
 def validate_ownership_calibration(history):
     trainable, observations = training_observations(history)
     ownership_observations = [row for row in observations if row.get("actual_ownership") is not None]
@@ -2018,14 +2248,17 @@ def train_calibration_model(history):
     validation = validate_calibration(history)
     ownership_fitted = fit_ownership_parameters(history)
     ownership_validation = validate_ownership_calibration(history)
+    vegas_fitted = fit_vegas_parameters(history)
+    vegas_validation = validate_vegas_calibration(history)
     fingerprint = json.dumps({
         "slates": [normalize_slate_key(item.get("slate_key")) for item in history],
         "parameters": fitted.get("positions", {}),
         "ownership_parameters": ownership_fitted.get("positions", {}),
+        "vegas_parameters": vegas_fitted.get("groups", {}),
     }, sort_keys=True)
     model_version = f"mlb-cal-{hashlib.sha256(fingerprint.encode('utf-8')).hexdigest()[:12]}"
-    any_component_active = validation["passes"] or ownership_validation["passes"]
-    any_component_eligible = validation["eligible"] or ownership_validation["eligible"]
+    any_component_active = validation["passes"] or ownership_validation["passes"] or vegas_validation["passes"]
+    any_component_eligible = validation["eligible"] or ownership_validation["eligible"] or vegas_validation["eligible"]
     status = "active" if any_component_active else ("collecting" if not any_component_eligible else "rejected")
     adjustment_scale = calibration_adjustment_scale(fitted.get("training_slate_count", 0))
     training_slate_count = fitted.get("training_slate_count", 0)
@@ -2043,6 +2276,8 @@ def train_calibration_model(history):
         "training_player_count": fitted.get("training_player_count", 0),
         "ownership_training_slate_count": ownership_fitted.get("training_slate_count", 0),
         "ownership_training_player_count": ownership_fitted.get("training_player_count", 0),
+        "vegas_training_slate_count": vegas_fitted.get("training_slate_count", 0),
+        "vegas_training_player_count": vegas_fitted.get("training_player_count", 0),
         "learning_stage": learning_stage,
         "adjustment_scale": adjustment_scale,
         "full_strength_slates": CALIBRATION_FULL_STRENGTH_SLATES,
@@ -2050,13 +2285,14 @@ def train_calibration_model(history):
         "parameters": {
             "positions": fitted.get("positions", {}),
             "ownership_positions": ownership_fitted.get("positions", {}),
+            "vegas": vegas_fitted,
             "learning": {
                 "stage": learning_stage,
                 "adjustment_scale": adjustment_scale,
                 "full_strength_slates": CALIBRATION_FULL_STRENGTH_SLATES,
             },
         },
-        "validation": {**validation, "ownership": ownership_validation},
+        "validation": {**validation, "ownership": ownership_validation, "vegas": vegas_validation},
     }
 
 
@@ -2139,6 +2375,7 @@ def apply_calibration_to_player(player, model=None):
     calibrated["raw_ownership"] = round(raw_ownership, 4)
     calibrated["calibration_applied"] = False
     calibrated["ownership_calibration_applied"] = False
+    calibrated["vegas_calibration_applied"] = False
     if not model or not model.get("is_active"):
         return calibrated
     target_versions = {str(value) for value in model.get("target_model_versions", [])}
@@ -2152,11 +2389,21 @@ def apply_calibration_to_player(player, model=None):
     parameter = positions.get(position) or positions.get("ALL")
     ownership_positions = model_parameters.get("ownership_positions", {})
     ownership_parameter = ownership_positions.get(position) or ownership_positions.get("ALL")
+    vegas_model = model_parameters.get("vegas", {})
+    vegas_groups = vegas_model.get("groups", {}) if isinstance(vegas_model, dict) else {}
+    vegas_parameter = vegas_groups.get("P" if position == "P" else "H") or vegas_groups.get("ALL")
     validation = model.get("validation") if isinstance(model.get("validation"), dict) else {}
     projection_enabled = bool(validation.get("passes", True))
     ownership_validation = validation.get("ownership") if isinstance(validation.get("ownership"), dict) else {}
     ownership_enabled = bool(ownership_validation.get("passes", False))
-    if not isinstance(parameter, dict) and not (ownership_enabled and isinstance(ownership_parameter, dict)):
+    vegas_validation = validation.get("vegas") if isinstance(validation.get("vegas"), dict) else {}
+    vegas_enabled = bool(vegas_validation.get("passes", False))
+    vegas_verified = "odds api" in str(calibrated.get("odds_source") or calibrated.get("vegas_source") or "").lower()
+    if (
+        not isinstance(parameter, dict)
+        and not (ownership_enabled and isinstance(ownership_parameter, dict))
+        and not (vegas_enabled and vegas_verified and isinstance(vegas_parameter, dict))
+    ):
         calibrated["calibration_skip_reason"] = "position_not_trained"
         return calibrated
     adjustment_scale = max(0.0, min(1.0, safe_float(
@@ -2165,27 +2412,44 @@ def apply_calibration_to_player(player, model=None):
     )))
     projection_parameter = parameter if projection_enabled and isinstance(parameter, dict) else {}
     offset = safe_float(projection_parameter.get("projection_offset"), 0) * adjustment_scale
+    vegas_adjustment_scale = max(0.0, min(1.0, safe_float(
+        vegas_model.get("adjustment_scale") if isinstance(vegas_model, dict) else 0,
+        0,
+    )))
+    vegas_signal = safe_float(calibrated.get("vegas_boost"), 0)
+    vegas_offset = (
+        safe_float((vegas_parameter or {}).get("projection_slope"), 0)
+        * vegas_signal
+        * vegas_adjustment_scale
+        if vegas_enabled and vegas_verified and isinstance(vegas_parameter, dict) else 0.0
+    )
+    total_offset = offset + vegas_offset
     empirical_floor = raw_projection + safe_float(projection_parameter.get("residual_q15"), raw_floor - raw_projection)
     empirical_ceiling = raw_projection + safe_float(projection_parameter.get("residual_q90"), raw_ceiling - raw_projection)
-    projection = max(0.0, raw_projection + offset)
+    projection = max(0.0, raw_projection + total_offset)
     floor_empirical_weight = 0.30 * adjustment_scale
     ceiling_empirical_weight = 0.35 * adjustment_scale
     floor = max(0.0, min(
         projection,
-        (raw_floor + offset) * (1.0 - floor_empirical_weight) + empirical_floor * floor_empirical_weight,
+        (raw_floor + total_offset) * (1.0 - floor_empirical_weight) + (empirical_floor + vegas_offset) * floor_empirical_weight,
     ))
     ceiling = max(
         projection,
-        (raw_ceiling + offset) * (1.0 - ceiling_empirical_weight) + empirical_ceiling * ceiling_empirical_weight,
+        (raw_ceiling + total_offset) * (1.0 - ceiling_empirical_weight) + (empirical_ceiling + vegas_offset) * ceiling_empirical_weight,
     )
     calibrated.update({
         "projection": round(projection, 3),
         "floor": round(floor, 3),
         "ceiling": round(ceiling, 3),
-        "calibration_applied": bool(projection_enabled and projection_parameter),
-        "calibration_adjustment": round(offset, 3),
+        "calibration_applied": bool((projection_enabled and projection_parameter) or vegas_offset),
+        "calibration_adjustment": round(total_offset, 3),
+        "position_calibration_adjustment": round(offset, 3),
         "calibration_adjustment_scale": round(adjustment_scale, 3),
         "calibration_confidence": round(safe_float(projection_parameter.get("confidence"), 0), 3),
+        "vegas_calibration_applied": bool(vegas_offset),
+        "vegas_calibration_adjustment": round(vegas_offset, 3),
+        "vegas_calibration_coefficient": round(safe_float((vegas_parameter or {}).get("projection_slope"), 0), 4),
+        "vegas_calibration_confidence": round(safe_float((vegas_parameter or {}).get("confidence"), 0), 3),
         "calibration_model_version": model.get("model_version"),
         "calibration_trained_slates": safe_int(model.get("training_slate_count"), 0),
     })
@@ -6209,6 +6473,9 @@ def enrich_active_slate(request: AdminPasswordRequest):
     except Exception as exc:
         weather_state = {"success": False, "configured": True, "error": f"Weather refresh unavailable: {exc.__class__.__name__}"}
     enriched_players = add_values(enriched_players)
+    active_calibration = load_active_calibration_model(force=True)
+    enriched_players = apply_rolling_calibration(enriched_players, active_calibration)
+    enriched_players = add_values(enriched_players)
     save_active_slate(enriched_players)
     active_meta = load_slate_metadata()
     active_key = request.slate_key or active_meta.get("slate_key", "")
@@ -6219,7 +6486,14 @@ def enrich_active_slate(request: AdminPasswordRequest):
             active_meta.get("slate_name", "MLB Slate"),
             active_meta.get("slate_date", slate_date),
             active_meta.get("slate_type", "custom"),
+            str(getattr(request, "admin_token", "") or ""),
         )
+    snapshot_refresh = refresh_existing_projection_snapshot(
+        enriched_players,
+        active_key or "current",
+        odds_state if odds_state.get("success") else {},
+        str(getattr(request, "admin_token", "") or ""),
+    )
 
     cleanup_stats = {
         "original_count": len(enriched_players),
@@ -6244,6 +6518,7 @@ def enrich_active_slate(request: AdminPasswordRequest):
         "starter_refresh": starter_state,
         "odds_refresh": mlb_feed_summary(odds_state if odds_state.get("success") else {}, configured=bool(ODDS_API_KEY)),
         "weather_refresh": mlb_feed_summary(weather_state if weather_state.get("success") else {}, configured=True),
+        "projection_snapshot_refresh": snapshot_refresh,
         "warnings": [warning for warning in [starter_state.get("error", ""), odds_state.get("error", ""), weather_state.get("error", "")] if warning],
     }
 
@@ -7115,6 +7390,7 @@ async def upload_projections_csv(
         if item.get("ownership", 0) > 0:
             player["ownership"] = item["ownership"]
             player["ownership_source"] = "admin_projection_csv"
+            player["ownership_estimated"] = False
             ownership_count += 1
         if item.get("ceiling", 0) > 0:
             player["raw_ceiling"] = item["ceiling"]
@@ -7130,9 +7406,19 @@ async def upload_projections_csv(
     if matched == 0:
         return {"success": False, "error": "Projection names did not match any player on the active MLB slate."}
 
-    active_calibration = load_active_calibration_model(force=True)
+    try:
+        players, odds_state = refresh_mlb_odds(players, force=True)
+    except Exception as exc:
+        odds_state = {
+            "success": False,
+            "configured": bool(ODDS_API_KEY),
+            "error": f"Odds refresh unavailable: {exc.__class__.__name__}",
+        }
     players = apply_slate_starter_likelihood(players)
+    players = add_values(players)
+    active_calibration = load_active_calibration_model(force=True)
     players = apply_rolling_calibration(players, active_calibration)
+    players = add_values(players)
     save_active_slate(players)
     if slate_key and slate_key != "current":
         existing_slate = load_slate_record(slate_key) or {}
@@ -7144,19 +7430,44 @@ async def upload_projections_csv(
             existing_slate.get("slate_type", "custom"),
             admin_token,
         )
-    snapshot = save_projection_snapshot(players, slate_key or "current", admin_token)
+    resolved_slate_key = slate_key or "current"
+    lock_state = projection_snapshot_lock_state(odds_state if odds_state.get("success") else {})
+    existing_snapshot = load_projection_snapshot(resolved_slate_key, admin_token)
+    snapshot_protected = bool(existing_snapshot and lock_state.get("status") == "locked")
+    if snapshot_protected:
+        snapshot = existing_snapshot
+        snapshot_saved = False
+    else:
+        verified_count = verified_odds_player_count(players)
+        snapshot = save_projection_snapshot(
+            players,
+            resolved_slate_key,
+            admin_token,
+            source="admin_projection_csv_verified_odds" if verified_count else "admin_projection_csv",
+            metadata={
+                "lock_time": lock_state.get("lock_time"),
+                "market_snapshot_status": "verified_pre_lock" if verified_count else "estimated_only",
+                "odds_fetched_at": odds_state.get("fetched_at"),
+            },
+        )
+        snapshot_saved = True
     calibrated_count = len([player for player in players if player.get("calibration_applied")])
+    vegas_calibrated_count = len([player for player in players if player.get("vegas_calibration_applied")])
     return {
         "success": True,
-        "message": "MLB projections imported and the pre-lock snapshot was saved for rolling calibration.",
+        "message": "MLB projections imported with an automatic verified Vegas snapshot." if snapshot_saved and verified_odds_player_count(players) else ("MLB projections imported; the original pre-lock snapshot was protected after lock." if snapshot_protected else "MLB projections imported; Vegas learning will begin when verified odds match this slate."),
         "rows_imported": len(imported),
         "players_matched": matched,
         "ownership_matched": ownership_count,
         "ceiling_matched": ceiling_count,
         "unmatched_count": len(unmatched_names),
-        "projection_snapshot_saved": True,
+        "projection_snapshot_saved": snapshot_saved,
+        "projection_snapshot_protected": snapshot_protected,
         "projection_snapshot_persisted": bool(snapshot.get("persisted")),
+        "verified_odds_player_count": verified_odds_player_count(players),
+        "odds_refresh": mlb_feed_summary(odds_state if odds_state.get("success") else {}, configured=bool(ODDS_API_KEY)),
         "calibration_applied_players": calibrated_count,
+        "vegas_calibration_applied_players": vegas_calibrated_count,
         "calibration_model_version": active_calibration.get("model_version") if active_calibration else None,
     }
 
@@ -7337,6 +7648,9 @@ def model_backtest_status(authorization: str = Header("")):
     ownership_validation = (candidate.get("validation") or {}).get("ownership", {})
     active_validation = (active_model or {}).get("validation", {}) if isinstance(active_model, dict) else {}
     active_ownership_validation = active_validation.get("ownership", {}) if isinstance(active_validation, dict) else {}
+    vegas_validation = (candidate.get("validation") or {}).get("vegas", {})
+    active_vegas_validation = active_validation.get("vegas", {}) if isinstance(active_validation, dict) else {}
+    active_vegas_model = ((active_model or {}).get("parameters") or {}).get("vegas", {})
     learning_components = {
         "projections": {
             "status": "active" if active_model and active_validation.get("passes", True) else candidate.get("validation", {}).get("gate", "collecting"),
@@ -7353,13 +7667,21 @@ def model_backtest_status(authorization: str = Header("")):
             "next_step": "Upload DraftKings GameCenter results containing % Drafted, or a results CSV with Actual Ownership.",
         },
         "vegas": {
-            "status": "evidence_ready" if len({row["slate_key"] for row in live_odds_rows}) >= CALIBRATION_MIN_SLATES and len(live_odds_rows) >= 40 else "collecting",
+            "status": "active" if active_vegas_validation.get("passes") else vegas_validation.get("gate", "collecting"),
             "slates": len({row["slate_key"] for row in live_odds_rows}),
             "players": len(live_odds_rows),
             "source": "The Odds API consensus",
-            "adjusts_live_model": False,
+            "adjusts_live_model": bool(active_vegas_validation.get("passes")),
             "estimated_observations_ignored": len(estimated_market_rows),
-            "next_step": "Refresh live MLB feeds before uploading projections so verified market totals are captured in the pre-lock snapshot.",
+            "minimum_slates": CALIBRATION_MIN_SLATES,
+            "minimum_players": VEGAS_CALIBRATION_MIN_PLAYERS,
+            "improvement_percent": safe_float(active_vegas_validation.get("improvement_percent"), safe_float(vegas_validation.get("improvement_percent"), 0)),
+            "adjustment_scale": safe_float(active_vegas_model.get("adjustment_scale"), 0) if isinstance(active_vegas_model, dict) else 0,
+            "next_step": (
+                "Validated Vegas weighting is active and will keep adapting after every exact-slate result upload."
+                if active_vegas_validation.get("passes")
+                else "Upload projections for the exact slate before lock; verified odds are now captured automatically."
+            ),
         },
         "simulator": {
             "status": "evidence_ready" if simulator_history else "needs_contest_standings",
