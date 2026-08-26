@@ -298,6 +298,12 @@ class AdminIngestionTests(unittest.TestCase):
         self.assertEqual(main.v4_style_from_request(ceiling, ceiling.mode), "aggressive")
         self.assertEqual(main.v4_style_from_request(nuclear, nuclear.mode), "nuclear")
 
+    def test_mlb_lineup_is_returned_in_draftkings_roster_order(self):
+        positions = ["OF", "2B", "P", "SS", "C", "OF", "1B", "P", "3B", "OF"]
+        lineup = [{"name": f"Player {index}", "position": position} for index, position in enumerate(positions)]
+        ordered = main.order_mlb_lineup_for_draftkings(lineup)
+        self.assertEqual([player["position"] for player in ordered], ["P", "P", "C", "1B", "2B", "3B", "SS", "OF", "OF", "OF"])
+
     def test_tournament_distribution_anchors_to_uploaded_player_ceiling(self):
         player = {
             "name": "Verified Upside", "position": "OF", "salary": 4800,

@@ -9994,6 +9994,14 @@ def monte_carlo_lineup_simulation_v2(lineup, contest, runs=1200, field_scores=No
 TOURNAMENT_ENGINE_VERSION = "dfs_edge_mlb_tournament_engine_v5_nuclear_barbell"
 
 V4_REQUIRED_COUNTS = {"P": 2, "C": 1, "1B": 1, "2B": 1, "3B": 1, "SS": 1, "OF": 3}
+MLB_DK_POSITION_ORDER = {"P": 0, "C": 1, "1B": 2, "2B": 3, "3B": 4, "SS": 5, "OF": 6}
+
+
+def order_mlb_lineup_for_draftkings(lineup):
+    return sorted(
+        list(lineup or []),
+        key=lambda player: MLB_DK_POSITION_ORDER.get(normalize_position(player.get("position", "")), 99),
+    )
 
 
 def v4_style_from_request(request, mode="gpp"):
@@ -10780,7 +10788,8 @@ def lineup_quality_profile(lineup, mode="gpp"):
 
 
 def add_lineup_metadata(lineup_data):
-    lineup = lineup_data.get("lineup", []) or []
+    lineup = order_mlb_lineup_for_draftkings(lineup_data.get("lineup", []) or [])
+    lineup_data["lineup"] = lineup
     mode = lineup_data.get("mode", "gpp")
     total_salary = sum(safe_int(p.get("salary", 0), 0) for p in lineup)
     raw_projection = sum(safe_float(p.get("projection", 0), 0) for p in lineup)
