@@ -501,6 +501,52 @@ def parse_actual_results_csv(csv_text):
     return list(actual_by_name.values())
 
 
+def parse_contest_standings_csv(csv_text):
+    """Extract entrant ranks and scores from a DraftKings GameCenter CSV."""
+    standings = []
+    rank_columns = ["Rank", "Place", "Finishing Position", "Position"]
+    score_columns = ["Points", "Score", "Fantasy Points", "FPTS", "DK Points"]
+    entry_columns = ["EntryId", "Entry ID", "EntryName", "Entry Name", "UserName", "Username", "Lineup"]
+    for raw_row in csv.DictReader(io.StringIO(csv_text)):
+        row = clean_csv_row(raw_row)
+        rank_text = str(find_column(row, rank_columns) or "").strip()
+        score_text = find_column(row, score_columns)
+        has_entry = bool(find_column(row, entry_columns))
+        rank_match = re.search(r"[0-9]+", rank_text.replace(",", ""))
+        if not rank_match or score_text in (None, "") or not has_entry:
+            continue
+        rank = safe_int(rank_match.group(0), 0)
+        score = safe_float(score_text, -1)
+        if rank < 1 or score < 0:
+            continue
+        standings.append({"rank": rank, "score": round(score, 3)})
+
+    if not standings:
+        return {"summary": {}, "scores": []}
+
+    standings.sort(key=lambda item: (item["rank"], -item["score"]))
+    scores = sorted((item["score"] for item in standings), reverse=True)
+    field_size = max(max(item["rank"] for item in standings), len(standings))
+
+    def cutoff(percent):
+        rank = max(1, min(len(scores), math.ceil(field_size * percent)))
+        return round(scores[min(rank - 1, len(scores) - 1)], 3)
+
+    summary = {
+        "source": "draftkings_gamecenter_standings",
+        "observation_count": len(standings),
+        "field_size": field_size,
+        "first_place_score": round(scores[0], 3),
+        "top_0_1_percent_score": cutoff(0.001),
+        "top_1_percent_score": cutoff(0.01),
+        "top_10_percent_score": cutoff(0.10),
+        "median_score": round(statistics.median(scores), 3),
+        "minimum_score": round(scores[-1], 3),
+    }
+    return {"summary": summary, "scores": scores}
+
+
+
 def projection_backtest(players, actual_rows):
     actual_by_name = {
         normalized_player_name(item.get("name")): item
@@ -1408,6 +1454,8 @@ def save_backtest_record(payload, auth_token=""):
             "baseline": payload.get("baseline_by_position", {}),
             "ownership": payload.get("ownership", {}),
             "market_evidence": payload.get("market_evidence", {}),
+            "simulator_evidence": payload.get("simulator_evidence", {}),
+            "strategy_evidence": payload.get("strategy_evidence", {}),
         },
         "matched_players": safe_int(payload.get("matched_players"), 0),
         "unmatched_results": safe_int(payload.get("unmatched_results"), 0),
@@ -1444,6 +1492,8 @@ def load_backtest_history(auth_token=""):
             "overall": row.get("calibrated_overall", {}),
             "ownership": by_position.get("ownership", {}),
             "market_evidence": by_position.get("market_evidence", {}),
+            "simulator_evidence": by_position.get("simulator_evidence", {}),
+            "strategy_evidence": by_position.get("strategy_evidence", {}),
             "baseline_by_position": by_position.get("baseline", {}),
             "by_position": by_position.get("calibrated", {}),
             "matched_players": row.get("matched_players", 0),
@@ -1458,6 +1508,128 @@ def load_backtest_history(auth_token=""):
         records.values(),
         key=lambda item: str(item.get("evaluated_at") or item.get("slate_date") or ""),
     )[-CALIBRATION_MAX_SLATES:]
+
+
+def compact_learning_lineups(lineups):
+    compact = []
+    for lineup in (lineups or [])[:20]:
+        if not isinstance(lineup, dict):
+            continue
+        players = []
+        for player in lineup.get("lineup", []) if isinstance(lineup.get("lineup"), list) else []:
+            if not isinstance(player, dict):
+                continue
+            players.append({
+                "name": player.get("name"),
+                "position": normalize_position(player.get("position")),
+                "team": normalize_team(player.get("team")),
+                "projection": round(safe_float(player.get("projection"), 0), 3),
+                "ownership": round(safe_float(player.get("ownership"), 0), 3),
+            })
+        if players:
+            compact.append({
+                "projected_points": round(safe_float(lineup.get("projected_points"), 0), 3),
+                "optimizer_score": round(safe_float(lineup.get("optimizer_score"), 0), 3),
+                "builder_style": lineup.get("builder_style"),
+                "lineup": players,
+            })
+    return compact
+
+
+def record_lineup_learning_run(request, lineups):
+    compact = compact_learning_lineups(lineups)
+    if not compact:
+        return False
+    settings = {
+        "mode": str(getattr(request, "mode", "balanced") or "balanced").lower(),
+        "max_players_per_team": safe_int(getattr(request, "max_players_per_team", 5), 5),
+        "force_team_stack": bool(getattr(request, "force_team_stack", False)),
+        "avoid_pitcher_vs_hitter": bool(getattr(request, "avoid_pitcher_vs_hitter", True)),
+        "randomness": safe_int(getattr(request, "randomness", 0), 0),
+    }
+    rows = supabase_data_request(
+        "mlb_lineup_runs",
+        method="POST",
+        payload={
+            "slate_key": normalize_slate_key(getattr(request, "slate_key", "") or "current"),
+            "strategy_mode": settings["mode"],
+            "settings": settings,
+            "lineups": compact,
+            "lineup_count": len(compact),
+        },
+        prefer="return=minimal",
+    )
+    return rows is not None
+
+
+def evaluate_lineup_learning_runs(slate_key, actual_rows, standings_scores=None):
+    resolved_key = normalize_slate_key(slate_key)
+    actual_by_name = {
+        normalized_player_name(item.get("name")): safe_float(item.get("actual_points"), 0)
+        for item in actual_rows
+    }
+    encoded_key = urllib.parse.quote(resolved_key, safe="")
+    runs = supabase_data_request(
+        "mlb_lineup_runs",
+        query=f"slate_key=eq.{encoded_key}&evaluated_at=is.null&select=id,strategy_mode,lineups,lineup_count&limit=500",
+    )
+    if not isinstance(runs, list):
+        runs = []
+    all_scores = []
+    evaluated_lineups = 0
+    evaluated_runs = 0
+    strategy_counts = {}
+    field_scores = sorted((safe_float(value, -1) for value in (standings_scores or [])), reverse=True)
+    field_scores = [value for value in field_scores if value >= 0]
+    evaluated_at = datetime.now(timezone.utc).isoformat()
+
+    for run in runs:
+        results = []
+        for lineup in run.get("lineups", []) if isinstance(run.get("lineups"), list) else []:
+            player_rows = lineup.get("lineup", []) if isinstance(lineup, dict) else []
+            names = [normalized_player_name(player.get("name")) for player in player_rows if isinstance(player, dict)]
+            if not names or any(name not in actual_by_name for name in names):
+                continue
+            actual_score = round(sum(actual_by_name[name] for name in names), 3)
+            result = {"actual_score": actual_score}
+            if field_scores:
+                rank = 1 + sum(score > actual_score for score in field_scores)
+                result["estimated_rank"] = rank
+                result["field_percentile"] = round(100 * (1 - ((rank - 1) / max(1, len(field_scores)))), 3)
+            results.append(result)
+            all_scores.append(actual_score)
+
+        if not results:
+            continue
+        mode = str(run.get("strategy_mode") or "balanced")
+        strategy_counts[mode] = strategy_counts.get(mode, 0) + len(results)
+        evaluated_runs += 1
+        evaluated_lineups += len(results)
+        evaluation = {
+            "lineup_count": len(results),
+            "average_actual_score": round(statistics.fmean(item["actual_score"] for item in results), 3),
+            "best_actual_score": max(item["actual_score"] for item in results),
+            "top_1_percent_finishes": sum(item.get("field_percentile", 0) >= 99 for item in results),
+            "results": results,
+        }
+        run_id = urllib.parse.quote(str(run.get("id") or ""), safe="")
+        if run_id:
+            supabase_data_request(
+                "mlb_lineup_runs",
+                method="PATCH",
+                query=f"id=eq.{run_id}",
+                payload={"evaluated_at": evaluated_at, "evaluation": evaluation},
+                prefer="return=minimal",
+            )
+
+    return {
+        "source": "generated_lineup_actual_results",
+        "run_count": evaluated_runs,
+        "observation_count": evaluated_lineups,
+        "average_actual_score": round(statistics.fmean(all_scores), 3) if all_scores else 0,
+        "best_actual_score": max(all_scores) if all_scores else 0,
+        "strategy_counts": strategy_counts,
+    }
 
 
 def weighted_mean(values, weights):
@@ -6919,6 +7091,7 @@ async def upload_actual_results_csv(
 
     csv_text = (await file.read()).decode("utf-8-sig", errors="replace")
     actual_rows = parse_actual_results_csv(csv_text)
+    contest_standings = parse_contest_standings_csv(csv_text)
     if not actual_rows:
         return {
             "success": False,
@@ -6937,6 +7110,12 @@ async def upload_actual_results_csv(
     if not isinstance(players, list) or len(players) < 10:
         players = load_players(resolved_slate_key) or load_players()
     result = projection_backtest(players, actual_rows)
+    simulator_evidence = contest_standings.get("summary", {})
+    strategy_evidence = evaluate_lineup_learning_runs(
+        resolved_slate_key,
+        actual_rows,
+        contest_standings.get("scores", []),
+    )
     if result["matched_players"] < 10:
         return {
             "success": False,
@@ -6950,6 +7129,8 @@ async def upload_actual_results_csv(
         "slate_key": resolved_slate_key,
         "slate_date": (snapshot or {}).get("slate_date") or metadata.get("slate_date") or None,
         "evaluated_at": datetime.now(timezone.utc).isoformat(),
+        "simulator_evidence": simulator_evidence,
+        "strategy_evidence": strategy_evidence,
         **result,
     }
     _, backtest_persisted = save_backtest_record(payload, admin_token)
@@ -6989,6 +7170,22 @@ def model_backtest_status(authorization: str = Header("")):
     _, observations = training_observations(history)
     ownership_rows = [row for row in observations if row.get("actual_ownership") is not None]
     live_odds_rows = [row for row in observations if "odds api" in str(row.get("odds_source", "")).lower()]
+    estimated_market_rows = [
+        row for row in observations
+        if str(row.get("odds_source", "")).strip()
+        and row not in live_odds_rows
+        and (safe_float(row.get("team_total"), 0) > 0 or safe_float(row.get("opponent_total"), 0) > 0)
+    ]
+    simulator_history = [
+        item for item in history
+        if safe_int((item.get("simulator_evidence") or {}).get("observation_count"), 0) > 0
+    ]
+    strategy_history = [
+        item for item in history
+        if safe_int((item.get("strategy_evidence") or {}).get("observation_count"), 0) > 0
+    ]
+    simulator_observations = sum(safe_int((item.get("simulator_evidence") or {}).get("observation_count"), 0) for item in simulator_history)
+    strategy_observations = sum(safe_int((item.get("strategy_evidence") or {}).get("observation_count"), 0) for item in strategy_history)
     ownership_validation = (candidate.get("validation") or {}).get("ownership", {})
     active_validation = (active_model or {}).get("validation", {}) if isinstance(active_model, dict) else {}
     active_ownership_validation = active_validation.get("ownership", {}) if isinstance(active_validation, dict) else {}
@@ -7005,6 +7202,7 @@ def model_backtest_status(authorization: str = Header("")):
             "players": len(ownership_rows),
             "adjusts_live_model": bool(active_ownership_validation.get("passes")),
             "required_csv_column": "Actual Ownership",
+            "next_step": "Upload DraftKings GameCenter results containing % Drafted, or a results CSV with Actual Ownership.",
         },
         "vegas": {
             "status": "evidence_ready" if len({row["slate_key"] for row in live_odds_rows}) >= CALIBRATION_MIN_SLATES and len(live_odds_rows) >= 40 else "collecting",
@@ -7012,18 +7210,22 @@ def model_backtest_status(authorization: str = Header("")):
             "players": len(live_odds_rows),
             "source": "The Odds API consensus",
             "adjusts_live_model": False,
+            "estimated_observations_ignored": len(estimated_market_rows),
+            "next_step": "Refresh live MLB feeds before uploading projections so verified market totals are captured in the pre-lock snapshot.",
         },
         "simulator": {
-            "status": "needs_contest_standings",
-            "slates": 0,
-            "players": 0,
+            "status": "evidence_ready" if simulator_history else "needs_contest_standings",
+            "slates": len(simulator_history),
+            "players": simulator_observations,
             "adjusts_live_model": False,
+            "next_step": "Upload a DraftKings GameCenter CSV with entrant Rank and Points; standings are detected automatically.",
         },
         "lineup_strategy": {
-            "status": "needs_lineup_tracking",
-            "slates": 0,
-            "players": 0,
+            "status": "evidence_ready" if strategy_history else "tracking",
+            "slates": len(strategy_history),
+            "players": strategy_observations,
             "adjusts_live_model": False,
+            "next_step": "Build lineups before lock, then upload that exact slate's actual results to score every tracked strategy.",
         },
     }
     return {
@@ -7210,6 +7412,7 @@ def optimize_multiple_lineups(
     if not selected:
         return {"error": "No valid MLB lineups found with your current locks and excludes.", "lineups": [], "exposures": []}
 
+    record_lineup_learning_run(request, selected)
     return {
         "mode": request.mode,
         "requested_count": requested_count,

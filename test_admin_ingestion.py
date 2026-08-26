@@ -59,12 +59,13 @@ class AdminIngestionTests(unittest.TestCase):
         lineups = [{"lineup": [], "projected_points": 100 + index} for index in range(4)]
         with patch.object(main, "build_fast_multi_lineups_for_pro", return_value=(lineups, None, {}, 2)), patch.object(
             main, "calculate_exposures", return_value=[]
-        ):
+        ), patch.object(main, "record_lineup_learning_run") as learning_run:
             result = main.optimize_multiple_lineups(request, {"role": "admin"})
         self.assertEqual(result["requested_count"], 4)
         self.assertEqual(result["effective_count"], 4)
         self.assertEqual(result["returned_count"], 4)
         self.assertEqual(len(result["lineups"]), 4)
+        learning_run.assert_called_once_with(request, lineups)
 
     def test_session_falls_back_to_direct_supabase_verification(self):
         with patch.object(main, "central_auth_request", return_value={"success": False}), patch.object(
@@ -133,6 +134,36 @@ class AdminIngestionTests(unittest.TestCase):
         self.assertEqual(by_name["Zack Wheeler"]["actual_points"], 28.65)
         self.assertEqual(by_name["Zack Wheeler"]["actual_ownership"], 37.4)
         self.assertEqual(by_name["Bryce Harper"]["actual_ownership"], 22.1)
+
+
+    def test_draftkings_gamecenter_export_imports_contest_standings(self):
+        csv_text = (
+            "Rank,EntryId,EntryName,Points,Lineup\n"
+            "1,123,Winner,151.25,SP Player One OF Player Two\n"
+            "2,456,Runner Up,145.00,SP Player Three OF Player Four\n"
+            "100,789,Last Paid,90.50,SP Player Five OF Player Six\n"
+            "\n"
+            "Player,Roster Position,% Drafted,FPTS\n"
+            "Zack Wheeler,P,37.4%,28.65\n"
+        )
+        evidence = main.parse_contest_standings_csv(csv_text)
+        self.assertEqual(evidence["summary"]["observation_count"], 3)
+        self.assertEqual(evidence["summary"]["field_size"], 100)
+        self.assertEqual(evidence["summary"]["first_place_score"], 151.25)
+        self.assertEqual(evidence["summary"]["minimum_score"], 90.5)
+
+    def test_pro_optimizer_preserves_disabled_pitcher_hitter_conflict_setting(self):
+        request = main.MultiOptimizeRequest(count=1, avoid_pitcher_vs_hitter=False)
+        lineup = [{"lineup": [], "projected_points": 100}]
+        with patch.object(
+            main, "build_fast_multi_lineups_for_pro", return_value=(lineup, None, {}, 1)
+        ) as builder, patch.object(
+            main, "record_lineup_learning_run"
+        ), patch.object(
+            main, "calculate_exposures", return_value=[]
+        ):
+            main.optimize_multiple_lineups(request, {"role": "admin"})
+        self.assertFalse(builder.call_args.args[0].avoid_pitcher_vs_hitter)
 
 
     def test_player_name_matching_ignores_accents(self):
