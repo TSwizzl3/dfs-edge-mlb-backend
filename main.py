@@ -10042,6 +10042,24 @@ def v4_player_dist(player):
         p90 = proj * (1.95 + vol * 0.16)
         p95 = proj * (2.55 + vol * 0.20) + max(0, total - 4.2) * 1.1
         p99 = proj * (3.45 + vol * 0.28) + max(0, total - 4.2) * 2.0 + max(0, trend - 55) * 0.035 + max(0, 18 - own) * 0.10
+    # When the admin projection feed supplies a player-specific ceiling, use
+    # that distribution instead of treating every player as a fixed multiple of
+    # median projection. The supplied ceiling anchors p95; p99 extrapolates only
+    # the remaining upper tail.
+    supplied_ceiling = safe_float(player.get("ceiling", player.get("raw_ceiling", 0)), 0)
+    if supplied_ceiling > proj:
+        upside_gap = supplied_ceiling - proj
+        if pos == "P":
+            p75 = max(proj * 1.08, proj + upside_gap * 0.34)
+            p90 = max(proj * 1.15, proj + upside_gap * 0.72)
+            p95 = max(supplied_ceiling, proj + upside_gap)
+            p99 = max(supplied_ceiling * 1.10, proj + upside_gap * 1.42)
+        else:
+            p75 = max(proj * 1.12, proj + upside_gap * 0.38)
+            p90 = max(proj * 1.28, proj + upside_gap * 0.78)
+            p95 = max(supplied_ceiling, proj + upside_gap * 1.04)
+            p99 = max(supplied_ceiling * 1.16, proj + upside_gap * 1.68)
+
     return {
         "p50": round(max(0, p50), 2),
         "p75": round(max(0, p75 + data_boost * 0.15), 2),
@@ -10066,13 +10084,13 @@ def v4_nuclear_player_profile(player):
     p99 = safe_float(dist.get("p99", 0), 0)
     p99_per_thousand = p99 / max(1.0, salary / 1000.0)
     is_hitter = pos != "P"
-    premium_ceiling = bool(is_hitter and salary >= 4800 and p99 >= max(27.0, projection * 3.05))
+    premium_ceiling = bool(is_hitter and salary >= 4800 and p99 >= max(20.0, projection * 1.75))
     boom_value = bool(
         is_hitter
         and salary <= 4000
-        and projection >= 5.5
-        and p99 >= 18.0
-        and p99_per_thousand >= 6.4
+        and projection >= 4.5
+        and p99 >= max(12.0, projection * 1.85)
+        and p99_per_thousand >= 3.5
         and ownership <= 22.0
     )
     fragile_punt = bool(is_hitter and salary <= 4000 and not boom_value)

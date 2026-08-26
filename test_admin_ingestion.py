@@ -298,6 +298,16 @@ class AdminIngestionTests(unittest.TestCase):
         self.assertEqual(main.v4_style_from_request(ceiling, ceiling.mode), "aggressive")
         self.assertEqual(main.v4_style_from_request(nuclear, nuclear.mode), "nuclear")
 
+    def test_tournament_distribution_anchors_to_uploaded_player_ceiling(self):
+        player = {
+            "name": "Verified Upside", "position": "OF", "salary": 4800,
+            "projection": 10.0, "ceiling": 18.0, "ownership": 12.0,
+        }
+        distribution = main.v4_player_dist(player)
+        self.assertGreaterEqual(distribution["p95"], 18.0)
+        self.assertGreater(distribution["p99"], distribution["p95"])
+        self.assertLess(distribution["p99"], 30.0)
+
     def test_nuclear_objective_strongly_prefers_five_player_stack(self):
         lineup = [
             {"name": f"Player {index}", "projection": 10, "salary": 5000, "ownership": 8}
