@@ -136,6 +136,61 @@ class AdminIngestionTests(unittest.TestCase):
         self.assertEqual(by_name["Bryce Harper"]["actual_ownership"], 22.1)
 
 
+    def test_personal_lineup_ownership_is_tagged_partial(self):
+        rows = [
+            {"name": f"Player {index}", "actual_points": 10, "actual_ownership": 12}
+            for index in range(10)
+        ]
+        scope = main.tag_actual_ownership_scope(rows)
+        self.assertEqual(scope, "partial_entered_lineup")
+        self.assertTrue(all(row["ownership_scope"] == scope for row in rows))
+
+    def test_partial_lineup_ownership_does_not_train_full_slate_calibration(self):
+        history = [{
+            "slate_key": "2026-08-25-main",
+            "observations": [{
+                "position": "OF",
+                "raw_projection": 10,
+                "actual": 12,
+                "projected_ownership": 8,
+                "actual_ownership": 22,
+                "ownership_scope": "partial_entered_lineup",
+            }],
+        }]
+        _, observations = main.training_observations(history)
+        self.assertNotIn("actual_ownership", observations[0])
+
+    def test_saved_entered_lineup_is_evaluated_against_exact_slate(self):
+        saved = [{
+            "id": "saved-1",
+            "session_data": {
+                "slate_key": "2026-08-25-main",
+                "status": "entered",
+                "mode": "nuclear",
+                "lineups": [{"players": [{"name": "Player One"}, {"name": "Player Two"}]}],
+            },
+        }]
+        calls = []
+
+        def data_request(table, method="GET", query="", payload=None, **kwargs):
+            calls.append((table, method, payload))
+            return saved if method == "GET" else []
+
+        with patch.object(main, "supabase_data_request", side_effect=data_request):
+            evidence = main.evaluate_saved_lineup_sessions(
+                "2026-08-25-main",
+                [
+                    {"name": "Player One", "actual_points": 20},
+                    {"name": "Player Two", "actual_points": 15},
+                ],
+                [40, 30, 20],
+                "admin-token",
+            )
+        self.assertEqual(evidence["entered_observation_count"], 1)
+        self.assertEqual(evidence["best_actual_score"], 35)
+        self.assertTrue(any(method == "PATCH" for _, method, _ in calls))
+
+
     def test_draftkings_gamecenter_export_imports_contest_standings(self):
         csv_text = (
             "Rank,EntryId,EntryName,Points,Lineup\n"

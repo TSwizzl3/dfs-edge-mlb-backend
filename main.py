@@ -501,6 +501,25 @@ def parse_actual_results_csv(csv_text):
     return list(actual_by_name.values())
 
 
+def classify_actual_ownership_scope(actual_rows):
+    """Separate a full contest player pool from ownership visible only on an entered lineup."""
+    rows = actual_rows if isinstance(actual_rows, list) else []
+    ownership_count = sum(row.get("actual_ownership") is not None for row in rows if isinstance(row, dict))
+    if ownership_count >= 20:
+        return "full_contest_player_pool"
+    if ownership_count > 0:
+        return "partial_entered_lineup"
+    return "none"
+
+
+def tag_actual_ownership_scope(actual_rows):
+    scope = classify_actual_ownership_scope(actual_rows)
+    for row in actual_rows:
+        if isinstance(row, dict) and row.get("actual_ownership") is not None:
+            row["ownership_scope"] = scope
+    return scope
+
+
 def parse_contest_standings_csv(csv_text):
     """Extract entrant ranks and scores from a DraftKings GameCenter CSV."""
     standings = []
@@ -591,6 +610,7 @@ def projection_backtest(players, actual_rows):
             observation.update({
                 "actual_ownership": round(actual_ownership, 3),
                 "ownership_error": round(raw_ownership - actual_ownership, 3),
+                "ownership_scope": str(actual_row.get("ownership_scope") or "legacy_unclassified"),
             })
         matched.append(observation)
 
@@ -1635,6 +1655,100 @@ def evaluate_lineup_learning_runs(slate_key, actual_rows, standings_scores=None,
     }
 
 
+def evaluate_saved_lineup_sessions(slate_key, actual_rows, standings_scores=None, auth_token=""):
+    """Score user-selected and actually-entered lineup sets after the exact slate completes."""
+    resolved_key = normalize_slate_key(slate_key)
+    actual_by_name = {
+        normalized_player_name(item.get("name")): safe_float(item.get("actual_points"), 0)
+        for item in actual_rows
+    }
+    rows = supabase_data_request(
+        "saved_lineups",
+        query="sport=eq.MLB&select=id,session_data&order=created_at.desc&limit=500",
+        auth_token=auth_token,
+    )
+    if not isinstance(rows, list):
+        rows = []
+    field_scores = sorted((safe_float(value, -1) for value in (standings_scores or [])), reverse=True)
+    field_scores = [value for value in field_scores if value >= 0]
+    evaluated_sets = 0
+    evaluated_lineups = 0
+    entered_lineups = 0
+    saved_lineups = 0
+    actual_scores = []
+    strategy_counts = {}
+    evaluated_at = datetime.now(timezone.utc).isoformat()
+
+    for row in rows:
+        session = row.get("session_data") if isinstance(row.get("session_data"), dict) else {}
+        if normalize_slate_key(session.get("slate_key")) != resolved_key or session.get("evaluation"):
+            continue
+        entry_status = str(session.get("status") or "saved").lower()
+        if entry_status not in {"saved", "entered"}:
+            continue
+        lineup_results = []
+        for lineup in session.get("lineups", []) if isinstance(session.get("lineups"), list) else []:
+            if not isinstance(lineup, dict):
+                continue
+            player_rows = lineup.get("lineup") if isinstance(lineup.get("lineup"), list) else lineup.get("players", [])
+            names = [
+                normalized_player_name(player.get("name"))
+                for player in player_rows if isinstance(player, dict)
+            ]
+            if not names or any(name not in actual_by_name for name in names):
+                continue
+            score = round(sum(actual_by_name[name] for name in names), 3)
+            result = {"actual_score": score}
+            if field_scores:
+                rank = 1 + sum(field_score > score for field_score in field_scores)
+                result["estimated_rank"] = rank
+                result["field_percentile"] = round(100 * (1 - ((rank - 1) / max(1, len(field_scores)))), 3)
+            lineup_results.append(result)
+            actual_scores.append(score)
+
+        if not lineup_results:
+            continue
+        mode = str(session.get("mode") or ((session.get("settings") or {}).get("mode")) or "balanced")
+        strategy_counts[mode] = strategy_counts.get(mode, 0) + len(lineup_results)
+        evaluated_sets += 1
+        evaluated_lineups += len(lineup_results)
+        if entry_status == "entered":
+            entered_lineups += len(lineup_results)
+        else:
+            saved_lineups += len(lineup_results)
+        evaluation = {
+            "entry_status": entry_status,
+            "evaluated_at": evaluated_at,
+            "lineup_count": len(lineup_results),
+            "average_actual_score": round(statistics.fmean(item["actual_score"] for item in lineup_results), 3),
+            "best_actual_score": max(item["actual_score"] for item in lineup_results),
+            "top_1_percent_finishes": sum(item.get("field_percentile", 0) >= 99 for item in lineup_results),
+            "results": lineup_results,
+        }
+        updated_session = {**session, "status": "evaluated", "entry_status": entry_status, "evaluation": evaluation}
+        row_id = urllib.parse.quote(str(row.get("id") or ""), safe="")
+        if row_id:
+            supabase_data_request(
+                "saved_lineups",
+                method="PATCH",
+                query=f"id=eq.{row_id}",
+                payload={"session_data": updated_session},
+                prefer="return=minimal",
+                auth_token=auth_token,
+            )
+
+    return {
+        "source": "saved_and_entered_lineup_actual_results",
+        "set_count": evaluated_sets,
+        "observation_count": evaluated_lineups,
+        "saved_observation_count": saved_lineups,
+        "entered_observation_count": entered_lineups,
+        "average_actual_score": round(statistics.fmean(actual_scores), 3) if actual_scores else 0,
+        "best_actual_score": max(actual_scores) if actual_scores else 0,
+        "strategy_counts": strategy_counts,
+    }
+
+
 def weighted_mean(values, weights):
     total_weight = sum(weights)
     return sum(value * weight for value, weight in zip(values, weights)) / total_weight if total_weight > 0 else 0.0
@@ -1694,9 +1808,11 @@ def training_observations(history):
                 "team_total": safe_float(row.get("team_total"), 0),
                 "odds_source": str(row.get("odds_source") or ""),
             }
-            if row.get("actual_ownership") is not None:
+            ownership_scope = str(row.get("ownership_scope") or "legacy_unclassified")
+            if row.get("actual_ownership") is not None and ownership_scope != "partial_entered_lineup":
                 observation["projected_ownership"] = max(0.0, min(100.0, safe_float(row.get("projected_ownership"), 0)))
                 observation["actual_ownership"] = max(0.0, min(100.0, safe_float(row.get("actual_ownership"), 0)))
+                observation["ownership_scope"] = ownership_scope
             observations.append(observation)
     return trainable, observations
 
@@ -7099,6 +7215,7 @@ async def upload_actual_results_csv(
 
     csv_text = (await file.read()).decode("utf-8-sig", errors="replace")
     actual_rows = parse_actual_results_csv(csv_text)
+    ownership_scope = tag_actual_ownership_scope(actual_rows)
     contest_standings = parse_contest_standings_csv(csv_text)
     if not actual_rows:
         return {
@@ -7119,12 +7236,27 @@ async def upload_actual_results_csv(
         players = load_players(resolved_slate_key) or load_players()
     result = projection_backtest(players, actual_rows)
     simulator_evidence = contest_standings.get("summary", {})
-    strategy_evidence = evaluate_lineup_learning_runs(
+    generated_evidence = evaluate_lineup_learning_runs(
         resolved_slate_key,
         actual_rows,
         contest_standings.get("scores", []),
         admin_token,
     )
+    saved_evidence = evaluate_saved_lineup_sessions(
+        resolved_slate_key,
+        actual_rows,
+        contest_standings.get("scores", []),
+        admin_token,
+    )
+    strategy_evidence = {
+        "source": "generated_saved_and_entered_lineup_actual_results",
+        "observation_count": safe_int(generated_evidence.get("observation_count"), 0) + safe_int(saved_evidence.get("observation_count"), 0),
+        "generated_observation_count": safe_int(generated_evidence.get("observation_count"), 0),
+        "saved_observation_count": safe_int(saved_evidence.get("saved_observation_count"), 0),
+        "entered_observation_count": safe_int(saved_evidence.get("entered_observation_count"), 0),
+        "generated": generated_evidence,
+        "user_selected": saved_evidence,
+    }
     if result["matched_players"] < 10:
         return {
             "success": False,
@@ -7140,6 +7272,7 @@ async def upload_actual_results_csv(
         "evaluated_at": datetime.now(timezone.utc).isoformat(),
         "simulator_evidence": simulator_evidence,
         "strategy_evidence": strategy_evidence,
+        "ownership_scope": ownership_scope,
         **result,
     }
     _, backtest_persisted = save_backtest_record(payload, admin_token)
@@ -7151,7 +7284,13 @@ async def upload_actual_results_csv(
     response_payload = {key: value for key, value in payload.items() if key != "observations"}
     return {
         **response_payload,
-        "message": f"MLB backtest saved for {resolved_slate_key} with {result['matched_players']} matched players. Projection calibration is {calibration_model['status']}; ownership calibration is {ownership_status} with {ownership_sample_size} actual ownership values from this slate.",
+        "message": (
+            f"MLB backtest saved for {resolved_slate_key} with {result['matched_players']} matched players. "
+            f"Projection calibration is {calibration_model['status']}; ownership data was classified as {ownership_scope.replace('_', ' ')}. "
+            + (f"{ownership_sample_size} full-player-pool ownership values can train ownership calibration." if ownership_scope == "full_contest_player_pool"
+               else f"{ownership_sample_size} partial ownership values are saved for lineup analysis but are not used as a full slate ownership distribution.")
+        ),
+        "ownership_scope": ownership_scope,
         "history_slate_count": len(history),
         "training_slate_count": calibration_model.get("training_slate_count", 0),
         "training_player_count": calibration_model.get("training_player_count", 0),
