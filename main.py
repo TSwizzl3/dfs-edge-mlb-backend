@@ -13,6 +13,7 @@ import math
 import random
 import os
 import statistics
+import threading
 import time
 import urllib.request
 import urllib.parse
@@ -82,6 +83,13 @@ ODDS_API_REGIONS = os.getenv("ODDS_API_REGIONS", "us").strip() or "us"
 ODDS_API_BOOKMAKERS = os.getenv("ODDS_API_BOOKMAKERS", "").strip()
 MLB_WEATHER_CACHE_SECONDS = 30 * 60
 MLB_ODDS_CACHE_SECONDS = 3 * 60 * 60
+try:
+    MLB_LIVE_STATUS_CACHE_SECONDS = max(15, int(os.getenv("MLB_LIVE_STATUS_CACHE_SECONDS", "45")))
+except (TypeError, ValueError):
+    MLB_LIVE_STATUS_CACHE_SECONDS = 45
+MLB_LIVE_STATUS_MAX_STALE_SECONDS = 10 * 60
+_MLB_LIVE_STATUS_CACHE = {}
+_MLB_LIVE_STATUS_LOCK = threading.Lock()
 ALLOW_SAMPLE_SLATE = os.getenv("ALLOW_SAMPLE_SLATE", "false").strip().lower() in {"1", "true", "yes"}
 
 ROSTER_SLOTS = ["P", "P", "C", "1B", "2B", "3B", "SS", "OF", "OF", "OF"]
@@ -3522,6 +3530,106 @@ def refresh_mlb_starters(players, slate_date):
     }
     save_mlb_starter_state(state)
     return refreshed, state
+
+
+def _availability_snapshot_age(players, now_unix=None):
+    now_unix = now_unix or time.time()
+    newest = 0.0
+    for player in players or []:
+        value = str(player.get("availability_checked_at", "") or "").strip()
+        if not value:
+            continue
+        try:
+            newest = max(newest, datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+        except (TypeError, ValueError):
+            continue
+    return max(0.0, now_unix - newest) if newest else None
+
+
+def ensure_mlb_live_availability(slate_key="", max_age_seconds=None):
+    """Refresh official MLB starters before the player pool or optimizer is used."""
+    requested_key = str(slate_key or "").strip()
+    exact_key = requested_key and requested_key != "current"
+    record = load_slate_record(requested_key) if exact_key else None
+    meta = record or load_slate_metadata()
+    players = [dict(player) for player in ((record or {}).get("players", []) if record else load_players())]
+    resolved_key = str((record or {}).get("slate_key") or meta.get("slate_key") or requested_key or "current")
+    slate_date = str((record or {}).get("slate_date") or meta.get("slate_date") or datetime.now().strftime("%Y-%m-%d"))[:10]
+    cache_seconds = MLB_LIVE_STATUS_CACHE_SECONDS if max_age_seconds is None else max(0, safe_int(max_age_seconds, MLB_LIVE_STATUS_CACHE_SECONDS))
+    source_updated_at = str((record or {}).get("updated_at") or meta.get("updated_at") or "")
+    now_unix = time.time()
+
+    if not players:
+        return [], {
+            "success": False,
+            "safe_to_optimize": False,
+            "error": "The selected MLB slate has no players to verify.",
+            "slate_key": resolved_key,
+        }
+
+    cached = _MLB_LIVE_STATUS_CACHE.get(resolved_key, {})
+    if (
+        cached
+        and now_unix - safe_float(cached.get("checked_at_unix"), 0) <= cache_seconds
+        and (not source_updated_at or cached.get("source_updated_at") == source_updated_at)
+        and isinstance(cached.get("players"), list)
+    ):
+        return [dict(player) for player in cached["players"]], dict(cached.get("state") or {})
+
+    with _MLB_LIVE_STATUS_LOCK:
+        cached = _MLB_LIVE_STATUS_CACHE.get(resolved_key, {})
+        if (
+            cached
+            and now_unix - safe_float(cached.get("checked_at_unix"), 0) <= cache_seconds
+            and (not source_updated_at or cached.get("source_updated_at") == source_updated_at)
+            and isinstance(cached.get("players"), list)
+        ):
+            return [dict(player) for player in cached["players"]], dict(cached.get("state") or {})
+
+        try:
+            refreshed, starter_state = refresh_mlb_starters(players, slate_date)
+        except Exception as exc:
+            refreshed = players
+            starter_state = {"error": f"Official MLB availability refresh failed: {exc.__class__.__name__}", "games_checked": 0}
+
+        refresh_error = str(starter_state.get("error") or "").strip()
+        official_success = not refresh_error and safe_int(starter_state.get("games_checked"), 0) > 0
+        prior_age = _availability_snapshot_age(players, now_unix)
+        safe_to_optimize = official_success or (prior_age is not None and prior_age <= MLB_LIVE_STATUS_MAX_STALE_SECONDS)
+        checked_at = datetime.now(timezone.utc).isoformat()
+
+        if official_success:
+            for player in refreshed:
+                player["availability_checked_at"] = checked_at
+                player["availability_source"] = "mlb_stats_official"
+            if exact_key:
+                saved_record = save_slate_library(
+                    refreshed,
+                    resolved_key,
+                    (record or {}).get("name", "MLB Slate"),
+                    slate_date,
+                    (record or {}).get("slate_type", "custom"),
+                )
+                source_updated_at = str(saved_record.get("updated_at") or source_updated_at)
+            else:
+                save_active_slate(refreshed)
+
+        state = {
+            **starter_state,
+            "success": official_success,
+            "safe_to_optimize": safe_to_optimize,
+            "slate_key": resolved_key,
+            "checked_at": checked_at if official_success else None,
+            "snapshot_age_seconds": 0 if official_success else prior_age,
+            "error": refresh_error or ("No official MLB games matched this slate." if not official_success else ""),
+        }
+        _MLB_LIVE_STATUS_CACHE[resolved_key] = {
+            "checked_at_unix": now_unix,
+            "source_updated_at": source_updated_at,
+            "players": [dict(player) for player in refreshed],
+            "state": dict(state),
+        }
+        return refreshed, state
 
 
 def estimated_injury_status(player):
@@ -7797,7 +7905,10 @@ def update_player_status(request: UpdatePlayerStatusRequest):
 
 @app.get("/players")
 def get_players(slate_key: str = ""):
-    players = add_values(load_players(slate_key))
+    verified_players, availability = ensure_mlb_live_availability(slate_key, max_age_seconds=60)
+    players = add_values(verified_players)
+    for player in players:
+        player["optimizer_eligible"] = optimizer_starter_eligible(player) and not is_manual_inactive_player(player)
     slot_order = {"P": 0, "C": 1, "1B": 2, "2B": 3, "3B": 4, "SS": 5, "OF": 6}
     players.sort(key=lambda p: (slot_order.get(p["position"], 99), -p["projection"]))
     return {
@@ -7807,6 +7918,7 @@ def get_players(slate_key: str = ""):
         "roster_slots": ROSTER_SLOTS,
         "players": players,
         "slate_key": slate_key or "current",
+        "availability": availability,
     }
 
 
@@ -7824,7 +7936,9 @@ def get_value_plays(slate_key: str = ""):
 
 @app.post("/optimize")
 def optimize_lineup(request: OptimizeRequest):
-    slate_players = load_players(request.slate_key)
+    slate_players, availability = ensure_mlb_live_availability(request.slate_key, max_age_seconds=30)
+    if not availability.get("safe_to_optimize", False):
+        return {"error": "Official MLB player availability could not be verified recently. DFS Edge blocked this build to prevent scratched or out players. Refresh and try again."}
     all_lineups, error, trim_report, checked = build_all_lineups(
         mode=request.mode,
         locked_players=request.locked_players,
@@ -10493,7 +10607,10 @@ def build_fast_multi_lineups_for_pro(request, count):
     min_salary = max(0, min(SALARY_CAP, safe_int(getattr(request, "min_salary", 0), 0)))
     avoid_conflict = bool(getattr(request, "avoid_pitcher_vs_hitter", True))
 
-    raw_players = add_values(load_players(getattr(request, "slate_key", "")))
+    verified_players, availability = ensure_mlb_live_availability(getattr(request, "slate_key", ""), max_age_seconds=30)
+    if not availability.get("safe_to_optimize", False):
+        return [], "Official MLB player availability could not be verified recently. DFS Edge blocked this build to prevent scratched or out players. Refresh and try again.", {"availability": availability}, 0
+    raw_players = add_values(verified_players)
     if not raw_players:
         return [], "The selected MLB slate could not be loaded by the optimizer. Refresh the slate library and try again; the player pool itself was not rejected for starter eligibility.", {"slate_load_failed": True}, 0
     error = validate_locks(raw_players, locked_players, excluded_players)

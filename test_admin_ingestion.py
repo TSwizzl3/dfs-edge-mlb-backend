@@ -88,7 +88,7 @@ class AdminIngestionTests(unittest.TestCase):
         def simple_metadata(data):
             return {**data, "takedown_strength": 0, "ceiling_score": 0}
 
-        with patch.object(main, "load_players", return_value=[{"name": "Pool"}]), patch.object(
+        with patch.object(main, "ensure_mlb_live_availability", return_value=([{"name": "Pool"}], {"safe_to_optimize": True})), patch.object(
             main, "validate_locks", return_value=None
         ), patch.object(main, "build_optimizer_pool_with_fallback", return_value=([{"name": "Pool"}], {})), patch.object(
             main, "add_values", side_effect=lambda players: players
@@ -105,6 +105,49 @@ class AdminIngestionTests(unittest.TestCase):
 
         self.assertIsNone(error)
         self.assertEqual(len(selected), 2)
+
+    def test_live_availability_refresh_persists_official_scratches(self):
+        main._MLB_LIVE_STATUS_CACHE.clear()
+        record = {
+            "slate_key": "2026-08-30-main",
+            "name": "Main Slate",
+            "slate_date": "2026-08-30",
+            "slate_type": "main",
+            "updated_at": "2026-08-30T10:00:00+00:00",
+            "players": [
+                {"name": "Active Hitter", "position": "OF", "team": "AAA", "salary": 5000, "active": True},
+                {"name": "Late Scratch", "position": "OF", "team": "AAA", "salary": 4500, "active": True},
+            ],
+        }
+        refreshed = [
+            dict(record["players"][0], starter_status="confirmed_starter", starter_source="mlb_stats_confirmed_lineup"),
+            dict(record["players"][1], active=False, starter_status="confirmed_not_starting", starter_source="mlb_stats_confirmed_lineup", inactive_reason="not_in_announced_batting_order"),
+        ]
+        state = {"games_checked": 1, "confirmed_hitter_matches": 1, "error": ""}
+        with patch.object(main, "load_slate_record", return_value=record), patch.object(
+            main, "refresh_mlb_starters", return_value=(refreshed, state)
+        ), patch.object(main, "save_slate_library", return_value={**record, "updated_at": "2026-08-30T10:01:00+00:00"}) as saved:
+            players, availability = main.ensure_mlb_live_availability("2026-08-30-main", max_age_seconds=0)
+
+        scratch = next(player for player in players if player["name"] == "Late Scratch")
+        self.assertFalse(scratch["active"])
+        self.assertFalse(main.optimizer_starter_eligible(scratch))
+        self.assertTrue(availability["safe_to_optimize"])
+        saved.assert_called_once()
+
+    def test_optimizer_fails_closed_when_official_availability_is_stale(self):
+        request = main.MultiOptimizeRequest(count=1, slate_key="2026-08-30-main")
+        with patch.object(
+            main,
+            "ensure_mlb_live_availability",
+            return_value=([], {"safe_to_optimize": False, "error": "official feed unavailable"}),
+        ):
+            selected, error, report, checked = main.build_fast_multi_lineups_for_pro(request, 1)
+
+        self.assertEqual(selected, [])
+        self.assertIn("blocked this build", error)
+        self.assertFalse(report["availability"]["safe_to_optimize"])
+        self.assertEqual(checked, 0)
 
     def test_custom_simulation_never_uses_legacy_global_payout_table(self):
         request = main.ContestSimulationRequest(
