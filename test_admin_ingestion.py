@@ -149,6 +149,116 @@ class AdminIngestionTests(unittest.TestCase):
         self.assertFalse(report["availability"]["safe_to_optimize"])
         self.assertEqual(checked, 0)
 
+    def test_manual_lock_overrides_scratch_while_unlocked_scratch_stays_out(self):
+        available = {
+            "name": "Available Hitter", "position": "OF", "team": "AAA",
+            "salary": 5000, "projection": 10.0, "active": True,
+            "starter_status": "confirmed_starter", "starter_source": "mlb_stats_confirmed_lineup",
+        }
+        locked_scratch = {
+            "name": "Locked Scratch", "position": "OF", "team": "BBB",
+            "salary": 4500, "projection": 8.0, "active": False,
+            "starter_status": "confirmed_not_starting", "starter_source": "mlb_stats_confirmed_lineup",
+            "inactive_reason": "not_in_announced_batting_order",
+        }
+        automatic_scratch = {
+            "name": "Automatic Scratch", "position": "OF", "team": "CCC",
+            "salary": 4400, "projection": 7.5, "active": False,
+            "starter_status": "out", "starter_source": "mlb_stats_confirmed_lineup",
+            "inactive_reason": "confirmed_out",
+        }
+        players = [available, locked_scratch, automatic_scratch]
+
+        self.assertIsNone(main.validate_locks(players, ["Locked Scratch"], []))
+        pool, _ = main.build_optimizer_pool_with_fallback(players, ["Locked Scratch"], [])
+        names = {player["name"] for player in pool}
+
+        self.assertIn("Available Hitter", names)
+        self.assertIn("Locked Scratch", names)
+        self.assertNotIn("Automatic Scratch", names)
+
+    def test_exclude_still_wins_over_manual_lock(self):
+        player = {
+            "name": "Manual Choice", "position": "P", "team": "AAA",
+            "salary": 8000, "projection": 12.0, "active": False,
+            "starter_status": "out", "starter_source": "mlb_stats_probable_pitcher",
+        }
+        error = main.validate_locks([player], ["Manual Choice"], ["Manual Choice"])
+        self.assertIn("both locked and excluded", error)
+
+    def test_live_builder_places_a_manually_locked_out_player_in_the_lineup(self):
+        def active_player(name, position, team):
+            is_pitcher = position == "P"
+            return {
+                "name": name, "position": position, "team": team, "opponent": "",
+                "salary": 4000, "projection": 10.0, "ownership": 10.0, "active": True,
+                "dk_slate_eligible": True,
+                "starter_status": "probable_pitcher" if is_pitcher else "confirmed_starter",
+                "starter_source": "mlb_stats_probable_pitcher" if is_pitcher else "mlb_stats_confirmed_lineup",
+                "starter_probability": 0.96 if is_pitcher else 1.0,
+            }
+
+        players = [
+            active_player("Pitcher One", "P", "NYY"),
+            active_player("Pitcher Two", "P", "BOS"),
+            active_player("Catcher", "C", "CHC"),
+            active_player("First Base", "1B", "LAD"),
+            active_player("Second Base", "2B", "ATL"),
+            active_player("Third Base", "3B", "PHI"),
+            active_player("Shortstop", "SS", "SEA"),
+            active_player("Outfield One", "OF", "HOU"),
+            active_player("Outfield Two", "OF", "SD"),
+            {
+                **active_player("Locked Outfielder", "OF", "NYM"),
+                "active": False,
+                "starter_status": "out",
+                "inactive_reason": "confirmed_out",
+            },
+        ]
+        request = main.MultiOptimizeRequest(
+            count=1,
+            mode="cash",
+            locked_players=["Locked Outfielder"],
+            avoid_pitcher_vs_hitter=False,
+        )
+        valued_players = main.add_values(players)
+        pool, _ = main.build_optimizer_pool_with_fallback(
+            valued_players,
+            ["Locked Outfielder"],
+            [],
+        )
+        groups = {position: [] for position in main.V4_REQUIRED_COUNTS}
+        for player in pool:
+            groups[main.normalize_position(player["position"])].append(player)
+        direct_lineup = main.v4_build_one_lineup(
+            groups=groups,
+            style="safe",
+            stack_team="",
+            secondary_team=None,
+            stack_target=2,
+            locked_objects=[player for player in pool if player["name"] == "Locked Outfielder"],
+            excluded_names=set(),
+            offset=0,
+            max_players_per_team=5,
+            min_salary=0,
+            avoid_pitcher_vs_hitter=False,
+        )
+        self.assertIsNotNone(
+            direct_lineup,
+            f"pool counts={main.mlb_position_counts(pool)} eligibility="
+            f"{[(player['name'], main.optimizer_starter_eligible(player)) for player in pool]}",
+        )
+        with patch.object(
+            main,
+            "ensure_mlb_live_availability",
+            return_value=(players, {"safe_to_optimize": True}),
+        ):
+            lineups, error, _, _ = main.build_fast_multi_lineups_for_pro(request, 1)
+
+        self.assertIsNone(error)
+        self.assertEqual(len(lineups), 1)
+        self.assertIn("Locked Outfielder", {player["name"] for player in lineups[0]["lineup"]})
+
     def test_custom_simulation_never_uses_legacy_global_payout_table(self):
         request = main.ContestSimulationRequest(
             contest_size=1000,

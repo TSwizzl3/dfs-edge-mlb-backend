@@ -4192,20 +4192,36 @@ def valid_optimizer_player(player):
     )
 
 
+def valid_locked_player(player):
+    """A manual lock overrides availability, but never slate or roster legality."""
+    return (
+        safe_int(player.get("salary", 0), 0) > 0
+        and normalize_position(player.get("position", "")) in ["P", "C", "1B", "2B", "3B", "SS", "OF"]
+        and player.get("dk_slate_eligible") is not False
+    )
+
+
 def build_optimizer_pool_with_fallback(players, locked_players=None, excluded_players=None):
     """
-    Build only from active, starter-eligible players in the uploaded DK slate.
+    Build automatically from active, starter-eligible players in the uploaded
+    DK slate. A player explicitly locked by the user bypasses availability and
+    injury filtering, while an explicit exclude always wins.
     It intentionally fails closed if a position is thin; bench and relief
     players are never reintroduced as an emergency fallback.
     """
     locked_players = locked_players or []
     excluded_players = excluded_players or []
+    locked_set = set(locked_players)
     excluded_set = set(excluded_players)
 
     active_valid = [
         p for p in players
         if p.get("name") not in excluded_set
-        and valid_optimizer_player(p)
+        and (
+            valid_locked_player(p)
+            if p.get("name") in locked_set
+            else valid_optimizer_player(p)
+        )
     ]
     optimized_pool, trim_report = trim_player_pool(active_valid, locked_players)
     trim_report["fallback_used"] = False
@@ -4229,9 +4245,9 @@ def validate_locks(players, locked_players, excluded_players):
         return "You cannot lock more than 10 players."
 
     by_name = {p.get("name"): p for p in players}
-    ineligible_locked = [name for name in locked_players if name in by_name and not optimizer_starter_eligible(by_name[name])]
-    if ineligible_locked:
-        return f"Locked player is not confirmed or likely to start: {', '.join(ineligible_locked)}"
+    illegal_locked = [name for name in locked_players if name in by_name and not valid_locked_player(by_name[name])]
+    if illegal_locked:
+        return f"Locked player is not eligible for this DraftKings roster: {', '.join(illegal_locked)}"
 
     return None
 
@@ -9131,7 +9147,8 @@ def v2_same_position_count(lineup, position):
     return len([p for p in lineup if normalize_position(p.get("position", "")) == position])
 
 
-def v2_lineup_position_valid(lineup):
+def v2_lineup_position_valid(lineup, availability_override_names=None):
+    availability_override_names = set(availability_override_names or [])
     return (
         v2_same_position_count(lineup, "P") == 2
         and v2_same_position_count(lineup, "C") == 1
@@ -9141,7 +9158,11 @@ def v2_lineup_position_valid(lineup):
         and v2_same_position_count(lineup, "SS") == 1
         and v2_same_position_count(lineup, "OF") == 3
         and not same_team_pitcher_conflict(lineup)
-        and all(optimizer_starter_eligible(player) for player in lineup)
+        and all(
+            player.get("name") in availability_override_names
+            or optimizer_starter_eligible(player)
+            for player in lineup
+        )
     )
 
 
@@ -10337,7 +10358,13 @@ def v4_lineup_counts(lineup):
     return counts
 
 
-def v4_can_add(lineup, player, max_players_per_team=5, avoid_pitcher_vs_hitter=True):
+def v4_can_add(
+    lineup,
+    player,
+    max_players_per_team=5,
+    avoid_pitcher_vs_hitter=True,
+    allow_availability_override=False,
+):
     name = player.get("name")
     if any(p.get("name") == name for p in lineup):
         return False
@@ -10345,7 +10372,7 @@ def v4_can_add(lineup, player, max_players_per_team=5, avoid_pitcher_vs_hitter=T
     counts = v4_lineup_counts(lineup)
     if pos not in V4_REQUIRED_COUNTS or counts.get(pos, 0) >= V4_REQUIRED_COUNTS[pos]:
         return False
-    if not optimizer_starter_eligible(player):
+    if not allow_availability_override and not optimizer_starter_eligible(player):
         return False
     if pos == "P" and any(
         normalize_position(existing.get("position", "")) == "P"
@@ -10413,9 +10440,19 @@ def v4_fill_position(lineup, groups, pos, style, stack_team, max_players_per_tea
     return False
 
 
-def v4_upgrade_salary_floor(lineup, groups, min_salary, style, stack_team, max_players_per_team, avoid_pitcher_vs_hitter):
+def v4_upgrade_salary_floor(
+    lineup,
+    groups,
+    min_salary,
+    style,
+    stack_team,
+    max_players_per_team,
+    avoid_pitcher_vs_hitter,
+    protected_names=None,
+):
     if min_salary <= 0:
         return lineup
+    protected_names = set(protected_names or [])
     # Upgrade low salary pieces while staying valid. Bounded loops only.
     for _ in range(18):
         salary = sum(safe_int(p.get("salary", 0), 0) for p in lineup)
@@ -10424,6 +10461,8 @@ def v4_upgrade_salary_floor(lineup, groups, min_salary, style, stack_team, max_p
         improved = False
         lineup_sorted = sorted(list(lineup), key=lambda p: (safe_int(p.get("salary", 0), 0), v4_player_grade(p, style, stack_team)))
         for old in lineup_sorted:
+            if old.get("name") in protected_names:
+                continue
             pos = normalize_position(old.get("position", ""))
             old_salary = safe_int(old.get("salary", 0), 0)
             current_names = set(p.get("name") for p in lineup)
@@ -10438,7 +10477,7 @@ def v4_upgrade_salary_floor(lineup, groups, min_salary, style, stack_team, max_p
                     continue
                 if avoid_pitcher_vs_hitter and pitcher_vs_hitter_conflict(trial):
                     continue
-                if v2_lineup_position_valid(trial):
+                if v2_lineup_position_valid(trial, protected_names):
                     lineup = trial
                     improved = True
                     break
@@ -10449,14 +10488,25 @@ def v4_upgrade_salary_floor(lineup, groups, min_salary, style, stack_team, max_p
     return lineup
 
 
-def v4_repair_salary_cap(lineup, groups, style, stack_team, max_players_per_team, avoid_pitcher_vs_hitter):
+def v4_repair_salary_cap(
+    lineup,
+    groups,
+    style,
+    stack_team,
+    max_players_per_team,
+    avoid_pitcher_vs_hitter,
+    protected_names=None,
+):
     # Downgrade until under cap. Bounded, deterministic.
+    protected_names = set(protected_names or [])
     for _ in range(20):
         salary = sum(safe_int(p.get("salary", 0), 0) for p in lineup)
         if salary <= SALARY_CAP:
             return lineup
         changed = False
         for old in sorted(lineup, key=lambda p: safe_int(p.get("salary", 0), 0), reverse=True):
+            if old.get("name") in protected_names:
+                continue
             pos = normalize_position(old.get("position", ""))
             old_salary = safe_int(old.get("salary", 0), 0)
             current_names = set(p.get("name") for p in lineup)
@@ -10470,7 +10520,7 @@ def v4_repair_salary_cap(lineup, groups, style, stack_team, max_players_per_team
                     continue
                 if avoid_pitcher_vs_hitter and pitcher_vs_hitter_conflict(trial):
                     continue
-                if v2_lineup_position_valid(trial):
+                if v2_lineup_position_valid(trial, protected_names):
                     lineup = trial
                     changed = True
                     break
@@ -10484,11 +10534,18 @@ def v4_repair_salary_cap(lineup, groups, style, stack_team, max_players_per_team
 def v4_build_one_lineup(groups, style, stack_team, secondary_team, stack_target, locked_objects, excluded_names, offset, max_players_per_team, min_salary, avoid_pitcher_vs_hitter):
     lineup = []
     excluded_names = set(excluded_names or [])
+    locked_names = {p.get("name") for p in locked_objects}
     # Add locks first.
     for p in locked_objects:
         if p.get("name") in excluded_names:
             return None
-        if not v4_can_add(lineup, p, max_players_per_team=max_players_per_team, avoid_pitcher_vs_hitter=False):
+        if not v4_can_add(
+            lineup,
+            p,
+            max_players_per_team=max_players_per_team,
+            avoid_pitcher_vs_hitter=False,
+            allow_availability_override=True,
+        ):
             return None
         lineup.append(p)
     if avoid_pitcher_vs_hitter and pitcher_vs_hitter_conflict(lineup):
@@ -10538,15 +10595,34 @@ def v4_build_one_lineup(groups, style, stack_team, secondary_team, stack_target,
             if not v4_fill_position(lineup, groups, pos, style, stack_team, max_players_per_team, avoid_pitcher_vs_hitter, seed_offset=offset + len(lineup), prefer_salary=salary_preference):
                 return None
 
-    lineup = v4_repair_salary_cap(lineup, groups, style, stack_team, max_players_per_team, avoid_pitcher_vs_hitter)
-    lineup = v4_upgrade_salary_floor(lineup, groups, min_salary, style, stack_team, max_players_per_team, avoid_pitcher_vs_hitter)
+    lineup = v4_repair_salary_cap(
+        lineup,
+        groups,
+        style,
+        stack_team,
+        max_players_per_team,
+        avoid_pitcher_vs_hitter,
+        protected_names=locked_names,
+    )
+    lineup = v4_upgrade_salary_floor(
+        lineup,
+        groups,
+        min_salary,
+        style,
+        stack_team,
+        max_players_per_team,
+        avoid_pitcher_vs_hitter,
+        protected_names=locked_names,
+    )
     salary = sum(safe_int(p.get("salary", 0), 0) for p in lineup)
     if salary > SALARY_CAP:
         return None
     if min_salary > 0 and salary < min_salary:
         # Do not loop forever. Return None so the caller can test another stack/offset.
         return None
-    if not v2_lineup_position_valid(lineup):
+    if not v2_lineup_position_valid(lineup, locked_names):
+        return None
+    if not has_all_locked(lineup, locked_names):
         return None
     if avoid_pitcher_vs_hitter and pitcher_vs_hitter_conflict(lineup):
         return None
@@ -10619,7 +10695,16 @@ def build_fast_multi_lineups_for_pro(request, count):
 
     # Use fallback pool so auto-cleanup trims do not kill live generation.
     pool, trim_report = build_optimizer_pool_with_fallback(raw_players, locked_players, excluded_players)
-    pool = [p for p in add_values(pool) if p.get("name") not in excluded_names and valid_optimizer_player(p) and not is_manual_inactive_player(p)]
+    locked_set = set(locked_players)
+    pool = [
+        p for p in add_values(pool)
+        if p.get("name") not in excluded_names
+        and (
+            valid_locked_player(p)
+            if p.get("name") in locked_set
+            else valid_optimizer_player(p) and not is_manual_inactive_player(p)
+        )
+    ]
     if not has_required_mlb_positions(pool):
         required = {"P": 2, "C": 1, "1B": 1, "2B": 1, "3B": 1, "SS": 1, "OF": 3}
         counts = mlb_position_counts(pool)
