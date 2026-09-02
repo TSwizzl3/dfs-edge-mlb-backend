@@ -1069,6 +1069,73 @@ class AdminIngestionTests(unittest.TestCase):
         self.assertTrue(all(player["weather_risk"] == "Watch" for player in applied))
         self.assertTrue(all(player["weather_source"] == "National Weather Service" for player in applied))
 
+    def test_payout_from_tiers_reads_exact_rank_ranges(self):
+        tiers = [
+            {"start_rank": 1, "end_rank": 1, "payout": 20000},
+            {"start_rank": 7, "end_rank": 8, "payout": 250},
+            {"start_rank": 361, "end_rank": 991, "payout": 25},
+        ]
+        self.assertEqual(main.payout_from_tiers(1, tiers), 20000)
+        self.assertEqual(main.payout_from_tiers(8, tiers), 250)
+        self.assertEqual(main.payout_from_tiers(500, tiers), 25)
+        self.assertEqual(main.payout_from_tiers(1000, tiers), 0)
+
+    def test_learning_lineup_features_are_stable_and_include_stack_shape(self):
+        lineup = {
+            "lineup": [
+                {"name": "Pitcher One", "team": "PHI", "salary": 9000, "projection": 22, "ceiling": 32, "ownership": 15},
+                {"name": "Batter One", "team": "ATL", "salary": 5000, "projection": 11, "ceiling": 20, "ownership": 8},
+                {"name": "Batter Two", "team": "ATL", "salary": 4800, "projection": 10, "ceiling": 19, "ownership": 9},
+                {"name": "Batter Three", "team": "ATL", "salary": 4200, "projection": 9, "ceiling": 18, "ownership": 7},
+            ],
+            "projected_points": 52,
+            "optimizer_score": 61,
+        }
+        features = main.learning_lineup_features(lineup)
+        self.assertEqual(features["projected_points"], 52)
+        self.assertEqual(features["optimizer_score"], 61)
+        self.assertEqual(features["primary_stack_size"], 3)
+        self.assertEqual(features["hitter_team_count"], 2)
+        self.assertEqual(features["lineup_fingerprint"], main.learning_lineup_fingerprint(lineup["lineup"]))
+
+    def test_performance_report_deduplicates_and_walks_forward(self):
+        runs = []
+        for slate_number in range(4):
+            for mode, percentile in (("balanced", 55), ("ceiling", 70), ("nuclear", 40)):
+                lineups = []
+                results = []
+                for lineup_number in range(5):
+                    players = [
+                        {"name": f"{mode}-{slate_number}-{lineup_number}-{player_number}", "team": "ATL" if player_number < 3 else "PHI", "projection": 10 + player_number, "salary": 4500, "ownership": 10}
+                        for player_number in range(4)
+                    ]
+                    lineups.append({"lineup": players, "projection": 46, "builder_style": mode})
+                    results.append({"lineup_index": lineup_number + 1, "status": "complete", "actual_score": 50 + lineup_number, "field_percentile": percentile})
+                runs.append({
+                    "id": f"{mode}-{slate_number}", "slate_key": f"2026-09-0{slate_number + 1}-main",
+                    "generated_at": f"2026-09-0{slate_number + 1}T10:00:00Z", "strategy_mode": mode,
+                    "lineups": lineups, "lineup_count": 5, "evaluation": {"results": results},
+                })
+        # Repeat one run to prove the report removes slate/fingerprint duplicates.
+        runs.append({**runs[0], "id": "duplicate-run"})
+
+        def fake_request(table, **kwargs):
+            if table == "mlb_lineup_runs":
+                return runs
+            if table == "contest_entries":
+                return [{"id": "entry-1", "status": "settled", "entry_fee": 20, "payout": 30, "net_profit": 10}]
+            return []
+
+        with patch.object(main, "supabase_data_request", side_effect=fake_request):
+            report = main.build_strategy_performance_report("admin-token")
+
+        self.assertEqual(report["data_quality"]["unique_lineups"], 60)
+        self.assertEqual(report["data_quality"]["duplicate_lineups"], 5)
+        self.assertEqual(report["walk_forward"]["test_slate_count"], 1)
+        self.assertEqual(report["walk_forward"]["tests"][0]["selected_strategy"], "ceiling")
+        self.assertEqual(report["profit"]["net_profit"], 10)
+        self.assertFalse(report["activation_gate"]["passes"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1640,17 +1640,62 @@ def compact_learning_lineups(lineups):
                 "name": player.get("name"),
                 "position": normalize_position(player.get("position")),
                 "team": normalize_team(player.get("team")),
+                "opponent": normalize_team(player.get("opponent", player.get("opp"))),
+                "salary": safe_int(player.get("salary"), 0),
                 "projection": round(safe_float(player.get("projection"), 0), 3),
                 "ownership": round(safe_float(player.get("ownership"), 0), 3),
+                "floor": round(safe_float(player.get("floor"), 0), 3),
+                "ceiling": round(safe_float(player.get("ceiling"), 0), 3),
+                "batting_order": safe_int(player.get("batting_order"), 0),
+                "team_total": round(safe_float(player.get("team_total"), 0), 3),
             })
         if players:
             compact.append({
                 "projected_points": round(safe_float(lineup.get("projected_points"), 0), 3),
                 "optimizer_score": round(safe_float(lineup.get("optimizer_score"), 0), 3),
                 "builder_style": lineup.get("builder_style"),
+                "lineup_fingerprint": learning_lineup_fingerprint(players),
                 "lineup": players,
             })
     return compact
+
+
+def learning_lineup_fingerprint(players):
+    names = sorted(
+        normalized_player_name(player.get("name"))
+        for player in (players or [])
+        if isinstance(player, dict) and player.get("name")
+    )
+    return hashlib.sha256("|".join(names).encode("utf-8")).hexdigest()[:24] if names else ""
+
+
+def learning_lineup_features(lineup):
+    player_rows = lineup.get("lineup", []) if isinstance(lineup, dict) else []
+    player_rows = [player for player in player_rows if isinstance(player, dict)]
+    hitter_teams = {}
+    for player in player_rows:
+        if normalize_position(player.get("position")) == "P":
+            continue
+        team = normalize_team(player.get("team"))
+        if team and team != "UNK":
+            hitter_teams[team] = hitter_teams.get(team, 0) + 1
+    stack_sizes = sorted(hitter_teams.values(), reverse=True)
+    projections = [safe_float(player.get("projection"), 0) for player in player_rows]
+    ownerships = [safe_float(player.get("ownership"), 0) for player in player_rows]
+    ceilings = [safe_float(player.get("ceiling"), 0) for player in player_rows]
+    salaries = [safe_int(player.get("salary"), 0) for player in player_rows]
+    return {
+        "lineup_fingerprint": str(lineup.get("lineup_fingerprint") or learning_lineup_fingerprint(player_rows)),
+        "projected_points": round(safe_float(lineup.get("projected_points"), sum(projections)), 3),
+        "optimizer_score": round(safe_float(lineup.get("optimizer_score"), 0), 3),
+        "salary": sum(salaries),
+        "average_ownership": round(statistics.fmean(ownerships), 3) if ownerships else 0,
+        "ownership_sum": round(sum(ownerships), 3),
+        "ceiling_sum": round(sum(value for value in ceilings if value > 0), 3),
+        "primary_stack_size": stack_sizes[0] if stack_sizes else 0,
+        "secondary_stack_size": stack_sizes[1] if len(stack_sizes) > 1 else 0,
+        "hitter_team_count": len(hitter_teams),
+    }
 
 
 def record_lineup_learning_run(request, lineups, auth_token=""):
@@ -1689,7 +1734,7 @@ def evaluate_lineup_learning_runs(slate_key, actual_rows, standings_scores=None,
     encoded_key = urllib.parse.quote(resolved_key, safe="")
     runs = supabase_data_request(
         "mlb_lineup_runs",
-        query=f"slate_key=eq.{encoded_key}&evaluated_at=is.null&select=id,strategy_mode,lineups,lineup_count&limit=500",
+        query=f"slate_key=eq.{encoded_key}&select=id,strategy_mode,lineups,lineup_count,evaluation&limit=500",
         auth_token=auth_token,
     )
     if not isinstance(runs, list):
@@ -1697,38 +1742,66 @@ def evaluate_lineup_learning_runs(slate_key, actual_rows, standings_scores=None,
     all_scores = []
     evaluated_lineups = 0
     evaluated_runs = 0
+    incomplete_lineups = 0
     strategy_counts = {}
     field_scores = sorted((safe_float(value, -1) for value in (standings_scores or [])), reverse=True)
     field_scores = [value for value in field_scores if value >= 0]
     evaluated_at = datetime.now(timezone.utc).isoformat()
 
     for run in runs:
+        previous = run.get("evaluation") if isinstance(run.get("evaluation"), dict) else {}
+        if previous.get("status") == "complete" and safe_int(previous.get("lineup_count"), 0) >= safe_int(run.get("lineup_count"), 0):
+            continue
         results = []
-        for lineup in run.get("lineups", []) if isinstance(run.get("lineups"), list) else []:
+        complete_results = []
+        for lineup_index, lineup in enumerate(run.get("lineups", []) if isinstance(run.get("lineups"), list) else [], start=1):
             player_rows = lineup.get("lineup", []) if isinstance(lineup, dict) else []
             names = [normalized_player_name(player.get("name")) for player in player_rows if isinstance(player, dict)]
-            if not names or any(name not in actual_by_name for name in names):
+            missing_players = [
+                str(player.get("name") or "Unknown player")
+                for player in player_rows
+                if isinstance(player, dict) and normalized_player_name(player.get("name")) not in actual_by_name
+            ]
+            features = learning_lineup_features(lineup if isinstance(lineup, dict) else {})
+            if not names or missing_players:
+                results.append({
+                    "lineup_index": lineup_index,
+                    "status": "incomplete",
+                    "missing_players": missing_players or ["Lineup contains no readable players"],
+                    **features,
+                })
+                incomplete_lineups += 1
                 continue
             actual_score = round(sum(actual_by_name[name] for name in names), 3)
-            result = {"actual_score": actual_score}
+            result = {
+                "lineup_index": lineup_index,
+                "status": "complete",
+                "actual_score": actual_score,
+                **features,
+            }
             if field_scores:
                 rank = 1 + sum(score > actual_score for score in field_scores)
                 result["estimated_rank"] = rank
                 result["field_percentile"] = round(100 * (1 - ((rank - 1) / max(1, len(field_scores)))), 3)
             results.append(result)
+            complete_results.append(result)
             all_scores.append(actual_score)
 
         if not results:
             continue
         mode = str(run.get("strategy_mode") or "balanced")
-        strategy_counts[mode] = strategy_counts.get(mode, 0) + len(results)
+        strategy_counts[mode] = strategy_counts.get(mode, 0) + len(complete_results)
         evaluated_runs += 1
-        evaluated_lineups += len(results)
+        evaluated_lineups += len(complete_results)
+        complete_count = len(complete_results)
         evaluation = {
-            "lineup_count": len(results),
-            "average_actual_score": round(statistics.fmean(item["actual_score"] for item in results), 3),
-            "best_actual_score": max(item["actual_score"] for item in results),
-            "top_1_percent_finishes": sum(item.get("field_percentile", 0) >= 99 for item in results),
+            "status": "complete" if complete_count == len(results) else "partial",
+            "lineup_count": complete_count,
+            "recorded_lineup_count": len(results),
+            "missing_lineup_count": len(results) - complete_count,
+            "average_actual_score": round(statistics.fmean(item["actual_score"] for item in complete_results), 3) if complete_results else 0,
+            "best_actual_score": max((item["actual_score"] for item in complete_results), default=0),
+            "top_1_percent_finishes": sum(item.get("field_percentile", 0) >= 99 for item in complete_results),
             "results": results,
         }
         run_id = urllib.parse.quote(str(run.get("id") or ""), safe="")
@@ -1737,7 +1810,7 @@ def evaluate_lineup_learning_runs(slate_key, actual_rows, standings_scores=None,
                 "mlb_lineup_runs",
                 method="PATCH",
                 query=f"id=eq.{run_id}",
-                payload={"evaluated_at": evaluated_at, "evaluation": evaluation},
+                payload={"evaluated_at": evaluated_at if evaluation["status"] == "complete" else None, "evaluation": evaluation},
                 prefer="return=minimal",
                 auth_token=auth_token,
             )
@@ -1746,6 +1819,7 @@ def evaluate_lineup_learning_runs(slate_key, actual_rows, standings_scores=None,
         "source": "generated_lineup_actual_results",
         "run_count": evaluated_runs,
         "observation_count": evaluated_lineups,
+        "incomplete_lineup_count": incomplete_lineups,
         "average_actual_score": round(statistics.fmean(all_scores), 3) if all_scores else 0,
         "best_actual_score": max(all_scores) if all_scores else 0,
         "strategy_counts": strategy_counts,
@@ -1778,13 +1852,17 @@ def evaluate_saved_lineup_sessions(slate_key, actual_rows, standings_scores=None
 
     for row in rows:
         session = row.get("session_data") if isinstance(row.get("session_data"), dict) else {}
-        if normalize_slate_key(session.get("slate_key")) != resolved_key or session.get("evaluation"):
+        previous_evaluation = session.get("evaluation") if isinstance(session.get("evaluation"), dict) else {}
+        if normalize_slate_key(session.get("slate_key")) != resolved_key or previous_evaluation.get("status") == "complete":
             continue
-        entry_status = str(session.get("status") or "saved").lower()
+        entry_status = str(session.get("entry_status") or session.get("status") or "saved").lower()
+        if entry_status == "evaluated":
+            entry_status = str(previous_evaluation.get("entry_status") or "saved").lower()
         if entry_status not in {"saved", "entered"}:
             continue
         lineup_results = []
-        for lineup in session.get("lineups", []) if isinstance(session.get("lineups"), list) else []:
+        incomplete_results = []
+        for lineup_index, lineup in enumerate(session.get("lineups", []) if isinstance(session.get("lineups"), list) else [], start=1):
             if not isinstance(lineup, dict):
                 continue
             player_rows = lineup.get("lineup") if isinstance(lineup.get("lineup"), list) else lineup.get("players", [])
@@ -1792,10 +1870,20 @@ def evaluate_saved_lineup_sessions(slate_key, actual_rows, standings_scores=None
                 normalized_player_name(player.get("name"))
                 for player in player_rows if isinstance(player, dict)
             ]
-            if not names or any(name not in actual_by_name for name in names):
+            missing_players = [
+                str(player.get("name") or "Unknown player")
+                for player in player_rows if isinstance(player, dict)
+                and normalized_player_name(player.get("name")) not in actual_by_name
+            ]
+            if not names or missing_players:
+                incomplete_results.append({
+                    "lineup_index": lineup_index,
+                    "status": "incomplete",
+                    "missing_players": missing_players or ["Lineup contains no readable players"],
+                })
                 continue
             score = round(sum(actual_by_name[name] for name in names), 3)
-            result = {"actual_score": score}
+            result = {"lineup_index": lineup_index, "status": "complete", "actual_score": score}
             if field_scores:
                 rank = 1 + sum(field_score > score for field_score in field_scores)
                 result["estimated_rank"] = rank
@@ -1803,7 +1891,7 @@ def evaluate_saved_lineup_sessions(slate_key, actual_rows, standings_scores=None
             lineup_results.append(result)
             actual_scores.append(score)
 
-        if not lineup_results:
+        if not lineup_results and not incomplete_results:
             continue
         mode = str(session.get("mode") or ((session.get("settings") or {}).get("mode")) or "balanced")
         strategy_counts[mode] = strategy_counts.get(mode, 0) + len(lineup_results)
@@ -1814,15 +1902,23 @@ def evaluate_saved_lineup_sessions(slate_key, actual_rows, standings_scores=None
         else:
             saved_lineups += len(lineup_results)
         evaluation = {
+            "status": "complete" if not incomplete_results else "partial",
             "entry_status": entry_status,
             "evaluated_at": evaluated_at,
             "lineup_count": len(lineup_results),
-            "average_actual_score": round(statistics.fmean(item["actual_score"] for item in lineup_results), 3),
-            "best_actual_score": max(item["actual_score"] for item in lineup_results),
+            "recorded_lineup_count": len(lineup_results) + len(incomplete_results),
+            "missing_lineup_count": len(incomplete_results),
+            "average_actual_score": round(statistics.fmean(item["actual_score"] for item in lineup_results), 3) if lineup_results else 0,
+            "best_actual_score": max((item["actual_score"] for item in lineup_results), default=0),
             "top_1_percent_finishes": sum(item.get("field_percentile", 0) >= 99 for item in lineup_results),
-            "results": lineup_results,
+            "results": lineup_results + incomplete_results,
         }
-        updated_session = {**session, "status": "evaluated", "entry_status": entry_status, "evaluation": evaluation}
+        updated_session = {
+            **session,
+            "status": "evaluated" if evaluation["status"] == "complete" else entry_status,
+            "entry_status": entry_status,
+            "evaluation": evaluation,
+        }
         row_id = urllib.parse.quote(str(row.get("id") or ""), safe="")
         if row_id:
             supabase_data_request(
@@ -1844,6 +1940,135 @@ def evaluate_saved_lineup_sessions(slate_key, actual_rows, standings_scores=None
         "best_actual_score": max(actual_scores) if actual_scores else 0,
         "strategy_counts": strategy_counts,
     }
+
+
+def payout_from_tiers(rank, tiers):
+    resolved_rank = safe_int(rank, 0)
+    if resolved_rank < 1:
+        return 0.0
+    for tier in tiers if isinstance(tiers, list) else []:
+        start = safe_int(tier.get("start_rank", tier.get("start", 0)), 0) if isinstance(tier, dict) else 0
+        end = safe_int(tier.get("end_rank", tier.get("end", start)), start) if isinstance(tier, dict) else 0
+        if start <= resolved_rank <= max(start, end):
+            return round(max(0.0, safe_float(tier.get("payout"), 0)), 2)
+    return 0.0
+
+
+def evaluate_contest_entries(slate_key, actual_rows, standings_scores=None, auth_token=""):
+    """Settle tracked real entries from the exact result file and payout snapshot."""
+    resolved_key = normalize_slate_key(slate_key)
+    encoded_key = urllib.parse.quote(resolved_key, safe="")
+    rows = supabase_data_request(
+        "contest_entries",
+        query=f"sport=eq.MLB&slate_key=eq.{encoded_key}&status=in.(planned,entered)&select=*&limit=1000",
+        auth_token=auth_token,
+    )
+    if not isinstance(rows, list):
+        rows = []
+    actual_by_name = {
+        normalized_player_name(item.get("name")): safe_float(item.get("actual_points"), 0)
+        for item in actual_rows
+    }
+    field_scores = sorted((safe_float(value, -1) for value in (standings_scores or [])), reverse=True)
+    field_scores = [value for value in field_scores if value >= 0]
+    settled = 0
+    incomplete = 0
+    total_entry_fees = 0.0
+    total_payout = 0.0
+    settled_at = datetime.now(timezone.utc).isoformat()
+
+    for row in rows:
+        snapshot = row.get("lineup_snapshot") if isinstance(row.get("lineup_snapshot"), dict) else {}
+        player_rows = snapshot.get("lineup") if isinstance(snapshot.get("lineup"), list) else snapshot.get("players", [])
+        names = [normalized_player_name(player.get("name")) for player in player_rows if isinstance(player, dict)]
+        if not names or any(name not in actual_by_name for name in names):
+            incomplete += 1
+            continue
+        actual_score = round(sum(actual_by_name[name] for name in names), 3)
+        rank = safe_int(row.get("actual_rank"), 0)
+        if field_scores:
+            rank = 1 + sum(score > actual_score for score in field_scores)
+        payout = safe_float(row.get("payout"), 0)
+        tiers = row.get("payout_tiers_snapshot") if isinstance(row.get("payout_tiers_snapshot"), list) else []
+        if rank > 0 and tiers:
+            payout = payout_from_tiers(rank, tiers)
+        entry_id = urllib.parse.quote(str(row.get("id") or ""), safe="")
+        if not entry_id:
+            continue
+        patched = supabase_data_request(
+            "contest_entries",
+            method="PATCH",
+            query=f"id=eq.{entry_id}",
+            payload={
+                "actual_score": actual_score,
+                "actual_rank": rank or None,
+                "field_size": safe_int(row.get("field_size"), 0) or (len(field_scores) if field_scores else None),
+                "payout": round(max(0.0, payout), 2),
+                "status": "settled" if rank > 0 else "entered",
+                "settled_at": settled_at if rank > 0 else None,
+            },
+            prefer="return=representation",
+            auth_token=auth_token,
+        )
+        if isinstance(patched, list) and patched:
+            settled += 1
+            total_entry_fees += safe_float(row.get("entry_fee"), 0)
+            total_payout += payout
+
+    return {
+        "source": "tracked_real_contest_entries",
+        "settled_entry_count": settled,
+        "incomplete_entry_count": incomplete,
+        "entry_fees": round(total_entry_fees, 2),
+        "payout": round(total_payout, 2),
+        "net_profit": round(total_payout - total_entry_fees, 2),
+    }
+
+
+def compact_standings_distribution(scores):
+    counts = {}
+    for raw_score in scores or []:
+        score = round(safe_float(raw_score, -1), 3)
+        if score < 0:
+            continue
+        counts[score] = counts.get(score, 0) + 1
+    return [
+        {"score": score, "count": count}
+        for score, count in sorted(counts.items(), key=lambda item: item[0], reverse=True)
+    ]
+
+
+def persist_result_import(
+    slate_key,
+    actual_rows,
+    contest_standings,
+    ownership_scope,
+    filename="",
+    contest_profile_id="",
+    auth_token="",
+):
+    summary = contest_standings.get("summary", {}) if isinstance(contest_standings, dict) else {}
+    scores = contest_standings.get("scores", []) if isinstance(contest_standings, dict) else []
+    payload = {
+        "sport": "MLB",
+        "slate_key": normalize_slate_key(slate_key),
+        "contest_profile_id": str(contest_profile_id or "").strip() or None,
+        "source_filename": str(filename or "")[:240],
+        "ownership_scope": str(ownership_scope or "none"),
+        "player_results": actual_rows,
+        "standings_scores": compact_standings_distribution(scores),
+        "standings_summary": summary,
+        "player_result_count": len(actual_rows or []),
+        "standings_count": safe_int(summary.get("observation_count"), len(scores)),
+    }
+    rows = supabase_data_request(
+        "dfs_result_imports",
+        method="POST",
+        payload=payload,
+        prefer="return=representation",
+        auth_token=auth_token,
+    )
+    return bool(isinstance(rows, list) and rows)
 
 
 def weighted_mean(values, weights):
@@ -7641,6 +7866,7 @@ async def upload_actual_results_csv(
     admin_password: str = Form(""),
     admin_token: str = Form(""),
     slate_key: str = Form(""),
+    contest_profile_id: str = Form(""),
     file: UploadFile = File(...),
 ):
     if not is_admin_authorized(admin_password, admin_token):
@@ -7665,6 +7891,15 @@ async def upload_actual_results_csv(
         or metadata.get("slate_name")
         or datetime.now(timezone.utc).date().isoformat()
     )
+    result_import_persisted = persist_result_import(
+        resolved_slate_key,
+        actual_rows,
+        contest_standings,
+        ownership_scope,
+        filename=file.filename,
+        contest_profile_id=contest_profile_id,
+        auth_token=admin_token,
+    )
     snapshot = load_projection_snapshot(resolved_slate_key, admin_token)
     players = snapshot.get("players", []) if isinstance(snapshot, dict) else []
     if not isinstance(players, list) or len(players) < 10:
@@ -7683,14 +7918,22 @@ async def upload_actual_results_csv(
         contest_standings.get("scores", []),
         admin_token,
     )
+    entry_evidence = evaluate_contest_entries(
+        resolved_slate_key,
+        actual_rows,
+        contest_standings.get("scores", []),
+        admin_token,
+    )
     strategy_evidence = {
         "source": "generated_saved_and_entered_lineup_actual_results",
         "observation_count": safe_int(generated_evidence.get("observation_count"), 0) + safe_int(saved_evidence.get("observation_count"), 0),
         "generated_observation_count": safe_int(generated_evidence.get("observation_count"), 0),
         "saved_observation_count": safe_int(saved_evidence.get("saved_observation_count"), 0),
         "entered_observation_count": safe_int(saved_evidence.get("entered_observation_count"), 0),
+        "settled_entry_count": safe_int(entry_evidence.get("settled_entry_count"), 0),
         "generated": generated_evidence,
         "user_selected": saved_evidence,
+        "real_entries": entry_evidence,
     }
     if result["matched_players"] < 10:
         return {
@@ -7739,7 +7982,233 @@ async def upload_actual_results_csv(
         "validation": calibration_model.get("validation", {}),
         "backtest_persisted": backtest_persisted,
         "calibration_persisted": calibration_persisted,
+        "result_import_persisted": result_import_persisted,
+        "entry_evidence": entry_evidence,
     }
+
+
+def pearson_correlation(left, right):
+    pairs = [
+        (safe_float(a, 0), safe_float(b, 0))
+        for a, b in zip(left or [], right or [])
+        if a is not None and b is not None
+    ]
+    if len(pairs) < 3:
+        return 0.0
+    xs = [pair[0] for pair in pairs]
+    ys = [pair[1] for pair in pairs]
+    mean_x = statistics.fmean(xs)
+    mean_y = statistics.fmean(ys)
+    numerator = sum((x - mean_x) * (y - mean_y) for x, y in pairs)
+    denominator = math.sqrt(sum((x - mean_x) ** 2 for x in xs) * sum((y - mean_y) ** 2 for y in ys))
+    return round(numerator / denominator, 4) if denominator > 0 else 0.0
+
+
+def lineup_performance_summary(rows):
+    percentiles = [safe_float(row.get("field_percentile"), -1) for row in rows]
+    percentiles = [value for value in percentiles if value >= 0]
+    actual_scores = [safe_float(row.get("actual_score"), -1) for row in rows]
+    actual_scores = [value for value in actual_scores if value >= 0]
+    projected = [safe_float(row.get("projected_points"), -1) for row in rows]
+    paired = [
+        (safe_float(row.get("projected_points"), -1), safe_float(row.get("actual_score"), -1))
+        for row in rows
+        if safe_float(row.get("projected_points"), -1) >= 0 and safe_float(row.get("actual_score"), -1) >= 0
+    ]
+    count = len(rows)
+    return {
+        "lineups": count,
+        "slates": len({str(row.get("slate_key") or "") for row in rows}),
+        "average_projection": round(statistics.fmean(value for value in projected if value >= 0), 3) if any(value >= 0 for value in projected) else 0,
+        "average_actual_score": round(statistics.fmean(actual_scores), 3) if actual_scores else 0,
+        "average_field_percentile": round(statistics.fmean(percentiles), 3) if percentiles else 0,
+        "above_median_count": sum(value >= 50 for value in percentiles),
+        "above_median_rate": round(100 * sum(value >= 50 for value in percentiles) / len(percentiles), 2) if percentiles else 0,
+        "top_10_count": sum(value >= 90 for value in percentiles),
+        "top_10_rate": round(100 * sum(value >= 90 for value in percentiles) / len(percentiles), 2) if percentiles else 0,
+        "top_1_count": sum(value >= 99 for value in percentiles),
+        "top_1_rate": round(100 * sum(value >= 99 for value in percentiles) / len(percentiles), 3) if percentiles else 0,
+        "projection_actual_correlation": pearson_correlation([item[0] for item in paired], [item[1] for item in paired]),
+    }
+
+
+def build_strategy_performance_report(auth_token=""):
+    runs = supabase_data_request(
+        "mlb_lineup_runs",
+        query="select=id,slate_key,generated_at,strategy_mode,lineups,lineup_count,evaluated_at,evaluation&order=generated_at.asc&limit=5000",
+        auth_token=auth_token,
+    )
+    runs = runs if isinstance(runs, list) else []
+    observations = []
+    recorded_lineups = 0
+    incomplete_lineups = 0
+
+    for run in runs:
+        lineups = run.get("lineups") if isinstance(run.get("lineups"), list) else []
+        recorded_lineups += max(len(lineups), safe_int(run.get("lineup_count"), 0))
+        evaluation = run.get("evaluation") if isinstance(run.get("evaluation"), dict) else {}
+        results = evaluation.get("results") if isinstance(evaluation.get("results"), list) else []
+        indexed_results = {}
+        legacy_results = []
+        for result in results:
+            if not isinstance(result, dict):
+                continue
+            index = safe_int(result.get("lineup_index"), 0)
+            if index > 0:
+                indexed_results[index] = result
+            else:
+                legacy_results.append(result)
+        for lineup_index, lineup in enumerate(lineups, start=1):
+            if not isinstance(lineup, dict):
+                incomplete_lineups += 1
+                continue
+            result = indexed_results.get(lineup_index)
+            if result is None and lineup_index <= len(legacy_results):
+                result = legacy_results[lineup_index - 1]
+            if not isinstance(result, dict) or str(result.get("status") or "complete") != "complete" or result.get("actual_score") is None:
+                incomplete_lineups += 1
+                continue
+            features = learning_lineup_features(lineup)
+            observations.append({
+                "slate_key": normalize_slate_key(run.get("slate_key")),
+                "generated_at": run.get("generated_at"),
+                "strategy_mode": str(lineup.get("builder_style") or run.get("strategy_mode") or "balanced").lower(),
+                "actual_score": safe_float(result.get("actual_score"), 0),
+                "estimated_rank": safe_int(result.get("estimated_rank"), 0) or None,
+                "field_percentile": safe_float(result.get("field_percentile"), -1) if result.get("field_percentile") is not None else None,
+                **features,
+            })
+
+    unique = {}
+    for row in observations:
+        key = f"{row.get('slate_key')}:{row.get('lineup_fingerprint')}"
+        unique.setdefault(key, row)
+    unique_rows = list(unique.values())
+    duplicate_count = max(0, len(observations) - len(unique_rows))
+    by_strategy = {}
+    for mode in sorted({str(row.get("strategy_mode") or "balanced") for row in unique_rows}):
+        mode_rows = [row for row in unique_rows if row.get("strategy_mode") == mode]
+        by_strategy[mode] = lineup_performance_summary(mode_rows)
+
+    slate_order = sorted(
+        {str(row.get("slate_key") or "") for row in unique_rows},
+        key=lambda slate: min(str(row.get("generated_at") or slate) for row in unique_rows if row.get("slate_key") == slate),
+    )
+    walk_forward_rows = []
+    for index, test_slate in enumerate(slate_order):
+        if index < 3:
+            continue
+        training_slates = set(slate_order[:index])
+        train_rows = [row for row in unique_rows if row.get("slate_key") in training_slates and row.get("field_percentile") is not None]
+        test_rows = [row for row in unique_rows if row.get("slate_key") == test_slate and row.get("field_percentile") is not None]
+        candidates = {}
+        for mode in {str(row.get("strategy_mode") or "balanced") for row in train_rows}:
+            mode_rows = [row for row in train_rows if row.get("strategy_mode") == mode]
+            if len(mode_rows) < 5:
+                continue
+            summary = lineup_performance_summary(mode_rows)
+            candidates[mode] = summary["average_field_percentile"] + summary["top_10_rate"] * 0.30 + summary["top_1_rate"] * 0.70
+        if not candidates:
+            continue
+        chosen_mode = max(candidates, key=candidates.get)
+        chosen_test = [row for row in test_rows if row.get("strategy_mode") == chosen_mode]
+        if not chosen_test:
+            continue
+        chosen_summary = lineup_performance_summary(chosen_test)
+        balanced_test = [row for row in test_rows if row.get("strategy_mode") == "balanced"]
+        walk_forward_rows.append({
+            "test_slate": test_slate,
+            "trained_on_slates": index,
+            "selected_strategy": chosen_mode,
+            "test_lineups": len(chosen_test),
+            "average_field_percentile": chosen_summary["average_field_percentile"],
+            "top_10_rate": chosen_summary["top_10_rate"],
+            "balanced_field_percentile": lineup_performance_summary(balanced_test)["average_field_percentile"] if balanced_test else None,
+        })
+
+    entries = supabase_data_request(
+        "contest_entries",
+        query="sport=eq.MLB&select=id,strategy_mode,status,entry_fee,payout,net_profit,actual_rank,field_size,slate_key&order=entered_at.desc&limit=5000",
+        auth_token=auth_token,
+    )
+    entries = entries if isinstance(entries, list) else []
+    settled_entries = [entry for entry in entries if str(entry.get("status")) == "settled"]
+    entry_fees = sum(safe_float(entry.get("entry_fee"), 0) for entry in settled_entries)
+    payouts = sum(safe_float(entry.get("payout"), 0) for entry in settled_entries)
+    profit_summary = {
+        "tracked_entries": len(entries),
+        "settled_entries": len(settled_entries),
+        "cashes": sum(safe_float(entry.get("payout"), 0) > 0 for entry in settled_entries),
+        "cash_rate": round(100 * sum(safe_float(entry.get("payout"), 0) > 0 for entry in settled_entries) / len(settled_entries), 2) if settled_entries else 0,
+        "entry_fees": round(entry_fees, 2),
+        "payouts": round(payouts, 2),
+        "net_profit": round(payouts - entry_fees, 2),
+        "roi_percent": round(100 * (payouts - entry_fees) / entry_fees, 2) if entry_fees > 0 else 0,
+    }
+    walk_forward_average = round(statistics.fmean(row["average_field_percentile"] for row in walk_forward_rows), 3) if walk_forward_rows else 0
+    report = {
+        "success": True,
+        "status": "shadow_validation",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "model_version": "mlb-strategy-shadow-v1",
+        "data_quality": {
+            "run_count": len(runs),
+            "recorded_lineups": recorded_lineups,
+            "complete_lineups": len(observations),
+            "incomplete_lineups": incomplete_lineups,
+            "unique_lineups": len(unique_rows),
+            "duplicate_lineups": duplicate_count,
+            "duplicate_rate": round(100 * duplicate_count / len(observations), 2) if observations else 0,
+            "slate_count": len(slate_order),
+        },
+        "overall": lineup_performance_summary(unique_rows),
+        "by_strategy": by_strategy,
+        "walk_forward": {
+            "test_slate_count": len(walk_forward_rows),
+            "average_field_percentile": walk_forward_average,
+            "tests": walk_forward_rows,
+        },
+        "profit": profit_summary,
+    }
+    report["activation_gate"] = {
+        "passes": False,
+        "status": "tracking_real_profit" if profit_summary["settled_entries"] < 25 else "needs_out_of_sample_edge",
+        "minimum_settled_entries": 25,
+        "minimum_walk_forward_slates": 5,
+        "message": "Strategy learning remains in shadow mode until it improves unseen slates and real settled entries without increasing duplicate exposure.",
+    }
+    return report
+
+
+@app.get("/model/performance/status")
+def model_performance_status(authorization: str = Header("")):
+    auth_token = str(authorization or "").removeprefix("Bearer ").strip()
+    if not auth_token or not is_admin_token(auth_token):
+        raise HTTPException(status_code=403, detail="Admin access required.")
+    return build_strategy_performance_report(auth_token)
+
+
+@app.post("/model/performance/run")
+def run_model_performance_report(authorization: str = Header("")):
+    auth_token = str(authorization or "").removeprefix("Bearer ").strip()
+    if not auth_token or not is_admin_token(auth_token):
+        raise HTTPException(status_code=403, detail="Admin access required.")
+    report = build_strategy_performance_report(auth_token)
+    rows = supabase_data_request(
+        "strategy_backtest_reports",
+        method="POST",
+        payload={
+            "sport": "MLB",
+            "model_version": report.get("model_version", "mlb-strategy-shadow-v1"),
+            "slate_count": safe_int((report.get("data_quality") or {}).get("slate_count"), 0),
+            "lineup_count": safe_int((report.get("data_quality") or {}).get("unique_lineups"), 0),
+            "report": report,
+            "is_active": False,
+        },
+        prefer="return=representation",
+        auth_token=auth_token,
+    )
+    return {**report, "persisted": bool(isinstance(rows, list) and rows)}
 
 
 @app.get("/model/backtest/status")
