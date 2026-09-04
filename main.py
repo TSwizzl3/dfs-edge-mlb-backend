@@ -8032,6 +8032,134 @@ def lineup_performance_summary(rows):
     }
 
 
+def canonical_mlb_strategy_mode(value):
+    """Keep historic optimizer labels compatible with the public three-mode UI."""
+    mode = str(value or "balanced").strip().lower()
+    if mode in {"safe", "cash", "cash_double_up", "balanced"}:
+        return "balanced"
+    if mode in {"aggressive", "ceiling", "single_entry", "small_field_single_entry"}:
+        return "ceiling"
+    if mode in {"nuclear", "nucleur", "large_field_gpp", "twenty_max", "mega_gpp"}:
+        return "nuclear"
+    return "balanced"
+
+
+def lineup_ownership_bucket(value):
+    ownership = safe_float(value, 0)
+    if ownership < 8:
+        return "under_8"
+    if ownership < 12:
+        return "8_to_12"
+    if ownership < 16:
+        return "12_to_16"
+    if ownership < 20:
+        return "16_to_20"
+    return "20_plus"
+
+
+def build_empirical_lineup_adjustments(rows):
+    """Learn small, shrinkage-limited construction nudges from completed slates.
+
+    The target is field percentile centered within each slate. Centering prevents
+    an easy slate, hard slate, or incomplete contest field from making a stack
+    shape look better than it was relative to the other DFS Edge builds that day.
+    """
+    eligible = [row for row in (rows or []) if row.get("field_percentile") is not None]
+    slate_groups = {}
+    for row in eligible:
+        slate_groups.setdefault(str(row.get("slate_key") or ""), []).append(row)
+    slate_means = {
+        slate: statistics.fmean(safe_float(row.get("field_percentile"), 0) for row in slate_rows)
+        for slate, slate_rows in slate_groups.items() if slate_rows
+    }
+    dimensions = {"primary_stack_size": {}, "average_ownership": {}}
+    for row in eligible:
+        slate = str(row.get("slate_key") or "")
+        centered = safe_float(row.get("field_percentile"), 0) - safe_float(slate_means.get(slate), 0)
+        buckets = {
+            "primary_stack_size": str(safe_int(row.get("primary_stack_size"), 0)),
+            "average_ownership": lineup_ownership_bucket(row.get("average_ownership")),
+        }
+        for dimension, bucket in buckets.items():
+            dimensions[dimension].setdefault(bucket, []).append((centered, slate))
+
+    learned = {}
+    validated_bucket_count = 0
+    for dimension, buckets in dimensions.items():
+        learned[dimension] = {}
+        for bucket, values in buckets.items():
+            sample_size = len(values)
+            slate_count = len({slate for _, slate in values})
+            raw_effect = statistics.fmean(value for value, _ in values) if values else 0
+            reliability = min(1.0, sample_size / 50.0) * min(1.0, slate_count / 8.0)
+            validated = sample_size >= 12 and slate_count >= 5
+            adjustment = max(-6.0, min(6.0, raw_effect * reliability)) if validated else 0.0
+            if validated:
+                validated_bucket_count += 1
+            learned[dimension][bucket] = {
+                "sample_size": sample_size,
+                "slate_count": slate_count,
+                "raw_slate_adjusted_percentile": round(raw_effect, 3),
+                "reliability": round(reliability, 3),
+                "adjustment": round(adjustment, 3),
+                "validated": validated,
+            }
+    active = len(eligible) >= 100 and len(slate_groups) >= 8 and validated_bucket_count >= 3
+    return {
+        "active": active,
+        "status": "bounded_active" if active else "shadow_validation",
+        "strength": 0.35 if active else 0.0,
+        "completed_lineups": len(eligible),
+        "slate_count": len(slate_groups),
+        "validated_bucket_count": validated_bucket_count,
+        "dimensions": learned,
+        "method": "within_slate_centered_shrinkage",
+        "note": "Construction adjustments are capped at 35% strength until real settled-entry evidence is larger.",
+    }
+
+
+STRATEGY_ADJUSTMENT_CACHE = {"loaded_at": 0.0, "model": {}}
+
+
+def load_live_strategy_adjustment_model(force=False):
+    now = time.time()
+    if not force and now - safe_float(STRATEGY_ADJUSTMENT_CACHE.get("loaded_at"), 0) < 300:
+        return STRATEGY_ADJUSTMENT_CACHE.get("model") or {}
+    rows = supabase_data_request(
+        "strategy_backtest_reports",
+        query="sport=eq.MLB&is_active=eq.true&select=report,created_at&order=created_at.desc&limit=1",
+    )
+    report = rows[0].get("report", {}) if isinstance(rows, list) and rows and isinstance(rows[0], dict) else {}
+    model = report.get("lineup_adjustments", {}) if isinstance(report, dict) else {}
+    STRATEGY_ADJUSTMENT_CACHE["loaded_at"] = now
+    STRATEGY_ADJUSTMENT_CACHE["model"] = model if isinstance(model, dict) else {}
+    return STRATEGY_ADJUSTMENT_CACHE["model"]
+
+
+def live_lineup_learning_adjustment(lineup):
+    model = load_live_strategy_adjustment_model()
+    if not bool(model.get("active")):
+        return {"score": 0.0, "strength": 0.0, "reasons": []}
+    features = learning_lineup_features({"lineup": lineup})
+    dimensions = model.get("dimensions") if isinstance(model.get("dimensions"), dict) else {}
+    buckets = {
+        "primary_stack_size": str(safe_int(features.get("primary_stack_size"), 0)),
+        "average_ownership": lineup_ownership_bucket(features.get("average_ownership")),
+    }
+    total = 0.0
+    reasons = []
+    for dimension, bucket in buckets.items():
+        detail = ((dimensions.get(dimension) or {}).get(bucket) or {})
+        if not detail.get("validated"):
+            continue
+        value = safe_float(detail.get("adjustment"), 0)
+        total += value
+        reasons.append({"feature": dimension, "bucket": bucket, "effect": round(value, 3)})
+    strength = max(0.0, min(0.35, safe_float(model.get("strength"), 0)))
+    # One learned percentile point is worth five optimizer points at full strength.
+    return {"score": round(total * strength * 5.0, 3), "strength": strength, "reasons": reasons}
+
+
 def build_strategy_performance_report(auth_token=""):
     runs = supabase_data_request(
         "mlb_lineup_runs",
@@ -8072,7 +8200,7 @@ def build_strategy_performance_report(auth_token=""):
             observations.append({
                 "slate_key": normalize_slate_key(run.get("slate_key")),
                 "generated_at": run.get("generated_at"),
-                "strategy_mode": str(lineup.get("builder_style") or run.get("strategy_mode") or "balanced").lower(),
+                "strategy_mode": canonical_mlb_strategy_mode(lineup.get("builder_style") or run.get("strategy_mode")),
                 "actual_score": safe_float(result.get("actual_score"), 0),
                 "estimated_rank": safe_int(result.get("estimated_rank"), 0) or None,
                 "field_percentile": safe_float(result.get("field_percentile"), -1) if result.get("field_percentile") is not None else None,
@@ -8145,12 +8273,25 @@ def build_strategy_performance_report(auth_token=""):
         "net_profit": round(payouts - entry_fees, 2),
         "roi_percent": round(100 * (payouts - entry_fees) / entry_fees, 2) if entry_fees > 0 else 0,
     }
+    entry_by_strategy = {}
+    for mode in ("balanced", "ceiling", "nuclear"):
+        mode_entries = [entry for entry in settled_entries if canonical_mlb_strategy_mode(entry.get("strategy_mode")) == mode]
+        mode_fees = sum(safe_float(entry.get("entry_fee"), 0) for entry in mode_entries)
+        mode_payouts = sum(safe_float(entry.get("payout"), 0) for entry in mode_entries)
+        entry_by_strategy[mode] = {
+            "entries": len(mode_entries),
+            "cashes": sum(safe_float(entry.get("payout"), 0) > 0 for entry in mode_entries),
+            "net_profit": round(mode_payouts - mode_fees, 2),
+            "roi_percent": round(100 * (mode_payouts - mode_fees) / mode_fees, 2) if mode_fees > 0 else 0,
+        }
+    profit_summary["by_strategy"] = entry_by_strategy
+    lineup_adjustments = build_empirical_lineup_adjustments(unique_rows)
     walk_forward_average = round(statistics.fmean(row["average_field_percentile"] for row in walk_forward_rows), 3) if walk_forward_rows else 0
     report = {
         "success": True,
         "status": "shadow_validation",
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "model_version": "mlb-strategy-shadow-v1",
+        "model_version": "mlb-strategy-learning-v2",
         "data_quality": {
             "run_count": len(runs),
             "recorded_lineups": recorded_lineups,
@@ -8169,13 +8310,18 @@ def build_strategy_performance_report(auth_token=""):
             "tests": walk_forward_rows,
         },
         "profit": profit_summary,
+        "lineup_adjustments": lineup_adjustments,
     }
     report["activation_gate"] = {
-        "passes": False,
-        "status": "tracking_real_profit" if profit_summary["settled_entries"] < 25 else "needs_out_of_sample_edge",
+        "passes": bool(lineup_adjustments.get("active")),
+        "status": "bounded_learning_active" if lineup_adjustments.get("active") else ("tracking_real_profit" if profit_summary["settled_entries"] < 25 else "needs_out_of_sample_edge"),
         "minimum_settled_entries": 25,
         "minimum_walk_forward_slates": 5,
-        "message": "Strategy learning remains in shadow mode until it improves unseen slates and real settled entries without increasing duplicate exposure.",
+        "message": (
+            "Validated construction patterns now influence new MLB lineups at a capped 35% strength; full-strength strategy learning still requires more settled entries and positive unseen-slate results."
+            if lineup_adjustments.get("active") else
+            "Strategy learning remains in shadow mode until it has enough completed slates and reliable construction buckets."
+        ),
     }
     return report
 
@@ -8185,7 +8331,12 @@ def model_performance_status(authorization: str = Header("")):
     auth_token = str(authorization or "").removeprefix("Bearer ").strip()
     if not auth_token or not is_admin_token(auth_token):
         raise HTTPException(status_code=403, detail="Admin access required.")
-    return build_strategy_performance_report(auth_token)
+    report = build_strategy_performance_report(auth_token)
+    adjustments = report.get("lineup_adjustments") if isinstance(report, dict) else {}
+    if isinstance(adjustments, dict) and adjustments.get("active"):
+        STRATEGY_ADJUSTMENT_CACHE["loaded_at"] = time.time()
+        STRATEGY_ADJUSTMENT_CACHE["model"] = adjustments
+    return report
 
 
 @app.post("/model/performance/run")
@@ -8199,15 +8350,17 @@ def run_model_performance_report(authorization: str = Header("")):
         method="POST",
         payload={
             "sport": "MLB",
-            "model_version": report.get("model_version", "mlb-strategy-shadow-v1"),
+            "model_version": report.get("model_version", "mlb-strategy-learning-v2"),
             "slate_count": safe_int((report.get("data_quality") or {}).get("slate_count"), 0),
             "lineup_count": safe_int((report.get("data_quality") or {}).get("unique_lineups"), 0),
             "report": report,
-            "is_active": False,
+            "is_active": bool((report.get("lineup_adjustments") or {}).get("active")),
         },
         prefer="return=representation",
         auth_token=auth_token,
     )
+    if isinstance(rows, list) and rows:
+        load_live_strategy_adjustment_model(force=True)
     return {**report, "persisted": bool(isinstance(rows, list) and rows)}
 
 
@@ -10595,7 +10748,7 @@ def monte_carlo_lineup_simulation_v2(lineup, contest, runs=1200, field_scores=No
 #   these global function names at request time.
 # ============================================================
 
-TOURNAMENT_ENGINE_VERSION = "dfs_edge_mlb_tournament_engine_v5_nuclear_barbell"
+TOURNAMENT_ENGINE_VERSION = "dfs_edge_mlb_tournament_engine_v6_empirical_guardrails"
 
 V4_REQUIRED_COUNTS = {"P": 2, "C": 1, "1B": 1, "2B": 1, "3B": 1, "SS": 1, "OF": 3}
 MLB_DK_POSITION_ORDER = {"P": 0, "C": 1, "1B": 2, "2B": 3, "3B": 4, "SS": 5, "OF": 6}
@@ -11119,20 +11272,27 @@ def v4_lineup_objective(lineup, mode="gpp", style="balanced", correlation_enable
     core_score = safe_float(core.get("average_core_play_score", 50), 50)
     primary_stack_size = safe_int(stack.get("primary_stack_size", stack.get("stack_size", 0)), 0)
     average_ownership = sum(safe_float(player.get("ownership", 12), 12) for player in lineup) / max(1, len(lineup))
-    nuclear_stack_bonus = 90 if primary_stack_size >= 5 else 10 if primary_stack_size == 4 else -80
+    # Completed-slate evidence currently favors four-hitter stacks over both
+    # two-hitter mini stacks and automatic five-hitter stacks. Keep five viable,
+    # but stop awarding it an overwhelming hard-coded bonus.
+    nuclear_stack_bonus = 24 if primary_stack_size == 4 else 12 if primary_stack_size >= 5 else 4 if primary_stack_size == 3 else -35
     stack_weight = 1.0 if correlation_enabled else 0.0
     nuclear_stack_bonus = nuclear_stack_bonus if correlation_enabled else 0
+    learned = live_lineup_learning_adjustment(lineup)
+    learned_score = safe_float(learned.get("score"), 0)
 
     if str(mode).lower() == "cash" or style == "safe":
-        return projection * 1.9 + core_score * 0.18 + salary_score + min(100, stack_score) * 0.08 * stack_weight - chalk * 0.05
+        return projection * 1.9 + core_score * 0.18 + salary_score + min(100, stack_score) * 0.08 * stack_weight - chalk * 0.05 + learned_score
     if style == "nuclear":
         nuclear_profile = v4_nuclear_lineup_profile(lineup)
-        return p99 * 1.82 + p95 * 0.35 + projection * 0.12 + stack_score * 2.18 * stack_weight + lev_score * 1.68 + uniq * 1.42 - chalk * 0.62 + salary_score + nuclear_stack_bonus + max(0, 12 - average_ownership) * 6.5 + safe_float(nuclear_profile.get("barbell_score", 0), 0) * 2.10
+        ownership_sweet_spot = max(0.0, 24.0 - abs(average_ownership - 11.5) * 4.0)
+        extreme_contrarian_penalty = max(0.0, 8.0 - average_ownership) * 12.0
+        return p99 * 1.82 + p95 * 0.35 + projection * 0.12 + stack_score * 2.18 * stack_weight + lev_score * 1.68 + uniq * 1.42 - chalk * 0.62 + salary_score + nuclear_stack_bonus + ownership_sweet_spot - extreme_contrarian_penalty + safe_float(nuclear_profile.get("barbell_score", 0), 0) * 2.10 + learned_score
     if style == "aggressive":
-        return p99 * 1.10 + p95 * 1.05 + stack_score * 1.75 * stack_weight + lev_score * 1.32 + uniq * 0.92 - chalk * 0.38 + salary_score
+        return p99 * 1.10 + p95 * 1.05 + stack_score * 1.75 * stack_weight + lev_score * 1.32 + uniq * 0.92 - chalk * 0.38 + salary_score + learned_score
     if style == "single_entry":
-        return p95 * 1.25 + projection * 0.65 + stack_score * 1.15 * stack_weight + lev_score * 0.88 + core_score * 0.10 - chalk * 0.22 + salary_score
-    return p95 * 1.05 + projection * 0.85 + stack_score * 0.88 * stack_weight + lev_score * 0.60 + salary_score
+        return p95 * 1.25 + projection * 0.65 + stack_score * 1.15 * stack_weight + lev_score * 0.88 + core_score * 0.10 - chalk * 0.22 + salary_score + learned_score
+    return p95 * 1.05 + projection * 0.85 + stack_score * 0.88 * stack_weight + lev_score * 0.60 + salary_score + learned_score
 
 
 def build_fast_multi_lineups_for_pro(request, count):
@@ -11194,13 +11354,13 @@ def build_fast_multi_lineups_for_pro(request, count):
     team_scores = v4_team_stack_scores(hitters, style)
     stack_teams = ([x[0] for x in team_scores[:18]] or [""]) if correlation_enabled else [""]
 
-    stack_sizes = [2] if style == "safe" else [4, 3, 5, 4, 3]
+    stack_sizes = [3, 4, 3] if style == "safe" else [4, 3, 5, 4, 3]
     if style == "single_entry":
         stack_sizes = [4, 3, 4, 5]
     if style == "aggressive":
-        stack_sizes = [4, 5, 4, 3, 5]
+        stack_sizes = [4, 4, 3, 4, 5]
     if style == "nuclear":
-        stack_sizes = [5, 4, 5, 4, 3]
+        stack_sizes = [4, 4, 5, 3, 4]
     stack_sizes = [min(max_players_per_team, s) for s in stack_sizes]
 
     candidates = []
@@ -11244,6 +11404,7 @@ def build_fast_multi_lineups_for_pro(request, count):
         data["optimizer_score"] = round(objective, 2)
         data["optimizer_objective"] = "v4_tournament_takedown_equity" if mode != "cash" else "v4_cash_safety"
         data["builder_style"] = style
+        data["continuous_learning_adjustment"] = live_lineup_learning_adjustment(lineup)
         if style == "nuclear":
             data["nuclear_construction_profile"] = v4_nuclear_lineup_profile(lineup)
         candidates.append(data)

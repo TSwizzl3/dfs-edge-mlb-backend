@@ -467,7 +467,7 @@ class AdminIngestionTests(unittest.TestCase):
         self.assertGreater(distribution["p99"], distribution["p95"])
         self.assertLess(distribution["p99"], 30.0)
 
-    def test_nuclear_objective_strongly_prefers_five_player_stack(self):
+    def test_nuclear_objective_prefers_four_player_stack_without_overrewarding_five(self):
         lineup = [
             {"name": f"Player {index}", "projection": 10, "salary": 5000, "ownership": 8}
             for index in range(10)
@@ -482,7 +482,7 @@ class AdminIngestionTests(unittest.TestCase):
                 four_stack_no_correlation = main.v4_lineup_objective(lineup, "nuclear", "nuclear", correlation_enabled=False)
             with patch.object(main, "v2_lineup_stack_profile", return_value={"stack_score": 90, "primary_stack_size": 5}):
                 five_stack_no_correlation = main.v4_lineup_objective(lineup, "nuclear", "nuclear", correlation_enabled=False)
-        self.assertGreater(five_stack_score, four_stack_score + 60)
+        self.assertGreater(four_stack_score, five_stack_score)
         self.assertEqual(five_stack_no_correlation, four_stack_no_correlation)
 
 
@@ -1098,6 +1098,26 @@ class AdminIngestionTests(unittest.TestCase):
         self.assertEqual(features["hitter_team_count"], 2)
         self.assertEqual(features["lineup_fingerprint"], main.learning_lineup_fingerprint(lineup["lineup"]))
 
+    def test_historic_builder_labels_map_to_public_strategy_modes(self):
+        self.assertEqual(main.canonical_mlb_strategy_mode("safe"), "balanced")
+        self.assertEqual(main.canonical_mlb_strategy_mode("aggressive"), "ceiling")
+        self.assertEqual(main.canonical_mlb_strategy_mode("nuclear"), "nuclear")
+
+    def test_empirical_adjustments_activate_only_with_repeated_slate_evidence(self):
+        rows = []
+        for slate in range(8):
+            for index in range(14):
+                rows.append({
+                    "slate_key": f"slate-{slate}",
+                    "field_percentile": 70 if index < 7 else 35,
+                    "primary_stack_size": 4 if index < 7 else 2,
+                    "average_ownership": 10 if index < 7 else 6,
+                })
+        model = main.build_empirical_lineup_adjustments(rows)
+        self.assertTrue(model["active"])
+        self.assertGreater(model["dimensions"]["primary_stack_size"]["4"]["adjustment"], 0)
+        self.assertLess(model["dimensions"]["primary_stack_size"]["2"]["adjustment"], 0)
+
     def test_performance_report_deduplicates_and_walks_forward(self):
         runs = []
         for slate_number in range(4):
@@ -1133,6 +1153,7 @@ class AdminIngestionTests(unittest.TestCase):
         self.assertEqual(report["data_quality"]["duplicate_lineups"], 5)
         self.assertEqual(report["walk_forward"]["test_slate_count"], 1)
         self.assertEqual(report["walk_forward"]["tests"][0]["selected_strategy"], "ceiling")
+        self.assertEqual(set(report["by_strategy"]), {"balanced", "ceiling", "nuclear"})
         self.assertEqual(report["profit"]["net_profit"], 10)
         self.assertFalse(report["activation_gate"]["passes"])
 
