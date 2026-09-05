@@ -22,6 +22,44 @@ class FakeResponse:
 
 
 class AdminIngestionTests(unittest.TestCase):
+    def test_gamecenter_results_require_an_exact_contest(self):
+        standings = {"summary": {"observation_count": 1764, "field_size": 1764}, "scores": [100]}
+        profile, error = main.validate_result_contest_assignment(
+            "2026-09-04-turbo", "", standings, "contest-standings-194992499.csv", "admin-token"
+        )
+        self.assertIsNone(profile)
+        self.assertIn("Choose the exact saved contest", error)
+
+    def test_gamecenter_results_block_a_wrong_contest_field(self):
+        standings = {"summary": {"observation_count": 1764, "field_size": 1764}, "scores": [100]}
+        contest = [{
+            "id": "contest-1", "slate_key": "2026-09-04-main", "name": "Rally Cap",
+            "field_size": 10200, "draftkings_contest_id": None,
+        }]
+        with patch.object(main, "supabase_data_request", return_value=contest):
+            profile, error = main.validate_result_contest_assignment(
+                "2026-09-04-main", "contest-1", standings,
+                "contest-standings-194992499.csv", "admin-token",
+            )
+        self.assertIsNone(profile)
+        self.assertIn("1,764 entries", error)
+        self.assertIn("10,200", error)
+
+    def test_matching_gamecenter_results_bind_the_draftkings_contest_id(self):
+        standings = {"summary": {"observation_count": 1764, "field_size": 1764}, "scores": [100]}
+        contest = [{
+            "id": "contest-1", "slate_key": "2026-09-04-turbo", "name": "Extra Inning",
+            "field_size": 1764, "draftkings_contest_id": None,
+        }]
+        with patch.object(main, "supabase_data_request", side_effect=[contest, []]) as request:
+            profile, error = main.validate_result_contest_assignment(
+                "2026-09-04-turbo", "contest-1", standings,
+                "contest-standings-194992499.csv", "admin-token",
+            )
+        self.assertIsNone(error)
+        self.assertEqual(profile["draftkings_contest_id"], "194992499")
+        self.assertEqual(request.call_args_list[1].kwargs["method"], "PATCH")
+
     def test_named_contest_slates_remain_isolated(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(
             main, "SLATE_LIBRARY_DIR", Path(directory)
@@ -1118,6 +1156,18 @@ class AdminIngestionTests(unittest.TestCase):
         self.assertGreater(model["dimensions"]["primary_stack_size"]["4"]["adjustment"], 0)
         self.assertLess(model["dimensions"]["primary_stack_size"]["2"]["adjustment"], 0)
 
+    def test_legacy_strategy_report_cannot_bypass_the_safety_gate(self):
+        main.STRATEGY_ADJUSTMENT_CACHE = {"loaded_at": 0.0, "model": {}}
+        unsafe_report = [{
+            "report": {
+                "lineup_adjustments": {"active": True, "strength": 0.35},
+                "activation_gate": {"passes": True},
+            }
+        }]
+        with patch.object(main, "supabase_data_request", return_value=unsafe_report):
+            model = main.load_live_strategy_adjustment_model(force=True)
+        self.assertEqual(model, {})
+
     def test_performance_report_deduplicates_and_walks_forward(self):
         runs = []
         for slate_number in range(4):
@@ -1143,7 +1193,7 @@ class AdminIngestionTests(unittest.TestCase):
             if table == "mlb_lineup_runs":
                 return runs
             if table == "contest_entries":
-                return [{"id": "entry-1", "status": "settled", "entry_fee": 20, "payout": 30, "net_profit": 10}]
+                return [{"id": "entry-1", "status": "settled", "entry_fee": 20, "payout": 30, "net_profit": 10, "contest_profile_id": "contest-1"}]
             return []
 
         with patch.object(main, "supabase_data_request", side_effect=fake_request):

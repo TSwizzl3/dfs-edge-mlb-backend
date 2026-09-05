@@ -575,6 +575,88 @@ def parse_contest_standings_csv(csv_text):
     return {"summary": summary, "scores": scores}
 
 
+def draftkings_contest_id_from_filename(filename):
+    """Read the stable DraftKings contest id from a GameCenter export filename."""
+    match = re.search(r"contest[-_ ]standings[-_ ]([0-9]+)", str(filename or ""), re.IGNORECASE)
+    return match.group(1) if match else ""
+
+
+def validate_result_contest_assignment(
+    slate_key,
+    contest_profile_id,
+    contest_standings,
+    filename="",
+    auth_token="",
+):
+    """Fail closed before contest standings can settle entries or train a slate.
+
+    Player-only result files may remain slate-level. A full DraftKings standings
+    export must be tied to an exact saved contest whose slate and field size
+    match the export.
+    """
+    resolved_slate_key = normalize_slate_key(slate_key)
+    profile_id = str(contest_profile_id or "").strip()
+    summary = contest_standings.get("summary", {}) if isinstance(contest_standings, dict) else {}
+    standings_count = safe_int(summary.get("observation_count"), 0)
+    standings_field_size = safe_int(summary.get("field_size"), standings_count)
+
+    if standings_count > 0 and not profile_id:
+        return None, (
+            "This DraftKings file contains contest standings. Choose the exact saved contest before uploading it; "
+            "slate-only imports cannot settle entries or train contest performance."
+        )
+    if not profile_id:
+        return None, None
+
+    encoded_id = urllib.parse.quote(profile_id, safe="")
+    rows = supabase_data_request(
+        "contest_profiles",
+        query=(
+            f"id=eq.{encoded_id}&sport=eq.MLB&"
+            "select=id,slate_key,name,field_size,draftkings_contest_id&limit=1"
+        ),
+        auth_token=auth_token,
+    )
+    if not isinstance(rows, list) or not rows:
+        return None, "The selected MLB contest could not be verified. Refresh the contest library and choose it again."
+
+    profile = rows[0]
+    profile_slate_key = normalize_slate_key(profile.get("slate_key"))
+    if profile_slate_key != resolved_slate_key:
+        return None, (
+            f"Results were blocked: {profile.get('name') or 'the selected contest'} belongs to "
+            f"{profile_slate_key}, not {resolved_slate_key}."
+        )
+
+    expected_field_size = safe_int(profile.get("field_size"), 0)
+    if standings_count > 0 and expected_field_size > 0 and standings_field_size != expected_field_size:
+        return None, (
+            f"Results were blocked before learning: the uploaded standings contain {standings_field_size:,} entries, "
+            f"but {profile.get('name') or 'the selected contest'} is saved with {expected_field_size:,}. "
+            "Choose the matching contest or correct its field size."
+        )
+
+    filename_contest_id = draftkings_contest_id_from_filename(filename)
+    saved_contest_id = str(profile.get("draftkings_contest_id") or "").strip()
+    if filename_contest_id and saved_contest_id and filename_contest_id != saved_contest_id:
+        return None, (
+            f"Results were blocked: this export is DraftKings contest {filename_contest_id}, but the selected contest "
+            f"is linked to {saved_contest_id}."
+        )
+
+    if standings_count > 0 and filename_contest_id and not saved_contest_id:
+        supabase_data_request(
+            "contest_profiles",
+            method="PATCH",
+            query=f"id=eq.{encoded_id}",
+            payload={"draftkings_contest_id": filename_contest_id},
+            prefer="return=minimal",
+            auth_token=auth_token,
+        )
+        profile["draftkings_contest_id"] = filename_contest_id
+    return profile, None
+
+
 
 def projection_backtest(players, actual_rows):
     actual_by_name = {
@@ -7891,6 +7973,15 @@ async def upload_actual_results_csv(
         or metadata.get("slate_name")
         or datetime.now(timezone.utc).date().isoformat()
     )
+    _, contest_assignment_error = validate_result_contest_assignment(
+        resolved_slate_key,
+        contest_profile_id,
+        contest_standings,
+        filename=file.filename,
+        auth_token=admin_token,
+    )
+    if contest_assignment_error:
+        return {"success": False, "error": contest_assignment_error}
     result_import_persisted = persist_result_import(
         resolved_slate_key,
         actual_rows,
@@ -8130,7 +8221,15 @@ def load_live_strategy_adjustment_model(force=False):
         query="sport=eq.MLB&is_active=eq.true&select=report,created_at&order=created_at.desc&limit=1",
     )
     report = rows[0].get("report", {}) if isinstance(rows, list) and rows and isinstance(rows[0], dict) else {}
+    activation_gate = report.get("activation_gate", {}) if isinstance(report, dict) else {}
     model = report.get("lineup_adjustments", {}) if isinstance(report, dict) else {}
+    if not (
+        isinstance(activation_gate, dict)
+        and activation_gate.get("passes") is True
+        and isinstance(model, dict)
+        and model.get("safety_approved") is True
+    ):
+        model = {}
     STRATEGY_ADJUSTMENT_CACHE["loaded_at"] = now
     STRATEGY_ADJUSTMENT_CACHE["model"] = model if isinstance(model, dict) else {}
     return STRATEGY_ADJUSTMENT_CACHE["model"]
@@ -8256,16 +8355,21 @@ def build_strategy_performance_report(auth_token=""):
 
     entries = supabase_data_request(
         "contest_entries",
-        query="sport=eq.MLB&select=id,strategy_mode,status,entry_fee,payout,net_profit,actual_rank,field_size,slate_key&order=entered_at.desc&limit=5000",
+        query="sport=eq.MLB&select=id,strategy_mode,status,entry_fee,payout,net_profit,actual_rank,field_size,slate_key,contest_profile_id,source&order=entered_at.desc&limit=5000",
         auth_token=auth_token,
     )
     entries = entries if isinstance(entries, list) else []
     settled_entries = [entry for entry in entries if str(entry.get("status")) == "settled"]
+    verified_settled_entries = [
+        entry for entry in settled_entries if str(entry.get("contest_profile_id") or "").strip()
+    ]
     entry_fees = sum(safe_float(entry.get("entry_fee"), 0) for entry in settled_entries)
     payouts = sum(safe_float(entry.get("payout"), 0) for entry in settled_entries)
     profit_summary = {
         "tracked_entries": len(entries),
         "settled_entries": len(settled_entries),
+        "verified_exact_contest_entries": len(verified_settled_entries),
+        "unassigned_settled_entries": len(settled_entries) - len(verified_settled_entries),
         "cashes": sum(safe_float(entry.get("payout"), 0) > 0 for entry in settled_entries),
         "cash_rate": round(100 * sum(safe_float(entry.get("payout"), 0) > 0 for entry in settled_entries) / len(settled_entries), 2) if settled_entries else 0,
         "entry_fees": round(entry_fees, 2),
@@ -8287,11 +8391,33 @@ def build_strategy_performance_report(auth_token=""):
     profit_summary["by_strategy"] = entry_by_strategy
     lineup_adjustments = build_empirical_lineup_adjustments(unique_rows)
     walk_forward_average = round(statistics.fmean(row["average_field_percentile"] for row in walk_forward_rows), 3) if walk_forward_rows else 0
+    overall_summary = lineup_performance_summary(unique_rows)
+    settled_slate_count = len({normalize_slate_key(entry.get("slate_key")) for entry in verified_settled_entries})
+    candidate_learning_ready = bool(lineup_adjustments.get("active"))
+    activation_checks = {
+        "construction_evidence": candidate_learning_ready,
+        "minimum_verified_entries": len(verified_settled_entries) >= 50,
+        "minimum_verified_slates": settled_slate_count >= 8,
+        "positive_real_roi": profit_summary["roi_percent"] > 0,
+        "walk_forward_edge": len(walk_forward_rows) >= 5 and walk_forward_average >= 55,
+        "projection_signal": safe_float(overall_summary.get("projection_actual_correlation"), 0) >= 0.20,
+    }
+    safety_passes = all(activation_checks.values())
+    lineup_adjustments["candidate_active"] = candidate_learning_ready
+    lineup_adjustments["safety_approved"] = safety_passes
+    lineup_adjustments["active"] = safety_passes
+    lineup_adjustments["strength"] = 0.35 if safety_passes else 0.0
+    lineup_adjustments["status"] = "bounded_active" if safety_passes else "shadow_validation"
+    lineup_adjustments["note"] = (
+        "Construction adjustments passed real-entry, out-of-sample, and projection-signal gates."
+        if safety_passes else
+        "Construction patterns remain visible for analysis but cannot influence new lineups until real-entry and unseen-slate safety gates pass."
+    )
     report = {
         "success": True,
         "status": "shadow_validation",
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "model_version": "mlb-strategy-learning-v2",
+        "model_version": "mlb-strategy-learning-v3-safety-gated",
         "data_quality": {
             "run_count": len(runs),
             "recorded_lineups": recorded_lineups,
@@ -8302,7 +8428,7 @@ def build_strategy_performance_report(auth_token=""):
             "duplicate_rate": round(100 * duplicate_count / len(observations), 2) if observations else 0,
             "slate_count": len(slate_order),
         },
-        "overall": lineup_performance_summary(unique_rows),
+        "overall": overall_summary,
         "by_strategy": by_strategy,
         "walk_forward": {
             "test_slate_count": len(walk_forward_rows),
@@ -8313,14 +8439,17 @@ def build_strategy_performance_report(auth_token=""):
         "lineup_adjustments": lineup_adjustments,
     }
     report["activation_gate"] = {
-        "passes": bool(lineup_adjustments.get("active")),
-        "status": "bounded_learning_active" if lineup_adjustments.get("active") else ("tracking_real_profit" if profit_summary["settled_entries"] < 25 else "needs_out_of_sample_edge"),
-        "minimum_settled_entries": 25,
+        "passes": safety_passes,
+        "status": "bounded_learning_active" if safety_passes else "safety_hold",
+        "checks": activation_checks,
+        "minimum_settled_entries": 50,
+        "verified_settled_slates": settled_slate_count,
+        "minimum_verified_slates": 8,
         "minimum_walk_forward_slates": 5,
         "message": (
             "Validated construction patterns now influence new MLB lineups at a capped 35% strength; full-strength strategy learning still requires more settled entries and positive unseen-slate results."
-            if lineup_adjustments.get("active") else
-            "Strategy learning remains in shadow mode until it has enough completed slates and reliable construction buckets."
+            if safety_passes else
+            "Strategy learning is held in shadow mode because it has not yet proven positive real-entry ROI, repeatable unseen-slate edge, and useful projection correlation."
         ),
     }
     return report
@@ -8333,9 +8462,13 @@ def model_performance_status(authorization: str = Header("")):
         raise HTTPException(status_code=403, detail="Admin access required.")
     report = build_strategy_performance_report(auth_token)
     adjustments = report.get("lineup_adjustments") if isinstance(report, dict) else {}
-    if isinstance(adjustments, dict) and adjustments.get("active"):
+    gate = report.get("activation_gate") if isinstance(report, dict) else {}
+    if isinstance(adjustments, dict) and adjustments.get("active") and isinstance(gate, dict) and gate.get("passes"):
         STRATEGY_ADJUSTMENT_CACHE["loaded_at"] = time.time()
         STRATEGY_ADJUSTMENT_CACHE["model"] = adjustments
+    else:
+        STRATEGY_ADJUSTMENT_CACHE["loaded_at"] = time.time()
+        STRATEGY_ADJUSTMENT_CACHE["model"] = {}
     return report
 
 
@@ -8350,11 +8483,11 @@ def run_model_performance_report(authorization: str = Header("")):
         method="POST",
         payload={
             "sport": "MLB",
-            "model_version": report.get("model_version", "mlb-strategy-learning-v2"),
+            "model_version": report.get("model_version", "mlb-strategy-learning-v3-safety-gated"),
             "slate_count": safe_int((report.get("data_quality") or {}).get("slate_count"), 0),
             "lineup_count": safe_int((report.get("data_quality") or {}).get("unique_lineups"), 0),
             "report": report,
-            "is_active": bool((report.get("lineup_adjustments") or {}).get("active")),
+            "is_active": bool((report.get("activation_gate") or {}).get("passes")),
         },
         prefer="return=representation",
         auth_token=auth_token,
@@ -11272,6 +11405,10 @@ def v4_lineup_objective(lineup, mode="gpp", style="balanced", correlation_enable
     core_score = safe_float(core.get("average_core_play_score", 50), 50)
     primary_stack_size = safe_int(stack.get("primary_stack_size", stack.get("stack_size", 0)), 0)
     average_ownership = sum(safe_float(player.get("ownership", 12), 12) for player in lineup) / max(1, len(lineup))
+    ownership_confidence = statistics.fmean([
+        0.40 if player.get("ownership_estimated", True) else 1.0
+        for player in lineup
+    ]) if lineup else 0.40
     # Completed-slate evidence currently favors four-hitter stacks over both
     # two-hitter mini stacks and automatic five-hitter stacks. Keep five viable,
     # but stop awarding it an overwhelming hard-coded bonus.
@@ -11287,7 +11424,7 @@ def v4_lineup_objective(lineup, mode="gpp", style="balanced", correlation_enable
         nuclear_profile = v4_nuclear_lineup_profile(lineup)
         ownership_sweet_spot = max(0.0, 24.0 - abs(average_ownership - 11.5) * 4.0)
         extreme_contrarian_penalty = max(0.0, 8.0 - average_ownership) * 12.0
-        return p99 * 1.82 + p95 * 0.35 + projection * 0.12 + stack_score * 2.18 * stack_weight + lev_score * 1.68 + uniq * 1.42 - chalk * 0.62 + salary_score + nuclear_stack_bonus + ownership_sweet_spot - extreme_contrarian_penalty + safe_float(nuclear_profile.get("barbell_score", 0), 0) * 2.10 + learned_score
+        return p99 * 1.82 + p95 * 0.35 + projection * 0.12 + stack_score * 2.18 * stack_weight + lev_score * 1.68 * ownership_confidence + uniq * 1.42 * ownership_confidence - chalk * 0.62 + salary_score + nuclear_stack_bonus + ownership_sweet_spot * ownership_confidence - extreme_contrarian_penalty + safe_float(nuclear_profile.get("barbell_score", 0), 0) * 2.10 + learned_score
     if style == "aggressive":
         return p99 * 1.10 + p95 * 1.05 + stack_score * 1.75 * stack_weight + lev_score * 1.32 + uniq * 0.92 - chalk * 0.38 + salary_score + learned_score
     if style == "single_entry":
@@ -11452,8 +11589,10 @@ def build_fast_multi_lineups_for_pro(request, count):
         )
     else:
         candidates.sort(key=lambda x: (safe_float(x.get("optimizer_score", 0), 0), safe_float(x.get("takedown_strength", 0), 0), safe_float(x.get("ceiling_score", 0), 0)), reverse=True)
-    max_exposure = min(max(safe_int(getattr(request, "max_exposure", 65), 65), 20), 100)
-    max_same = min(max(safe_int(getattr(request, "max_same_players", 7), 7), 3), 9)
+    requested_max_exposure = min(max(safe_int(getattr(request, "max_exposure", 60), 60), 20), 100)
+    max_exposure = min(requested_max_exposure, 50) if style == "nuclear" and count > 1 else requested_max_exposure
+    requested_max_same = min(max(safe_int(getattr(request, "max_same_players", 7), 7), 3), 9)
+    max_same = min(requested_max_same, 6) if style == "nuclear" and count > 1 else requested_max_same
     selected = diversify_lineups(
         all_lineups=candidates,
         count=count,
@@ -11463,16 +11602,6 @@ def build_fast_multi_lineups_for_pro(request, count):
         player_min_exposure=getattr(request, "player_min_exposure", {}),
         player_max_exposure=getattr(request, "player_max_exposure", {}),
     )
-    if len(selected) < count:
-        # Fill without similarity restriction if user constraints are too tight.
-        existing = {lineup_key(x["lineup"]) for x in selected}
-        for cand in candidates:
-            if len(selected) >= count:
-                break
-            k = lineup_key(cand["lineup"])
-            if k not in existing:
-                selected.append(cand)
-                existing.add(k)
     selected.sort(key=lambda x: safe_float(x.get("optimizer_score", 0), 0), reverse=True)
     report = dict(trim_report or {})
     report.update({
@@ -11482,6 +11611,10 @@ def build_fast_multi_lineups_for_pro(request, count):
         "hard_max_hitters_per_team": max_players_per_team,
         "candidate_count": len(candidates),
         "returned_count": len(selected),
+        "requested_max_exposure": requested_max_exposure,
+        "effective_max_exposure": max_exposure,
+        "requested_max_same_players": requested_max_same,
+        "effective_max_same_players": max_same,
         "v4_attempts": attempts,
         "stack_teams_tested": stack_teams[:12],
         "timeout_safe": True,
@@ -11602,7 +11735,13 @@ def lineup_quality_profile(lineup, mode="gpp"):
     takedown = round(max(0, min(100, takedown)), 1)
     return {
         "lineup_quality_score": quality,
+        # This is a relative construction score, not a contest-calibrated chance
+        # of finishing first. Only the contest simulator may report probability.
+        # Kept for older mobile clients; it is explicitly marked uncalibrated
+        # and newer clients should present takedown_profile_score instead.
         "win_probability": round(max(0, min(100, takedown * 0.72)), 2),
+        "win_probability_is_calibrated": False,
+        "takedown_profile_score": takedown,
         "takedown_strength": takedown,
         "lineup_quality_label": label,
         "lineup_quality_breakdown": {
