@@ -60,6 +60,24 @@ class AdminIngestionTests(unittest.TestCase):
         self.assertEqual(profile["draftkings_contest_id"], "194992499")
         self.assertEqual(request.call_args_list[1].kwargs["method"], "PATCH")
 
+    def test_final_draftkings_field_can_safely_replace_the_prelock_capacity(self):
+        standings = {"summary": {"observation_count": 10294, "field_size": 10294}, "scores": [100]}
+        contest = [{
+            "id": "contest-1", "slate_key": "2026-09-05-main", "name": "Main GPP",
+            "field_size": 10200, "draftkings_contest_id": None,
+        }]
+        with patch.object(main, "supabase_data_request", side_effect=[contest, []]) as request:
+            profile, error = main.validate_result_contest_assignment(
+                "2026-09-05-main", "contest-1", standings,
+                "contest-standings-195000001.csv", "admin-token",
+            )
+        self.assertIsNone(error)
+        self.assertTrue(profile["field_size_adjusted"])
+        self.assertEqual(profile["field_size_estimate"], 10200)
+        self.assertEqual(profile["field_size"], 10294)
+        self.assertEqual(request.call_args_list[1].kwargs["payload"]["field_size"], 10294)
+        self.assertEqual(request.call_args_list[1].kwargs["payload"]["draftkings_contest_id"], "195000001")
+
     def test_named_contest_slates_remain_isolated(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(
             main, "SLATE_LIBRARY_DIR", Path(directory)

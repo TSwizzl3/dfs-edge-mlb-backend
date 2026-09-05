@@ -629,12 +629,22 @@ def validate_result_contest_assignment(
         )
 
     expected_field_size = safe_int(profile.get("field_size"), 0)
+    field_size_update = None
     if standings_count > 0 and expected_field_size > 0 and standings_field_size != expected_field_size:
-        return None, (
-            f"Results were blocked before learning: the uploaded standings contain {standings_field_size:,} entries, "
-            f"but {profile.get('name') or 'the selected contest'} is saved with {expected_field_size:,}. "
-            "Choose the matching contest or correct its field size."
-        )
+        # DraftKings shows a contest capacity before lock. The final GameCenter
+        # export contains the actual entrant count, which can be slightly above
+        # or below that estimate. Accept a narrow 5% variance and preserve the
+        # much wider mismatch guard that prevents cross-contest contamination.
+        allowed_variance = max(25, math.ceil(expected_field_size * 0.05))
+        field_size_difference = abs(standings_field_size - expected_field_size)
+        if field_size_difference > allowed_variance:
+            return None, (
+                f"Results were blocked before learning: the uploaded standings contain {standings_field_size:,} entries, "
+                f"but {profile.get('name') or 'the selected contest'} is saved with {expected_field_size:,}. "
+                f"Final DraftKings fields may vary by up to {allowed_variance:,} entries for this contest; "
+                "this difference is too large to safely assume it is the same contest."
+            )
+        field_size_update = standings_field_size
 
     filename_contest_id = draftkings_contest_id_from_filename(filename)
     saved_contest_id = str(profile.get("draftkings_contest_id") or "").strip()
@@ -644,16 +654,24 @@ def validate_result_contest_assignment(
             f"is linked to {saved_contest_id}."
         )
 
+    contest_updates = {}
+    if field_size_update:
+        contest_updates["field_size"] = field_size_update
+        profile["field_size_estimate"] = expected_field_size
+        profile["field_size"] = field_size_update
+        profile["field_size_adjusted"] = True
     if standings_count > 0 and filename_contest_id and not saved_contest_id:
+        contest_updates["draftkings_contest_id"] = filename_contest_id
+        profile["draftkings_contest_id"] = filename_contest_id
+    if contest_updates:
         supabase_data_request(
             "contest_profiles",
             method="PATCH",
             query=f"id=eq.{encoded_id}",
-            payload={"draftkings_contest_id": filename_contest_id},
+            payload=contest_updates,
             prefer="return=minimal",
             auth_token=auth_token,
         )
-        profile["draftkings_contest_id"] = filename_contest_id
     return profile, None
 
 
@@ -7973,7 +7991,7 @@ async def upload_actual_results_csv(
         or metadata.get("slate_name")
         or datetime.now(timezone.utc).date().isoformat()
     )
-    _, contest_assignment_error = validate_result_contest_assignment(
+    validated_contest, contest_assignment_error = validate_result_contest_assignment(
         resolved_slate_key,
         contest_profile_id,
         contest_standings,
@@ -8074,6 +8092,8 @@ async def upload_actual_results_csv(
         "backtest_persisted": backtest_persisted,
         "calibration_persisted": calibration_persisted,
         "result_import_persisted": result_import_persisted,
+        "contest_field_size_adjusted": bool((validated_contest or {}).get("field_size_adjusted")),
+        "contest_field_size": safe_int((validated_contest or {}).get("field_size"), 0) or None,
         "entry_evidence": entry_evidence,
     }
 
