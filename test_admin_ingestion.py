@@ -121,7 +121,25 @@ class AdminIngestionTests(unittest.TestCase):
         self.assertEqual(result["effective_count"], 4)
         self.assertEqual(result["returned_count"], 4)
         self.assertEqual(len(result["lineups"]), 4)
-        learning_run.assert_called_once_with(request, lineups, "")
+        learning_run.assert_called_once_with(request, lineups, "", "champion", "")
+
+    def test_hidden_challenger_is_recorded_but_never_returned(self):
+        request = main.MultiOptimizeRequest(count=1)
+        champion = [{"lineup": [{"name": "Champion"}], "projected_points": 100}]
+        challenger = [{"lineup": [{"name": "Challenger"}], "projected_points": 99}]
+        trim_report = {"_challenger_lineups": challenger, "shadow_challenger_ready": True}
+        with patch.object(main, "build_fast_multi_lineups_for_pro", return_value=(champion, None, trim_report, 2)), patch.object(
+            main, "calculate_exposures", return_value=[]
+        ), patch.object(main, "record_lineup_learning_run") as learning_run:
+            result = main.optimize_multiple_lineups(request, {"role": "admin"})
+        self.assertEqual(result["lineups"], champion)
+        self.assertNotIn("_challenger_lineups", result["trim_report"])
+        self.assertEqual(learning_run.call_count, 2)
+        champion_call, challenger_call = learning_run.call_args_list
+        self.assertEqual(champion_call.args[3], "champion")
+        self.assertEqual(challenger_call.args[3], "challenger")
+        self.assertTrue(champion_call.args[4])
+        self.assertEqual(champion_call.args[4], challenger_call.args[4])
 
     def test_session_falls_back_to_direct_supabase_verification(self):
         with patch.object(main, "central_auth_request", return_value={"success": False}), patch.object(
@@ -1185,6 +1203,64 @@ class AdminIngestionTests(unittest.TestCase):
         with patch.object(main, "supabase_data_request", return_value=unsafe_report):
             model = main.load_live_strategy_adjustment_model(force=True)
         self.assertEqual(model, {})
+
+    def test_champion_challenger_promotes_gradually_after_recent_wins(self):
+        observations = []
+        for slate_number in range(5):
+            pair_id = f"pair-{slate_number}"
+            for variant, percentile in (("champion", 50), ("challenger", 55)):
+                for lineup_number in range(2):
+                    observations.append({
+                        "slate_key": f"2026-09-{slate_number + 1:02d}-main",
+                        "generated_at": f"2026-09-{slate_number + 1:02d}T10:00:00Z",
+                        "learning_variant": variant,
+                        "learning_pair_id": pair_id,
+                        "lineup_fingerprint": f"{variant}-{slate_number}-{lineup_number}",
+                        "field_percentile": percentile,
+                    })
+        evaluation = main.champion_challenger_evaluation(observations)
+        self.assertTrue(evaluation["passes"])
+        self.assertEqual(evaluation["live_strength"], 0.10)
+        self.assertEqual(evaluation["paired_slates"], 5)
+        self.assertEqual(evaluation["average_uplift"], 5)
+
+    def test_champion_challenger_rolls_back_after_recent_regression(self):
+        observations = []
+        for slate_number in range(8):
+            pair_id = f"pair-{slate_number}"
+            challenger = 57 if slate_number < 6 else 40
+            for variant, percentile in (("champion", 50), ("challenger", challenger)):
+                for lineup_number in range(2):
+                    observations.append({
+                        "slate_key": f"2026-09-{slate_number + 1:02d}-main",
+                        "generated_at": f"2026-09-{slate_number + 1:02d}T10:00:00Z",
+                        "learning_variant": variant,
+                        "learning_pair_id": pair_id,
+                        "lineup_fingerprint": f"{variant}-{slate_number}-{lineup_number}",
+                        "field_percentile": percentile,
+                    })
+        evaluation = main.champion_challenger_evaluation(observations)
+        self.assertFalse(evaluation["passes"])
+        self.assertEqual(evaluation["live_strength"], 0)
+        self.assertFalse(evaluation["regression_guard_passes"])
+
+    def test_persisted_failed_challenger_deactivates_the_old_live_model(self):
+        report = {
+            "model_version": "test-v4",
+            "data_quality": {"slate_count": 5, "unique_lineups": 10},
+            "activation_gate": {"passes": False},
+        }
+        with patch.object(main, "build_strategy_performance_report", return_value=report), patch.object(
+            main, "supabase_data_request", side_effect=[[], [{"id": "new-report"}]]
+        ) as request, patch.object(main, "load_live_strategy_adjustment_model"), patch.object(
+            main, "load_shadow_strategy_adjustment_model"
+        ):
+            saved, persisted = main.persist_strategy_performance_report("admin-token")
+        self.assertTrue(persisted)
+        self.assertEqual(saved, report)
+        self.assertEqual(request.call_args_list[0].kwargs["method"], "PATCH")
+        self.assertEqual(request.call_args_list[0].kwargs["payload"], {"is_active": False})
+        self.assertFalse(request.call_args_list[1].kwargs["payload"]["is_active"])
 
     def test_performance_report_deduplicates_and_walks_forward(self):
         runs = []

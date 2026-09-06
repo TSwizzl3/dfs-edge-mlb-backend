@@ -1754,6 +1754,8 @@ def compact_learning_lineups(lineups):
                 "projected_points": round(safe_float(lineup.get("projected_points"), 0), 3),
                 "optimizer_score": round(safe_float(lineup.get("optimizer_score"), 0), 3),
                 "builder_style": lineup.get("builder_style"),
+                "learning_variant": str(lineup.get("learning_variant") or "legacy"),
+                "learning_pair_id": str(lineup.get("learning_pair_id") or ""),
                 "lineup_fingerprint": learning_lineup_fingerprint(players),
                 "lineup": players,
             })
@@ -1798,16 +1800,23 @@ def learning_lineup_features(lineup):
     }
 
 
-def record_lineup_learning_run(request, lineups, auth_token=""):
+def record_lineup_learning_run(request, lineups, auth_token="", learning_variant="champion", learning_pair_id=""):
     compact = compact_learning_lineups(lineups)
     if not compact:
         return False
+    learning_variant = str(learning_variant or "champion").strip().lower()
+    learning_pair_id = str(learning_pair_id or "").strip()
+    for lineup in compact:
+        lineup["learning_variant"] = learning_variant
+        lineup["learning_pair_id"] = learning_pair_id
     settings = {
         "mode": str(getattr(request, "mode", "balanced") or "balanced").lower(),
         "max_players_per_team": safe_int(getattr(request, "max_players_per_team", 5), 5),
         "force_team_stack": bool(getattr(request, "force_team_stack", False)),
         "avoid_pitcher_vs_hitter": bool(getattr(request, "avoid_pitcher_vs_hitter", True)),
         "randomness": safe_int(getattr(request, "randomness", 0), 0),
+        "learning_variant": learning_variant,
+        "learning_pair_id": learning_pair_id,
     }
     rows = supabase_data_request(
         "mlb_lineup_runs",
@@ -8069,6 +8078,13 @@ async def upload_actual_results_csv(
     ownership_sample_size = safe_int(((result.get("ownership") or {}).get("overall") or {}).get("sample_size"), 0)
     ownership_status = ((calibration_model.get("validation") or {}).get("ownership") or {}).get("gate", "collecting")
     response_payload = {key: value for key, value in payload.items() if key != "observations"}
+    # Re-score the hidden challenger after every completed-slate import. This is
+    # deliberately background work so a large history cannot delay the upload.
+    threading.Thread(
+        target=persist_strategy_performance_report,
+        args=(admin_token,),
+        daemon=True,
+    ).start()
     return {
         **response_payload,
         "message": (
@@ -8230,6 +8246,7 @@ def build_empirical_lineup_adjustments(rows):
 
 
 STRATEGY_ADJUSTMENT_CACHE = {"loaded_at": 0.0, "model": {}}
+SHADOW_STRATEGY_ADJUSTMENT_CACHE = {"loaded_at": 0.0, "model": {}}
 
 
 def load_live_strategy_adjustment_model(force=False):
@@ -8255,9 +8272,36 @@ def load_live_strategy_adjustment_model(force=False):
     return STRATEGY_ADJUSTMENT_CACHE["model"]
 
 
-def live_lineup_learning_adjustment(lineup):
-    model = load_live_strategy_adjustment_model()
-    if not bool(model.get("active")):
+def load_shadow_strategy_adjustment_model(force=False):
+    """Load the newest learned construction candidate, even while it is hidden."""
+    now = time.time()
+    if not force and now - safe_float(SHADOW_STRATEGY_ADJUSTMENT_CACHE.get("loaded_at"), 0) < 300:
+        return SHADOW_STRATEGY_ADJUSTMENT_CACHE.get("model") or {}
+    rows = supabase_data_request(
+        "strategy_backtest_reports",
+        query="sport=eq.MLB&select=report,created_at&order=created_at.desc&limit=1",
+    )
+    report = rows[0].get("report", {}) if isinstance(rows, list) and rows and isinstance(rows[0], dict) else {}
+    model = report.get("lineup_adjustments", {}) if isinstance(report, dict) else {}
+    if not isinstance(model, dict) or not bool(model.get("candidate_active") or model.get("active")):
+        model = {}
+    SHADOW_STRATEGY_ADJUSTMENT_CACHE["loaded_at"] = now
+    SHADOW_STRATEGY_ADJUSTMENT_CACHE["model"] = model
+    return model
+
+
+def score_lineup_learning_adjustment(lineup, model, candidate=False):
+    if not isinstance(model, dict):
+        return {"score": 0.0, "strength": 0.0, "reasons": []}
+    if candidate:
+        enabled = bool(model.get("candidate_active") or model.get("active"))
+        default_strength = 0.35
+        requested_strength = model.get("candidate_strength", default_strength)
+    else:
+        enabled = bool(model.get("active"))
+        default_strength = 0.0
+        requested_strength = model.get("strength", default_strength)
+    if not enabled:
         return {"score": 0.0, "strength": 0.0, "reasons": []}
     features = learning_lineup_features({"lineup": lineup})
     dimensions = model.get("dimensions") if isinstance(model.get("dimensions"), dict) else {}
@@ -8274,9 +8318,108 @@ def live_lineup_learning_adjustment(lineup):
         value = safe_float(detail.get("adjustment"), 0)
         total += value
         reasons.append({"feature": dimension, "bucket": bucket, "effect": round(value, 3)})
-    strength = max(0.0, min(0.35, safe_float(model.get("strength"), 0)))
+    strength = max(0.0, min(0.35, safe_float(requested_strength, default_strength)))
     # One learned percentile point is worth five optimizer points at full strength.
     return {"score": round(total * strength * 5.0, 3), "strength": strength, "reasons": reasons}
+
+
+def live_lineup_learning_adjustment(lineup):
+    return score_lineup_learning_adjustment(lineup, load_live_strategy_adjustment_model(), candidate=False)
+
+
+def shadow_lineup_learning_adjustment(lineup):
+    return score_lineup_learning_adjustment(lineup, load_shadow_strategy_adjustment_model(), candidate=True)
+
+
+def champion_challenger_evaluation(observations):
+    """Compare hidden learned portfolios with their same-slate live baselines."""
+    paired = {}
+    for row in observations or []:
+        if not isinstance(row, dict) or row.get("field_percentile") is None:
+            continue
+        variant = str(row.get("learning_variant") or "legacy").strip().lower()
+        pair_id = str(row.get("learning_pair_id") or "").strip()
+        if variant not in {"champion", "challenger"} or not pair_id:
+            continue
+        slate_key = normalize_slate_key(row.get("slate_key"))
+        group = paired.setdefault((slate_key, pair_id), {"champion": {}, "challenger": {}, "generated_at": row.get("generated_at")})
+        fingerprint = str(row.get("lineup_fingerprint") or "")
+        group[variant].setdefault(fingerprint, safe_float(row.get("field_percentile"), 0))
+
+    portfolio_comparisons = []
+    for (slate_key, pair_id), group in paired.items():
+        champions = list(group["champion"].values())
+        challengers = list(group["challenger"].values())
+        if not champions or not challengers:
+            continue
+        champion_average = statistics.fmean(champions)
+        challenger_average = statistics.fmean(challengers)
+        portfolio_comparisons.append({
+            "slate_key": slate_key,
+            "learning_pair_id": pair_id,
+            "generated_at": group.get("generated_at"),
+            "champion_lineups": len(champions),
+            "challenger_lineups": len(challengers),
+            "matched_lineups": min(len(champions), len(challengers)),
+            "champion_average_field_percentile": round(champion_average, 3),
+            "challenger_average_field_percentile": round(challenger_average, 3),
+            "uplift": round(challenger_average - champion_average, 3),
+        })
+
+    slate_groups = {}
+    for comparison in portfolio_comparisons:
+        slate_groups.setdefault(comparison["slate_key"], []).append(comparison)
+    slate_comparisons = []
+    for slate_key, rows in slate_groups.items():
+        slate_comparisons.append({
+            "slate_key": slate_key,
+            "generated_at": max(str(row.get("generated_at") or "") for row in rows),
+            "portfolio_pairs": len(rows),
+            "matched_lineups": sum(safe_int(row.get("matched_lineups"), 0) for row in rows),
+            "champion_average_field_percentile": round(statistics.fmean(row["champion_average_field_percentile"] for row in rows), 3),
+            "challenger_average_field_percentile": round(statistics.fmean(row["challenger_average_field_percentile"] for row in rows), 3),
+            "uplift": round(statistics.fmean(row["uplift"] for row in rows), 3),
+        })
+    slate_comparisons.sort(key=lambda row: (str(row.get("generated_at") or ""), row["slate_key"]))
+    recent = slate_comparisons[-8:]
+    paired_slates = len(recent)
+    paired_lineups = sum(safe_int(row.get("matched_lineups"), 0) for row in recent)
+    champion_average = statistics.fmean(row["champion_average_field_percentile"] for row in recent) if recent else 0
+    challenger_average = statistics.fmean(row["challenger_average_field_percentile"] for row in recent) if recent else 0
+    uplift = statistics.fmean(row["uplift"] for row in recent) if recent else 0
+    win_rate = 100 * sum(row["uplift"] > 0 for row in recent) / paired_slates if paired_slates else 0
+    recent_two = recent[-2:]
+    regression_guard = not recent_two or statistics.fmean(row["uplift"] for row in recent_two) >= -5
+
+    strength = 0.0
+    stage = "shadow"
+    if paired_slates >= 8 and paired_lineups >= 16 and uplift >= 5 and win_rate >= 62 and challenger_average >= 52 and regression_guard:
+        strength, stage = 0.35, "promoted_35_percent"
+    elif paired_slates >= 6 and paired_lineups >= 12 and uplift >= 4 and win_rate >= 60 and challenger_average >= 51 and regression_guard:
+        strength, stage = 0.20, "promoted_20_percent"
+    elif paired_slates >= 5 and paired_lineups >= 10 and uplift >= 3 and win_rate >= 60 and challenger_average >= 50 and regression_guard:
+        strength, stage = 0.10, "promoted_10_percent"
+
+    return {
+        "status": stage,
+        "passes": strength > 0,
+        "live_strength": strength,
+        "paired_slates": paired_slates,
+        "paired_lineups": paired_lineups,
+        "champion_average_field_percentile": round(champion_average, 3),
+        "challenger_average_field_percentile": round(challenger_average, 3),
+        "average_uplift": round(uplift, 3),
+        "challenger_slate_win_rate": round(win_rate, 2),
+        "regression_guard_passes": regression_guard,
+        "minimum_paired_slates": 5,
+        "window_size": 8,
+        "recent_slates": recent,
+        "message": (
+            f"The learned challenger is influencing live builds at {round(strength * 100)}% strength. It will automatically step down or return to shadow mode if recent performance weakens."
+            if strength > 0 else
+            "The learned challenger is being scored invisibly beside the live builder. It needs at least five paired slates and a repeatable recent edge before it can influence user lineups."
+        ),
+    }
 
 
 def build_strategy_performance_report(auth_token=""):
@@ -8320,6 +8463,8 @@ def build_strategy_performance_report(auth_token=""):
                 "slate_key": normalize_slate_key(run.get("slate_key")),
                 "generated_at": run.get("generated_at"),
                 "strategy_mode": canonical_mlb_strategy_mode(lineup.get("builder_style") or run.get("strategy_mode")),
+                "learning_variant": str(lineup.get("learning_variant") or "legacy"),
+                "learning_pair_id": str(lineup.get("learning_pair_id") or ""),
                 "actual_score": safe_float(result.get("actual_score"), 0),
                 "estimated_rank": safe_int(result.get("estimated_rank"), 0) or None,
                 "field_percentile": safe_float(result.get("field_percentile"), -1) if result.get("field_percentile") is not None else None,
@@ -8409,6 +8554,9 @@ def build_strategy_performance_report(auth_token=""):
             "roi_percent": round(100 * (mode_payouts - mode_fees) / mode_fees, 2) if mode_fees > 0 else 0,
         }
     profit_summary["by_strategy"] = entry_by_strategy
+    # Historical/user-facing summaries remain de-duplicated, while the paired
+    # audit deliberately uses both members of each forward-tested pair.
+    champion_challenger = champion_challenger_evaluation(observations)
     lineup_adjustments = build_empirical_lineup_adjustments(unique_rows)
     walk_forward_average = round(statistics.fmean(row["average_field_percentile"] for row in walk_forward_rows), 3) if walk_forward_rows else 0
     overall_summary = lineup_performance_summary(unique_rows)
@@ -8416,28 +8564,31 @@ def build_strategy_performance_report(auth_token=""):
     candidate_learning_ready = bool(lineup_adjustments.get("active"))
     activation_checks = {
         "construction_evidence": candidate_learning_ready,
-        "minimum_verified_entries": len(verified_settled_entries) >= 50,
-        "minimum_verified_slates": settled_slate_count >= 8,
-        "positive_real_roi": profit_summary["roi_percent"] > 0,
-        "walk_forward_edge": len(walk_forward_rows) >= 5 and walk_forward_average >= 55,
-        "projection_signal": safe_float(overall_summary.get("projection_actual_correlation"), 0) >= 0.20,
+        "minimum_paired_slates": safe_int(champion_challenger.get("paired_slates"), 0) >= 5,
+        "minimum_paired_lineups": safe_int(champion_challenger.get("paired_lineups"), 0) >= 10,
+        "recent_challenger_edge": safe_float(champion_challenger.get("average_uplift"), 0) >= 3,
+        "repeatable_slate_wins": safe_float(champion_challenger.get("challenger_slate_win_rate"), 0) >= 60,
+        "challenger_above_field_median": safe_float(champion_challenger.get("challenger_average_field_percentile"), 0) >= 50,
+        "regression_guard": champion_challenger.get("regression_guard_passes") is True,
     }
-    safety_passes = all(activation_checks.values())
+    safety_passes = candidate_learning_ready and champion_challenger.get("passes") is True
+    promoted_strength = max(0.0, min(0.35, safe_float(champion_challenger.get("live_strength"), 0))) if safety_passes else 0.0
     lineup_adjustments["candidate_active"] = candidate_learning_ready
+    lineup_adjustments["candidate_strength"] = 0.35 if candidate_learning_ready else 0.0
     lineup_adjustments["safety_approved"] = safety_passes
     lineup_adjustments["active"] = safety_passes
-    lineup_adjustments["strength"] = 0.35 if safety_passes else 0.0
+    lineup_adjustments["strength"] = promoted_strength
     lineup_adjustments["status"] = "bounded_active" if safety_passes else "shadow_validation"
     lineup_adjustments["note"] = (
-        "Construction adjustments passed real-entry, out-of-sample, and projection-signal gates."
+        "Construction adjustments beat the same-slate champion in a recent paired forward test and are being introduced gradually."
         if safety_passes else
-        "Construction patterns remain visible for analysis but cannot influence new lineups until real-entry and unseen-slate safety gates pass."
+        "Construction patterns are producing hidden challenger portfolios and cannot influence user lineups until they beat the live champion on recent paired slates."
     )
     report = {
         "success": True,
         "status": "shadow_validation",
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "model_version": "mlb-strategy-learning-v3-safety-gated",
+        "model_version": "mlb-strategy-learning-v4-champion-challenger",
         "data_quality": {
             "run_count": len(runs),
             "recorded_lineups": recorded_lineups,
@@ -8455,6 +8606,7 @@ def build_strategy_performance_report(auth_token=""):
             "average_field_percentile": walk_forward_average,
             "tests": walk_forward_rows,
         },
+        "champion_challenger": champion_challenger,
         "profit": profit_summary,
         "lineup_adjustments": lineup_adjustments,
     }
@@ -8462,17 +8614,52 @@ def build_strategy_performance_report(auth_token=""):
         "passes": safety_passes,
         "status": "bounded_learning_active" if safety_passes else "safety_hold",
         "checks": activation_checks,
-        "minimum_settled_entries": 50,
+        "minimum_settled_entries": 0,
         "verified_settled_slates": settled_slate_count,
-        "minimum_verified_slates": 8,
-        "minimum_walk_forward_slates": 5,
+        "minimum_verified_slates": 0,
+        "minimum_walk_forward_slates": 0,
+        "promotion_strength": promoted_strength,
         "message": (
-            "Validated construction patterns now influence new MLB lineups at a capped 35% strength; full-strength strategy learning still requires more settled entries and positive unseen-slate results."
+            f"The paired challenger beat the live champion and now influences new MLB lineups at {round(promoted_strength * 100)}% strength. Automatic rollback remains active."
             if safety_passes else
-            "Strategy learning is held in shadow mode because it has not yet proven positive real-entry ROI, repeatable unseen-slate edge, and useful projection correlation."
+            "Strategy learning remains in shadow mode until the hidden challenger beats the current live builder across at least five recent paired slates. Lifetime profit is monitored but is not used as an unfair activation lock."
         ),
     }
     return report
+
+
+def persist_strategy_performance_report(auth_token=""):
+    """Persist the newest gate decision and make rollback immediately authoritative."""
+    report = build_strategy_performance_report(auth_token)
+    is_active = bool((report.get("activation_gate") or {}).get("passes"))
+    # There must be at most one authoritative live model. Deactivating old rows
+    # first makes a failed recent challenger test an actual automatic rollback.
+    supabase_data_request(
+        "strategy_backtest_reports",
+        method="PATCH",
+        query="sport=eq.MLB&is_active=eq.true",
+        payload={"is_active": False},
+        prefer="return=minimal",
+        auth_token=auth_token,
+    )
+    rows = supabase_data_request(
+        "strategy_backtest_reports",
+        method="POST",
+        payload={
+            "sport": "MLB",
+            "model_version": report.get("model_version", "mlb-strategy-learning-v4-champion-challenger"),
+            "slate_count": safe_int((report.get("data_quality") or {}).get("slate_count"), 0),
+            "lineup_count": safe_int((report.get("data_quality") or {}).get("unique_lineups"), 0),
+            "report": report,
+            "is_active": is_active,
+        },
+        prefer="return=representation",
+        auth_token=auth_token,
+    )
+    if isinstance(rows, list) and rows:
+        load_live_strategy_adjustment_model(force=True)
+        load_shadow_strategy_adjustment_model(force=True)
+    return report, bool(isinstance(rows, list) and rows)
 
 
 @app.get("/model/performance/status")
@@ -8497,24 +8684,8 @@ def run_model_performance_report(authorization: str = Header("")):
     auth_token = str(authorization or "").removeprefix("Bearer ").strip()
     if not auth_token or not is_admin_token(auth_token):
         raise HTTPException(status_code=403, detail="Admin access required.")
-    report = build_strategy_performance_report(auth_token)
-    rows = supabase_data_request(
-        "strategy_backtest_reports",
-        method="POST",
-        payload={
-            "sport": "MLB",
-            "model_version": report.get("model_version", "mlb-strategy-learning-v3-safety-gated"),
-            "slate_count": safe_int((report.get("data_quality") or {}).get("slate_count"), 0),
-            "lineup_count": safe_int((report.get("data_quality") or {}).get("unique_lineups"), 0),
-            "report": report,
-            "is_active": bool((report.get("activation_gate") or {}).get("passes")),
-        },
-        prefer="return=representation",
-        auth_token=auth_token,
-    )
-    if isinstance(rows, list) and rows:
-        load_live_strategy_adjustment_model(force=True)
-    return {**report, "persisted": bool(isinstance(rows, list) and rows)}
+    report, persisted = persist_strategy_performance_report(auth_token)
+    return {**report, "persisted": persisted}
 
 
 @app.get("/model/backtest/status")
@@ -8787,7 +8958,14 @@ def optimize_multiple_lineups(
     if not selected:
         return {"error": "No valid MLB lineups found with your current locks and excludes.", "lineups": [], "exposures": []}
 
-    record_lineup_learning_run(request, selected, str((session or {}).get("_access_token", "")))
+    challenger_lineups = trim_report.pop("_challenger_lineups", []) if isinstance(trim_report, dict) else []
+    pair_seed = f"{normalize_slate_key(request.slate_key or 'current')}:{time.time_ns()}:{learning_lineup_fingerprint(selected[0].get('lineup', []))}"
+    learning_pair_id = hashlib.sha256(pair_seed.encode("utf-8")).hexdigest()[:24] if challenger_lineups else ""
+    auth_token = str((session or {}).get("_access_token", ""))
+    record_lineup_learning_run(request, selected, auth_token, "champion", learning_pair_id)
+    if challenger_lineups:
+        record_lineup_learning_run(request, challenger_lineups, auth_token, "challenger", learning_pair_id)
+        trim_report["shadow_challenger_recorded"] = True
     return {
         "mode": request.mode,
         "requested_count": requested_count,
@@ -8815,6 +8993,8 @@ def export_lineups_csv(request: MultiOptimizeRequest, _: dict = Depends(require_
 
     # Use the same fast builder for export so Pro exports do not timeout on large MLB CSV slates.
     selected, error, trim_report, checked = build_fast_multi_lineups_for_pro(request, count)
+    if isinstance(trim_report, dict):
+        trim_report.pop("_challenger_lineups", None)
 
     if error:
         return {"success": False, "error": error, "csv": ""}
@@ -11623,6 +11803,34 @@ def build_fast_multi_lineups_for_pro(request, count):
         player_max_exposure=getattr(request, "player_max_exposure", {}),
     )
     selected.sort(key=lambda x: safe_float(x.get("optimizer_score", 0), 0), reverse=True)
+
+    # Produce a second, hidden portfolio from the exact same candidate pool.
+    # It is never returned to the user; completed-slate results compare it with
+    # the visible champion before learned construction can affect live builds.
+    shadow_model = load_shadow_strategy_adjustment_model()
+    shadow_candidates = []
+    if shadow_model:
+        for candidate in candidates:
+            shadow = dict(candidate)
+            live_adjustment = candidate.get("continuous_learning_adjustment") if isinstance(candidate.get("continuous_learning_adjustment"), dict) else {}
+            base_score = safe_float(candidate.get("optimizer_score"), 0) - safe_float(live_adjustment.get("score"), 0)
+            challenger_adjustment = score_lineup_learning_adjustment(candidate.get("lineup", []), shadow_model, candidate=True)
+            shadow["champion_optimizer_score"] = round(base_score + safe_float(live_adjustment.get("score"), 0), 3)
+            shadow["optimizer_score"] = round(base_score + safe_float(challenger_adjustment.get("score"), 0), 3)
+            shadow["continuous_learning_adjustment"] = challenger_adjustment
+            shadow["learning_variant"] = "challenger"
+            shadow_candidates.append(shadow)
+        shadow_candidates.sort(key=lambda x: (safe_float(x.get("optimizer_score"), 0), safe_float(x.get("takedown_strength", 0), 0)), reverse=True)
+    challenger_selected = diversify_lineups(
+        all_lineups=shadow_candidates,
+        count=count,
+        max_exposure=max_exposure,
+        max_same_players=max_same,
+        locked_players=locked_players,
+        player_min_exposure=getattr(request, "player_min_exposure", {}),
+        player_max_exposure=getattr(request, "player_max_exposure", {}),
+    ) if shadow_candidates else []
+    challenger_selected.sort(key=lambda x: safe_float(x.get("optimizer_score", 0), 0), reverse=True)
     report = dict(trim_report or {})
     report.update({
         "tournament_engine_version": TOURNAMENT_ENGINE_VERSION,
@@ -11639,7 +11847,10 @@ def build_fast_multi_lineups_for_pro(request, count):
         "stack_teams_tested": stack_teams[:12],
         "timeout_safe": True,
         "pool_count": len(pool),
+        "shadow_challenger_ready": bool(challenger_selected),
     })
+    # Private transport between the builder and endpoint; remove before response.
+    report["_challenger_lineups"] = challenger_selected[:count]
     return selected[:count], None, report, attempts
 
 
