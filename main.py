@@ -11702,9 +11702,18 @@ def build_fast_multi_lineups_for_pro(request, count):
 
     candidates = []
     seen = set()
-    # Bounded attempts keeps Render/live backend responsive.
-    attempts = min(900, max(220, count * (95 if style in ["aggressive", "nuclear"] else 70)))
+    # Keep tournament modes comfortably inside the web app's 90-second limit.
+    # A smaller, well-ranked candidate pool is enough for diversification and
+    # avoids spending the whole request enriching hundreds of duplicate builds.
+    search_started = time.monotonic()
+    search_time_budget_seconds = 24.0
+    target_candidates = min(700, max(120, count * 10))
+    attempts = min(480, max(180, count * (36 if style in ["aggressive", "nuclear"] else 28)))
+    attempts_completed = 0
     for i in range(attempts):
+        attempts_completed = i + 1
+        if time.monotonic() - search_started >= search_time_budget_seconds:
+            break
         stack_team = stack_teams[i % len(stack_teams)] if stack_teams else ""
         secondary_candidates = [t for t in stack_teams if correlation_enabled and t and t != stack_team]
         secondary_team = secondary_candidates[(i // max(1, len(stack_teams))) % len(secondary_candidates)] if secondary_candidates else None
@@ -11745,6 +11754,8 @@ def build_fast_multi_lineups_for_pro(request, count):
         if style == "nuclear":
             data["nuclear_construction_profile"] = v4_nuclear_lineup_profile(lineup)
         candidates.append(data)
+        if len(candidates) >= target_candidates:
+            break
 
     if not candidates:
         # Emergency final fallback: ignore min salary first, then return the best valid lineup rather than timing out.
@@ -11769,7 +11780,7 @@ def build_fast_multi_lineups_for_pro(request, count):
                     candidates.append(data)
                     break
         if not candidates:
-            return [], "The optimizer could not build a legal lineup from confirmed or likely starters. Refresh MLB starters, clear risky locks/excludes, or lower minimum salary.", {**trim_report, "builder_style": style, "v4_attempts": attempts}, attempts
+            return [], "The optimizer could not build a legal lineup from confirmed or likely starters. Refresh MLB starters, clear risky locks/excludes, or lower minimum salary.", {**trim_report, "builder_style": style, "v4_attempts": attempts_completed}, attempts_completed
 
     if style == "nuclear":
         # Nuclear is the p99/takedown mode. Prefer qualified star-and-boom-value
@@ -11843,7 +11854,10 @@ def build_fast_multi_lineups_for_pro(request, count):
         "effective_max_exposure": max_exposure,
         "requested_max_same_players": requested_max_same,
         "effective_max_same_players": max_same,
-        "v4_attempts": attempts,
+        "v4_attempts": attempts_completed,
+        "search_time_seconds": round(time.monotonic() - search_started, 3),
+        "search_time_budget_seconds": search_time_budget_seconds,
+        "target_candidate_count": target_candidates,
         "stack_teams_tested": stack_teams[:12],
         "timeout_safe": True,
         "pool_count": len(pool),
@@ -11851,7 +11865,7 @@ def build_fast_multi_lineups_for_pro(request, count):
     })
     # Private transport between the builder and endpoint; remove before response.
     report["_challenger_lineups"] = challenger_selected[:count]
-    return selected[:count], None, report, attempts
+    return selected[:count], None, report, attempts_completed
 
 
 def v2_lineup_stack_profile(lineup):
