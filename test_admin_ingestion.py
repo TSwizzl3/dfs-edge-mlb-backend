@@ -57,6 +57,17 @@ class RefreshedSlateReadTests(unittest.TestCase):
                 record = main.load_slate_record("mlb-main")
         self.assertEqual(record["players"][0]["name"], "Fresh Starter")
 
+    def test_newer_admin_upload_overrides_older_local_refresh(self):
+        with tempfile.TemporaryDirectory() as folder:
+            record_path = Path(folder) / "slate.json"
+            record_path.write_text(json.dumps({"slate_key": "mlb-main", "players": [{"name": "Old Starter"}], "updated_at": "2026-09-15T17:30:00+00:00", "is_active": True}))
+            remote = {"slate_key": "mlb-main", "players": [{"name": "New Starter"}], "updated_at": "2026-09-15T17:45:00+00:00"}
+            with patch.object(main, "local_slate_record_path", return_value=record_path), \
+                    patch.object(main, "supabase_slate_read_headers", return_value={"apikey": "test"}), \
+                    patch.object(main.urllib.request, "urlopen", return_value=FakeResponse([remote])):
+                record = main.load_slate_record("mlb-main")
+        self.assertEqual(record["players"][0]["name"], "New Starter")
+
 
 class AdminIngestionTests(unittest.TestCase):
     def test_gamecenter_results_require_an_exact_contest(self):
