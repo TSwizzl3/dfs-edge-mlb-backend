@@ -7,6 +7,30 @@ from unittest.mock import patch
 import main
 
 
+class ScheduledFeedTests(unittest.TestCase):
+    def test_quarter_hour_refresh_uses_current_slate_and_cached_paid_odds(self):
+        with patch.object(main.time, "sleep", side_effect=[None, SystemExit]), \
+                patch.object(main, "load_slate_metadata", return_value={"slate_key": "mlb-main", "slate_date": "2099-09-20"}), \
+                patch.object(main, "list_slate_library", return_value=[{"slate_key": "mlb-main"}]), \
+                patch.object(main, "load_slate_record", return_value={"players": [{"name": "Player"}], "slate_date": "2099-09-20"}), \
+                patch.object(main, "run_enrich_active_slate", return_value={"success": True, "warnings": []}) as refresh:
+            with self.assertRaises(SystemExit):
+                main.scheduled_feed_refresh_loop()
+        self.assertEqual(refresh.call_args.kwargs, {"force_paid_odds": False})
+        self.assertEqual(refresh.call_args.args[0].slate_key, "mlb-main")
+        self.assertEqual(main._SCHEDULED_FEED_STATUS["status"], "refreshed")
+
+    def test_live_slate_recovers_after_backend_restart(self):
+        with patch.object(main.time, "sleep", side_effect=[None, SystemExit]), \
+                patch.object(main, "load_slate_metadata", return_value={}), \
+                patch.object(main, "list_slate_library", return_value=[{"slate_key": "published-mlb"}]), \
+                patch.object(main, "load_slate_record", return_value={"players": [{"name": "Player"}], "slate_date": "2099-09-20"}), \
+                patch.object(main, "run_enrich_active_slate", return_value={"success": True, "warnings": []}) as refresh:
+            with self.assertRaises(SystemExit):
+                main.scheduled_feed_refresh_loop()
+        self.assertEqual(refresh.call_args.args[0].slate_key, "published-mlb")
+
+
 class FakeResponse:
     def __init__(self, payload):
         self.payload = payload

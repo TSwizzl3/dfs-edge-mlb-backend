@@ -21,6 +21,7 @@ import urllib.error
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 app = FastAPI(title="DFS Edge MLB API")
 
@@ -34,6 +35,8 @@ app.add_middleware(
 
 SALARY_CAP = 50000
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "").strip()
+_FEED_REFRESH_LOCK = threading.Lock()
+_SCHEDULED_FEED_STATUS = {"status": "waiting", "last_attempt_at": None, "last_success_at": None, "last_error": ""}
 CENTRAL_AUTH_URL = os.getenv(
     "CENTRAL_AUTH_URL",
     "https://dfs-edge-nfl-backend-skwfa.ondigitalocean.app",
@@ -2954,6 +2957,11 @@ def current_slate_source():
 def startup_setup():
     ensure_sample_players_file()
     ensure_admin_user()
+    threading.Thread(
+        target=scheduled_feed_refresh_loop,
+        name="dfs-edge-quarter-hour-feeds",
+        daemon=True,
+    ).start()
 
 
 
@@ -6856,6 +6864,11 @@ def data_engine_status():
 
     return {
         "success": True,
+        "automatic_feed_refresh": {
+            **_SCHEDULED_FEED_STATUS,
+            "interval_minutes": 15,
+            "next_due_at": datetime.fromtimestamp((int(time.time() // 900) + 1) * 900, timezone.utc).isoformat(),
+        },
         "version": DATA_ENGINE_VERSION,
         "sources": DATA_ENGINE_SOURCES,
         "player_count": len(players),
@@ -6901,6 +6914,15 @@ def data_engine_status():
 def enrich_active_slate(request: AdminPasswordRequest):
     if not is_admin_authorized(request):
         return {"success": False, "error": "Admin session expired. Log in as admin again."}
+    return run_enrich_active_slate(request)
+
+
+def run_enrich_active_slate(request: AdminPasswordRequest, force_paid_odds=True):
+    with _FEED_REFRESH_LOCK:
+        return _run_enrich_active_slate(request, force_paid_odds)
+
+
+def _run_enrich_active_slate(request: AdminPasswordRequest, force_paid_odds=True):
 
     selected_record = load_slate_record(request.slate_key) if request.slate_key and request.slate_key != "current" else None
     if request.slate_key and request.slate_key != "current" and not selected_record:
@@ -6923,7 +6945,7 @@ def enrich_active_slate(request: AdminPasswordRequest):
     slate_date = load_slate_metadata().get("slate_date") or datetime.now().strftime("%Y-%m-%d")
     enriched_players, starter_state = refresh_mlb_starters(enriched_players, slate_date)
     try:
-        enriched_players, odds_state = refresh_mlb_odds(enriched_players, force=True)
+        enriched_players, odds_state = refresh_mlb_odds(enriched_players, force=force_paid_odds)
     except Exception as exc:
         odds_state = {"success": False, "configured": bool(ODDS_API_KEY), "error": f"Odds refresh unavailable: {exc.__class__.__name__}"}
     try:
@@ -6979,6 +7001,38 @@ def enrich_active_slate(request: AdminPasswordRequest):
         "projection_snapshot_refresh": snapshot_refresh,
         "warnings": [warning for warning in [starter_state.get("error", ""), odds_state.get("error", ""), weather_state.get("error", "")] if warning],
     }
+
+
+def scheduled_feed_refresh_loop():
+    """Refresh the currently published MLB slate at every UTC quarter hour."""
+    while True:
+        time.sleep(max(1, 900 - (time.time() % 900)))
+        attempted_at = datetime.now(timezone.utc).isoformat()
+        _SCHEDULED_FEED_STATUS.update({"status": "checking", "last_attempt_at": attempted_at, "last_error": ""})
+        try:
+            metadata = load_slate_metadata()
+            slate_key = str(metadata.get("slate_key") or "").strip()
+            active_slates = list_slate_library()
+            if not any(item.get("slate_key") == slate_key for item in active_slates):
+                slate_key = str(active_slates[0].get("slate_key") or "") if active_slates else ""
+            record = load_slate_record(slate_key) if slate_key and slate_key != "current" else None
+            if not record or not record.get("players"):
+                _SCHEDULED_FEED_STATUS["status"] = "waiting_for_live_slate"
+                continue
+            slate_date = str(record.get("slate_date") or "").strip()
+            if slate_date and slate_date < datetime.now(ZoneInfo("America/Denver")).date().isoformat():
+                _SCHEDULED_FEED_STATUS["status"] = "slate_finished"
+                continue
+            result = run_enrich_active_slate(AdminPasswordRequest(slate_key=slate_key), force_paid_odds=False)
+            warnings = result.get("warnings") or []
+            if result.get("success") and not warnings:
+                _SCHEDULED_FEED_STATUS.update({"status": "refreshed", "last_success_at": attempted_at})
+            elif result.get("success"):
+                _SCHEDULED_FEED_STATUS.update({"status": "partial", "last_success_at": attempted_at, "last_error": ", ".join(str(w) for w in warnings)[:240]})
+            else:
+                _SCHEDULED_FEED_STATUS.update({"status": "failed", "last_error": str(result.get("error") or "Refresh failed")[:240]})
+        except Exception as exc:
+            _SCHEDULED_FEED_STATUS.update({"status": "failed", "last_error": str(exc)[:240]})
 
 
 @app.get("/data-engine/player/{player_name}")
