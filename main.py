@@ -1398,6 +1398,13 @@ def save_slate_library(players, slate_key, name, slate_date="", slate_type="cust
 
 def load_slate_record(slate_key):
     resolved_key = normalize_slate_key(slate_key)
+    local_record = None
+    try:
+        candidate = json.loads(local_slate_record_path(resolved_key).read_text(encoding="utf-8"))
+        if isinstance(candidate, dict) and isinstance(candidate.get("players"), list) and candidate.get("is_active", True):
+            local_record = candidate
+    except Exception:
+        pass
     read_headers = supabase_slate_read_headers()
     if read_headers:
         encoded_key = urllib.parse.quote(resolved_key, safe="")
@@ -1409,14 +1416,19 @@ def load_slate_record(slate_key):
             with urllib.request.urlopen(request, timeout=25) as response:
                 rows = json.loads(response.read().decode("utf-8"))
             if isinstance(rows, list) and rows and isinstance(rows[0].get("players"), list):
-                return rows[0]
+                remote_record = rows[0]
+                if local_record:
+                    try:
+                        local_updated = datetime.fromisoformat(str(local_record.get("updated_at") or "").replace("Z", "+00:00"))
+                        remote_updated = datetime.fromisoformat(str(remote_record.get("updated_at") or "").replace("Z", "+00:00"))
+                        if local_updated > remote_updated:
+                            return local_record
+                    except (TypeError, ValueError):
+                        pass
+                return remote_record
         except Exception:
             pass
-    try:
-        record = json.loads(local_slate_record_path(resolved_key).read_text(encoding="utf-8"))
-        return record if isinstance(record, dict) and isinstance(record.get("players"), list) else None
-    except Exception:
-        return None
+    return local_record
 
 
 def list_slate_library():
