@@ -8483,7 +8483,11 @@ def champion_challenger_evaluation(observations):
         "message": (
             f"The learned challenger is influencing live builds at {round(strength * 100)}% strength. It will automatically step down or return to shadow mode if recent performance weakens."
             if strength > 0 else
-            "The learned challenger is being scored invisibly beside the live builder. It needs at least five paired slates and a repeatable recent edge before it can influence user lineups."
+            (
+                "No completed champion/challenger pairs have been recorded yet. New eligible MLB builds will save both portfolios; upload that slate's results afterward to create the first paired forward test."
+                if paired_slates == 0 else
+                f"The learned challenger has {paired_slates} completed paired slate{'s' if paired_slates != 1 else ''}. It needs at least five paired slates and a repeatable recent edge before it can influence user lineups."
+            )
         ),
     }
 
@@ -11885,6 +11889,11 @@ def build_fast_multi_lineups_for_pro(request, count):
     # It is never returned to the user; completed-slate results compare it with
     # the visible champion before learned construction can affect live builds.
     shadow_model = load_shadow_strategy_adjustment_model()
+    # A performance audit can create the first candidate model after this
+    # worker cached an empty result. Refresh once before skipping the paired
+    # portfolio so the next eligible build immediately enters shadow testing.
+    if not shadow_model:
+        shadow_model = load_shadow_strategy_adjustment_model(force=True)
     shadow_candidates = []
     if shadow_model:
         for candidate in candidates:
@@ -11928,6 +11937,12 @@ def build_fast_multi_lineups_for_pro(request, count):
         "timeout_safe": True,
         "pool_count": len(pool),
         "shadow_challenger_ready": bool(challenger_selected),
+        "shadow_model_ready": bool(shadow_model),
+        "shadow_challenger_status": (
+            "recorded_with_champion"
+            if challenger_selected else
+            "candidate_model_unavailable"
+        ),
     })
     # Private transport between the builder and endpoint; remove before response.
     report["_challenger_lineups"] = challenger_selected[:count]
