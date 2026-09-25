@@ -8338,7 +8338,7 @@ def load_live_strategy_adjustment_model(force=False):
     return STRATEGY_ADJUSTMENT_CACHE["model"]
 
 
-def load_shadow_strategy_adjustment_model(force=False):
+def load_shadow_strategy_adjustment_model(force=False, auth_token=""):
     """Load the newest learned construction candidate, even while it is hidden."""
     now = time.time()
     if not force and now - safe_float(SHADOW_STRATEGY_ADJUSTMENT_CACHE.get("loaded_at"), 0) < 300:
@@ -8346,6 +8346,7 @@ def load_shadow_strategy_adjustment_model(force=False):
     rows = supabase_data_request(
         "strategy_backtest_reports",
         query="sport=eq.MLB&select=report,created_at&order=created_at.desc&limit=1",
+        auth_token=auth_token,
     )
     report = rows[0].get("report", {}) if isinstance(rows, list) and rows and isinstance(rows[0], dict) else {}
     model = report.get("lineup_adjustments", {}) if isinstance(report, dict) else {}
@@ -9020,7 +9021,8 @@ def optimize_multiple_lineups(
 
     # Always use the fast builder for this endpoint.
     # This fixes Pro mode when count is 1 and prevents full DraftKings CSV slates from timing out.
-    selected, error, trim_report, checked = build_fast_multi_lineups_for_pro(request, count)
+    auth_token = str((session or {}).get("_access_token", ""))
+    selected, error, trim_report, checked = build_fast_multi_lineups_for_pro(request, count, auth_token=auth_token)
 
     if error:
         return {"error": error, "lineups": [], "exposures": []}
@@ -9031,7 +9033,6 @@ def optimize_multiple_lineups(
     challenger_lineups = trim_report.pop("_challenger_lineups", []) if isinstance(trim_report, dict) else []
     pair_seed = f"{normalize_slate_key(request.slate_key or 'current')}:{time.time_ns()}:{learning_lineup_fingerprint(selected[0].get('lineup', []))}"
     learning_pair_id = hashlib.sha256(pair_seed.encode("utf-8")).hexdigest()[:24] if challenger_lineups else ""
-    auth_token = str((session or {}).get("_access_token", ""))
     record_lineup_learning_run(request, selected, auth_token, "champion", learning_pair_id)
     if challenger_lineups:
         record_lineup_learning_run(request, challenger_lineups, auth_token, "challenger", learning_pair_id)
@@ -10309,7 +10310,7 @@ def v2_attempt_lineup(groups, stack_team=None, stack_size=4, secondary_team=None
     return lineup
 
 
-def build_fast_multi_lineups_for_pro(request, count):
+def build_fast_multi_lineups_for_pro(request, count, auth_token=""):
     locked_players = request.locked_players or []
     excluded_players = request.excluded_players or []
     excluded_names = set(excluded_players)
@@ -11702,7 +11703,7 @@ def v4_lineup_objective(lineup, mode="gpp", style="balanced", correlation_enable
     return p95 * 1.05 + projection * 0.85 + stack_score * 0.88 * stack_weight + lev_score * 0.60 + salary_score + learned_score
 
 
-def build_fast_multi_lineups_for_pro(request, count):
+def build_fast_multi_lineups_for_pro(request, count, auth_token=""):
     """
     V4 bounded builder. No brute-force combinations, no unbounded validation loops.
     Returns fast even on live DK CSV slates and makes Aggressive/Nuclear actually
@@ -11888,12 +11889,12 @@ def build_fast_multi_lineups_for_pro(request, count):
     # Produce a second, hidden portfolio from the exact same candidate pool.
     # It is never returned to the user; completed-slate results compare it with
     # the visible champion before learned construction can affect live builds.
-    shadow_model = load_shadow_strategy_adjustment_model()
+    shadow_model = load_shadow_strategy_adjustment_model(auth_token=auth_token)
     # A performance audit can create the first candidate model after this
     # worker cached an empty result. Refresh once before skipping the paired
     # portfolio so the next eligible build immediately enters shadow testing.
     if not shadow_model:
-        shadow_model = load_shadow_strategy_adjustment_model(force=True)
+        shadow_model = load_shadow_strategy_adjustment_model(force=True, auth_token=auth_token)
     shadow_candidates = []
     if shadow_model:
         for candidate in candidates:

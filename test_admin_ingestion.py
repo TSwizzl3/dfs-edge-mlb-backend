@@ -176,16 +176,18 @@ class AdminIngestionTests(unittest.TestCase):
         champion = [{"lineup": [{"name": "Champion"}], "projected_points": 100}]
         challenger = [{"lineup": [{"name": "Challenger"}], "projected_points": 99}]
         trim_report = {"_challenger_lineups": challenger, "shadow_challenger_ready": True}
-        with patch.object(main, "build_fast_multi_lineups_for_pro", return_value=(champion, None, trim_report, 2)), patch.object(
+        with patch.object(main, "build_fast_multi_lineups_for_pro", return_value=(champion, None, trim_report, 2)) as optimizer, patch.object(
             main, "calculate_exposures", return_value=[]
         ), patch.object(main, "record_lineup_learning_run") as learning_run:
-            result = main.optimize_multiple_lineups(request, {"role": "admin"})
+            result = main.optimize_multiple_lineups(request, {"role": "admin", "_access_token": "signed-admin-token"})
+        optimizer.assert_called_once_with(request, 1, auth_token="signed-admin-token")
         self.assertEqual(result["lineups"], champion)
         self.assertNotIn("_challenger_lineups", result["trim_report"])
         self.assertEqual(learning_run.call_count, 2)
         champion_call, challenger_call = learning_run.call_args_list
         self.assertEqual(champion_call.args[3], "champion")
         self.assertEqual(challenger_call.args[3], "challenger")
+        self.assertEqual(champion_call.args[2], "signed-admin-token")
         self.assertTrue(champion_call.args[4])
         self.assertEqual(champion_call.args[4], challenger_call.args[4])
 
