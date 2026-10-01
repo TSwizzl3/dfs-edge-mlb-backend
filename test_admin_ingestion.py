@@ -8,6 +8,13 @@ import main
 
 
 class ScheduledFeedTests(unittest.TestCase):
+    def test_draftkings_game_info_overrides_wrong_uploaded_slate_date(self):
+        players = [
+            {"name": "Kyle Schwarber", "game_info": "PHI@ATL 10/01/2026 08:00PM ET"},
+            {"name": "Bryce Harper", "game_info": "PHI@ATL 10/01/2026 08:00PM ET"},
+        ]
+        self.assertEqual(main.slate_date_from_game_info(players, "2026-09-30"), "2026-10-01")
+
     def test_quarter_hour_refresh_uses_current_slate_and_cached_paid_odds(self):
         with patch.object(main.time, "sleep", side_effect=[None, SystemExit]), \
                 patch.object(main, "load_slate_metadata", return_value={"slate_key": "mlb-main", "slate_date": "2099-09-20"}), \

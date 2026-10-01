@@ -1299,6 +1299,24 @@ def convert_dk_csv_to_players(csv_text):
     return players
 
 
+def slate_date_from_game_info(players, fallback=""):
+    """Prefer the actual DraftKings contest date embedded in Game Info."""
+    dates = []
+    for player in players or []:
+        game_info = str(player.get("game_info", "") or "")
+        match = re.search(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b", game_info)
+        if not match:
+            continue
+        try:
+            dates.append(datetime(int(match.group(3)), int(match.group(1)), int(match.group(2))).date().isoformat())
+        except ValueError:
+            continue
+    if not dates:
+        return str(fallback or "").strip()[:10]
+    counts = {value: dates.count(value) for value in set(dates)}
+    return sorted(counts, key=lambda value: (-counts[value], value))[0]
+
+
 def ensure_sample_players_file():
     if not SAMPLE_PLAYERS_PATH.exists():
         with open(SAMPLE_PLAYERS_PATH, "w", encoding="utf-8") as f:
@@ -6954,7 +6972,7 @@ def _run_enrich_active_slate(request: AdminPasswordRequest, force_paid_odds=True
 
     enriched_players, _ = apply_auto_slate_cleanup(load_players(), respect_manual_overrides=True)
     enriched_players = apply_slate_starter_likelihood(enriched_players)
-    slate_date = load_slate_metadata().get("slate_date") or datetime.now().strftime("%Y-%m-%d")
+    slate_date = slate_date_from_game_info(enriched_players, load_slate_metadata().get("slate_date") or datetime.now().strftime("%Y-%m-%d"))
     enriched_players, starter_state = refresh_mlb_starters(enriched_players, slate_date)
     try:
         enriched_players, odds_state = refresh_mlb_odds(enriched_players, force=force_paid_odds)
@@ -7031,7 +7049,7 @@ def scheduled_feed_refresh_loop():
             if not record or not record.get("players"):
                 _SCHEDULED_FEED_STATUS["status"] = "waiting_for_live_slate"
                 continue
-            slate_date = str(record.get("slate_date") or "").strip()
+            slate_date = slate_date_from_game_info(record.get("players", []), record.get("slate_date") or "")
             if slate_date and slate_date < datetime.now(ZoneInfo("America/Denver")).date().isoformat():
                 _SCHEDULED_FEED_STATUS["status"] = "slate_finished"
                 continue
@@ -7835,7 +7853,7 @@ async def upload_dk_csv(
     cleaned_players, _ = apply_auto_slate_cleanup(players, respect_manual_overrides=False)
     cleaned_players = apply_slate_starter_likelihood(cleaned_players)
     save_active_slate(cleaned_players)
-    resolved_date = slate_date.strip() or datetime.now().strftime("%Y-%m-%d")
+    resolved_date = slate_date_from_game_info(cleaned_players, slate_date.strip() or datetime.now().strftime("%Y-%m-%d"))
     resolved_name = slate_name.strip() or f"DraftKings MLB {str(slate_type or 'custom').replace('_', ' ').title()} - {datetime.now().strftime('%b %d')}"
     resolved_key = normalize_slate_key(slate_key, resolved_name, resolved_date)
     current_meta = save_slate_metadata(
