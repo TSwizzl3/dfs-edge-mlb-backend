@@ -7036,7 +7036,6 @@ def _run_enrich_active_slate(request: AdminPasswordRequest, force_paid_odds=True
 def scheduled_feed_refresh_loop():
     """Refresh the currently published MLB slate at every UTC quarter hour."""
     while True:
-        time.sleep(max(1, 900 - (time.time() % 900)))
         attempted_at = datetime.now(timezone.utc).isoformat()
         _SCHEDULED_FEED_STATUS.update({"status": "checking", "last_attempt_at": attempted_at, "last_error": ""})
         try:
@@ -7063,6 +7062,7 @@ def scheduled_feed_refresh_loop():
                 _SCHEDULED_FEED_STATUS.update({"status": "failed", "last_error": str(result.get("error") or "Refresh failed")[:240]})
         except Exception as exc:
             _SCHEDULED_FEED_STATUS.update({"status": "failed", "last_error": str(exc)[:240]})
+        time.sleep(max(1, 900 - (time.time() % 900)))
 
 
 @app.get("/data-engine/player/{player_name}")
